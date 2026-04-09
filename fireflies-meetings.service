@@ -1,0 +1,20 @@
+[Unit]
+Description=Fireflies.ai meetings FUSE filesystem
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h/agentic/fireflies-meetings-fuse
+EnvironmentFile=%h/agentic/fireflies-meetings-fuse/.env
+ExecStartPre=-/usr/bin/fusermount3 -uz %h/views/fireflies-meetings
+ExecStart=%h/agentic/fireflies-meetings-fuse/.venv/bin/fireflies-meetings mount
+ExecStop=/usr/bin/fusermount3 -u %h/views/fireflies-meetings
+ExecStopPost=-/usr/bin/fusermount3 -u %h/views/fireflies-meetings
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

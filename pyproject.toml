@@ -1,0 +1,92 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fireflies-meetings"
+version = "0.1.0"
+description = "Read-only FUSE filesystem exposing Fireflies.ai meetings as markdown"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "Simon Pinfold" }]
+keywords = ["fireflies", "fuse", "meetings", "transcripts"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: No Input/Output (Daemon)",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Filesystems",
+]
+dependencies = [
+    "pyfuse3>=3.4.0",
+    "httpx>=0.27.0",
+    "trio>=0.25.0",
+    "pydantic>=2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/synap5e/fireflies-meetings-fuse"
+Issues = "https://github.com/synap5e/fireflies-meetings-fuse/issues"
+
+[project.scripts]
+fireflies-meetings = "fireflies_meetings.__main__:main"
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.24.0",
+    "ruff>=0.8.0",
+    "pytest>=8.0",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+preview = true
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "UP", "B", "SIM", "I",
+    "E402",     # import not at top of file
+    "PLC0415",  # import not at top of file (pylint)
+    "BLE001",   # broad exceptions
+    "C901",     # cyclomatic complexity
+    "PLR1702",  # too many nested blocks
+    "PLR0913",  # too many function args
+    "PLR0916",  # too many boolean expressions
+    "PLR0917",  # too many positional args
+]
+ignore = ["SIM108"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"tests/*.py" = ["BLE001"]
+# Lazy imports inside cmd_mount/_backfill_cache/_run_mount are intentional —
+# they keep `fireflies-meetings unmount` fast by not pulling in pyfuse3/trio.
+"fireflies_meetings/__main__.py" = ["PLC0415"]
+
+[tool.ruff.lint.isort]
+force-single-line = false
+combine-as-imports = true
+split-on-trailing-comma = true
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.basedpyright]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+reportUnusedCallResult = false
+reportImplicitStringConcatenation = false
+reportUnannotatedClassAttribute = false
+reportUnknownLambdaType = false
+include = ["fireflies_meetings", "tests"]
+exclude = ["**/__pycache__", "**/.venv"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
