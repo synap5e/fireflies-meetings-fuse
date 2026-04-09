@@ -510,11 +510,35 @@ class MeetingStore:
         return None
 
     def get_file(self, meeting_id: str, filename: str) -> bytes | None:
-        """Return rendered file bytes for a meeting, or None on failure."""
+        """Return rendered file bytes for a meeting, or None on failure.
+
+        Slow path: may trigger an API fetch if the meeting isn't on disk and
+        isn't in the in-memory cache. Only call from `open` / `read`, never
+        from `readdir` / `lookup` / `getattr`.
+        """
         cached = self._ensure_files(meeting_id)
         if cached is None:
             return None
         return cached.files.get(filename)
+
+    def get_file_size(self, meeting_id: str, filename: str) -> int:
+        """Cheap stat-only size lookup. Never blocks on the network.
+
+        Checks the in-memory cache (live/in-progress meetings) first, then
+        stats the disk cache file. Returns 0 if neither has it — the file
+        will still appear in directory listings but will look empty until
+        the backfill task fetches it. Used by `readdir` / `lookup` / `getattr`
+        so that listing a directory never blocks on an API call.
+        """
+        cached = self._file_cache.get(meeting_id)
+        if cached is not None:
+            data = cached.files.get(filename)
+            if data is not None:
+                return len(data)
+        try:
+            return (self._detail_cache_dir / meeting_id / filename).stat().st_size
+        except OSError:
+            return 0
 
     def list_files(self, meeting_id: str) -> list[str]:
         """Return filenames available for a meeting.

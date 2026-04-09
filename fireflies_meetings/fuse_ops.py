@@ -118,11 +118,12 @@ class FirefliesMeetingOps(pyfuse3.Operations):
         self._content: dict[int, bytes] = {}
         self._symlinks: dict[int, bytes] = {}  # inode -> symlink target bytes
 
-    def _resolve_content(self, path: str) -> bytes | None:
-        """Resolve a file path to its rendered content bytes."""
-        if path == f"/{_AUTH_EXPIRED_NAME}":
-            return _AUTH_EXPIRED_CONTENT if self._store.is_auth_fatal else None
+    def _resolve_meeting_file(self, path: str) -> tuple[str, str, str] | None:
+        """Parse a path into (meeting_id, slug, filename) if it's a meeting file.
 
+        Returns None for non-file paths or paths that don't match a known meeting.
+        Cheap: only consults the in-memory `_store.list_meetings*` snapshots.
+        """
         is_mine, sub = _parse_path(path)
         if len(sub) != _SUB_DEPTH_FILE:
             return None
@@ -140,8 +141,39 @@ class FirefliesMeetingOps(pyfuse3.Operations):
         entry = meetings.get(slug)
         if entry is None:
             return None
+        return entry.meeting.id, slug, filename
+
+    def _resolve_size(self, path: str) -> int | None:
+        """Cheap size lookup for stat / readdir / lookup. Never blocks on the network.
+
+        Returns None if `path` is not a known file (caller raises ENOENT).
+        Returns 0 if the meeting exists but its content isn't on disk yet —
+        the file appears in directory listings but reads return empty until
+        the backfill task fetches it.
+        """
+        if path == f"/{_AUTH_EXPIRED_NAME}":
+            return len(_AUTH_EXPIRED_CONTENT) if self._store.is_auth_fatal else None
+        parsed = self._resolve_meeting_file(path)
+        if parsed is None:
+            return None
+        meeting_id, _slug, filename = parsed
+        return self._store.get_file_size(meeting_id, filename)
+
+    def _resolve_content(self, path: str) -> bytes | None:
+        """Resolve a file path to its rendered content bytes.
+
+        Slow path: may trigger an API fetch. Only call from `open` (which
+        loads bytes for `read` to serve), never from `readdir` / `lookup` /
+        `getattr`.
+        """
+        if path == f"/{_AUTH_EXPIRED_NAME}":
+            return _AUTH_EXPIRED_CONTENT if self._store.is_auth_fatal else None
+        parsed = self._resolve_meeting_file(path)
+        if parsed is None:
+            return None
+        meeting_id, slug, filename = parsed
         try:
-            return self._store.get_file(entry.meeting.id, filename)
+            return self._store.get_file(meeting_id, filename)
         except Exception:
             log.exception("Error getting file %s for %s", filename, slug)
             return None
@@ -205,11 +237,10 @@ class FirefliesMeetingOps(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.ENOENT)
 
         if path == f"/{_AUTH_EXPIRED_NAME}":
-            content = self._resolve_content(path)
-            if content is not None:
-                self._content[inode] = content
-                return _make_file_attr(inode, len(content))
-            raise pyfuse3.FUSEError(errno.ENOENT)
+            size = self._resolve_size(path)
+            if size is None:
+                raise pyfuse3.FUSEError(errno.ENOENT)
+            return _make_file_attr(inode, size)
 
         is_mine, sub = _parse_path(path)
 
@@ -230,14 +261,13 @@ class FirefliesMeetingOps(pyfuse3.Operations):
         if len(sub) < _SUB_DEPTH_FILE:
             return _make_dir_attr(inode)
 
-        # Files
+        # Files — cheap stat-only path (no API calls).
         if len(sub) == _SUB_DEPTH_FILE:
-            content = self._resolve_content(path)
-            if content is not None:
-                self._content[inode] = content
-                name = path.rsplit("/", 1)[-1]
-                return _make_file_attr(inode, len(content), executable=name in _EXECUTABLE_NAMES)
-            raise pyfuse3.FUSEError(errno.ENOENT)
+            size = self._resolve_size(path)
+            if size is None:
+                raise pyfuse3.FUSEError(errno.ENOENT)
+            name = path.rsplit("/", 1)[-1]
+            return _make_file_attr(inode, size, executable=name in _EXECUTABLE_NAMES)
 
         raise pyfuse3.FUSEError(errno.ENOENT)
 
@@ -280,12 +310,11 @@ class FirefliesMeetingOps(pyfuse3.Operations):
             self._symlinks[inode] = tgt
             return _make_symlink_attr(inode, len(tgt))
 
-        content = self._resolve_content(child_path)
-        if content is not None:
-            self._content[inode] = content
-            return _make_file_attr(inode, len(content), executable=child_name in _EXECUTABLE_NAMES)
-
-        raise pyfuse3.FUSEError(errno.ENOENT)
+        # Cheap stat-only — no API calls. `open` does the actual fetch.
+        size = self._resolve_size(child_path)
+        if size is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        return _make_file_attr(inode, size, executable=child_name in _EXECUTABLE_NAMES)
 
     async def opendir(
         self,
@@ -324,10 +353,8 @@ class FirefliesMeetingOps(pyfuse3.Operations):
                 self._symlinks[child_inode] = tgt
                 attr = _make_symlink_attr(child_inode, len(tgt))
             else:
-                content = self._resolve_content(child_path)
-                size = len(content) if content is not None else 0
-                if content is not None:
-                    self._content[child_inode] = content
+                # Cheap stat-only — `open` will do the actual fetch on read.
+                size = self._resolve_size(child_path) or 0
                 attr = _make_file_attr(child_inode, size, executable=name in _EXECUTABLE_NAMES)
 
             if not pyfuse3.readdir_reply(token, name.encode("utf-8"), attr, idx + 1):
