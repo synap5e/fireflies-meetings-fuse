@@ -1,0 +1,28 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# uv / virtualenv
+.venv/
+
+# Test & lint caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local Claude settings (per-user permission grants)
+.claude/settings.local.json
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
