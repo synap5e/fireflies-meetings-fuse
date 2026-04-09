@@ -32,6 +32,8 @@ def render_summary(meeting: Meeting, detail: TranscriptDetail) -> str:
     if summary is None:
         if meeting.is_live:
             parts.append("*Meeting is in progress. Summary will be available after it ends.*")
+        elif meeting.meeting_info.summary_status == "skipped":
+            parts.append("*Summary skipped by Fireflies (likely too short or filtered).*")
         else:
             parts.append("*Summary not yet available.*")
         parts.append("")
