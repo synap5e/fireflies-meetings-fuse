@@ -105,6 +105,19 @@ class TransientAPIError(Exception):
     """GraphQL error or other transient failure — back off and retry later."""
 
 
+def _nest_meeting_fields(raw: JsonObject) -> JsonObject:
+    """Promote a flat Fireflies transcript dict to one with a nested 'meeting' field.
+
+    The detail query returns meeting fields (id, title, date, ...) as siblings
+    of the transcript fields (sentences, speakers, ...). `TranscriptDetail`
+    expects them under a `meeting` key, so we wrap the same dict in place — the
+    sibling fields then get cleanly dropped by `Meeting`'s `extra="ignore"`.
+    """
+    if "meeting" in raw:
+        return raw
+    return {**raw, "meeting": raw}
+
+
 class FirefliesClient:
     """HTTP client for the Fireflies.ai GraphQL API."""
 
@@ -195,7 +208,7 @@ class FirefliesClient:
         raw = data.get("transcript") if isinstance(data, dict) else None
         if not isinstance(raw, dict):
             raw = {}
-        return TranscriptDetail.model_validate(raw)
+        return TranscriptDetail.model_validate(_nest_meeting_fields(raw))
 
     def get_user_email(self) -> str | None:
         """Fetch the authenticated user's email address."""
