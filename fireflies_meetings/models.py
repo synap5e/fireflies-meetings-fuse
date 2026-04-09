@@ -139,9 +139,10 @@ class Meeting(BaseModel):
 class TranscriptDetail(BaseModel):
     """Full transcript data for a meeting.
 
-    The Fireflies API returns the meeting fields and the transcript fields
-    as siblings of one flat object. We promote the meeting fields into a
-    nested `Meeting` so the rest of the codebase has a clean separation.
+    The Fireflies API returns meeting fields and transcript fields as siblings
+    of one flat object; the API client (`api._nest_meeting_fields`) wraps that
+    flat dict before passing it here, so this model only ever sees the nested
+    shape.
     """
 
     model_config = _MODEL_CONFIG
@@ -154,16 +155,3 @@ class TranscriptDetail(BaseModel):
         default_factory=list,
         validation_alias=AliasChoices("attendees", "meeting_attendees"),
     )
-
-    @model_validator(mode="before")
-    @classmethod
-    def _promote_flat_meeting(cls, data: object) -> object:
-        """If the input is a flat API dict (no nested 'meeting' key), wrap it."""
-        if not isinstance(data, dict):
-            return data
-        typed = cast("dict[str, object]", data)
-        if "meeting" in typed:
-            return typed
-        new_data: dict[str, object] = dict(typed)
-        new_data["meeting"] = typed
-        return new_data

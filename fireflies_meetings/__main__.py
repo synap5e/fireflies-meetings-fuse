@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
+from types import FrameType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -124,7 +125,7 @@ def cmd_mount(args: argparse.Namespace) -> None:
     if args.debug:
         fuse_options.add("debug")
 
-    def _handle_usr1(signum: int, frame: object) -> None:
+    def _handle_usr1(signum: int, frame: FrameType | None) -> None:
         store.force_refresh()
 
     signal.signal(signal.SIGUSR1, _handle_usr1)
