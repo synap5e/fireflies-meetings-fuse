@@ -229,8 +229,8 @@ class FirefliesClient:
         body = self._post(_DETAIL_QUERY, {"id": meeting_id})
         data = body.get("data")
         raw = data.get("transcript") if isinstance(data, dict) else None
-        if not isinstance(raw, dict):
-            raw = {}
+        if not isinstance(raw, dict) or not raw:
+            raise TransientAPIError(f"No transcript data returned for {meeting_id}")
         return TranscriptDetail.model_validate(_nest_meeting_fields(raw))
 
     def get_user_email(self) -> str | None:
