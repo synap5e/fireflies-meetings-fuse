@@ -8,10 +8,16 @@ frozen so any "mutation" must go through `model_copy(update=...)`.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from typing import cast
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
+
+# Allowlist for meeting IDs. Fireflies controls these but the rest of
+# the codebase uses them as filesystem path components, so we validate
+# at the boundary: alphanumerics, underscore, and dash, 1-64 chars.
+_MEETING_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 # Standard config for every model in this file: frozen, accept either the
 # field name or its API alias on input, ignore unknown fields so we can pass
@@ -129,7 +135,7 @@ class Meeting(_FFBaseModel):
     `model_copy(update={"slug": ...})`.
     """
 
-    id: str = ""
+    id: str
     title: str = ""
     # API uses "date" (epoch ms); disk cache uses "date_epoch_ms"
     date_epoch_ms: float = Field(
@@ -147,6 +153,16 @@ class Meeting(_FFBaseModel):
     transcript_url: str = ""
     meeting_info: MeetingInfo = Field(default_factory=MeetingInfo)
     slug: str = ""  # computed by store, set via model_copy
+
+    @field_validator("id")
+    @classmethod
+    def _validate_id(cls, v: str) -> str:
+        """Reject IDs that aren't safe to use as a filesystem path component."""
+        if not _MEETING_ID_PATTERN.match(v):
+            raise ValueError(
+                f"meeting id must match {_MEETING_ID_PATTERN.pattern}, got {v!r}"
+            )
+        return v
 
     @model_validator(mode="before")
     @classmethod

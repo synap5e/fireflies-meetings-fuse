@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 
 import httpx
+from pydantic import ValidationError
 
 from .models import Meeting, TranscriptDetail
 
@@ -121,14 +123,22 @@ def _nest_meeting_fields(raw: JsonObject) -> JsonObject:
 class FirefliesClient:
     """HTTP client for the Fireflies.ai GraphQL API."""
 
-    def __init__(self, api_key: str) -> None:
-        self._client = httpx.Client(
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            timeout=30.0,
-        )
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
+        headers: dict[str, str] = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        if transport is not None:
+            self._client = httpx.Client(
+                headers=headers, timeout=30.0, transport=transport,
+            )
+        else:
+            self._client = httpx.Client(headers=headers, timeout=30.0)
         # Monotonic timestamp until which the bucket is known to be exhausted.
         # Set when a response reports remaining<=0 so the *next* call backs off
         # without discarding the response we already received.
@@ -143,7 +153,12 @@ class FirefliesClient:
         resp = self._client.post(_ENDPOINT, json={"query": query, "variables": variables})
 
         reset_header = resp.headers.get("x-ratelimit-reset-api")
-        reset_secs = float(reset_header) if reset_header else None
+        reset_secs: float | None
+        try:
+            reset_secs = float(reset_header) if reset_header else None
+        except ValueError:
+            log.warning("Malformed x-ratelimit-reset-api header: %r", reset_header)
+            reset_secs = None
 
         if resp.status_code == 429:
             self._rate_limit_blocked_until = time.monotonic() + (reset_secs or 60.0)
@@ -154,7 +169,10 @@ class FirefliesClient:
 
         resp.raise_for_status()
 
-        body: JsonObject = resp.json()
+        try:
+            body: JsonObject = resp.json()
+        except (json.JSONDecodeError, ValueError) as e:
+            raise TransientAPIError(f"Non-JSON response body: {e}") from e
 
         # Bucket-exhausted but the response itself succeeded — keep the data,
         # arm the next call to back off.
@@ -190,8 +208,13 @@ class FirefliesClient:
                 break
 
             for raw in raw_list:
-                if isinstance(raw, dict):
+                if not isinstance(raw, dict):
+                    continue
+                try:
                     meetings.append(Meeting.model_validate(raw))
+                except ValidationError as e:
+                    log.warning("Skipping malformed transcript record: %s", e)
+                    continue
 
             if len(raw_list) < _PAGE_SIZE:
                 break
@@ -214,7 +237,7 @@ class FirefliesClient:
         """Fetch the authenticated user's email address."""
         try:
             body = self._post(_USER_QUERY, {})
-        except (RateLimitedError, FatalAPIError, httpx.HTTPError):
+        except (RateLimitedError, FatalAPIError, TransientAPIError, httpx.HTTPError):
             log.warning("Failed to fetch user email from API")
             return None
         data = body.get("data")

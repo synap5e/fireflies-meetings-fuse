@@ -10,7 +10,6 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
-from types import FrameType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -33,7 +32,21 @@ def _load_api_key(api_key_path: str) -> str:
 
     path = Path(api_key_path)
     if path.is_file():
-        key = path.read_text().strip()
+        try:
+            mode = path.stat().st_mode & 0o777
+            if mode & 0o077:
+                print(
+                    f"warning: {api_key_path} is readable by group/other (mode {mode:o}). "
+                    f"Run: chmod 600 {api_key_path}",
+                    file=sys.stderr,
+                )
+            key = path.read_text().strip()
+        except OSError as e:
+            print(
+                f"Failed to read API key file {api_key_path}: {e}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         if key:
             return key
 
@@ -42,6 +55,27 @@ def _load_api_key(api_key_path: str) -> str:
         file=sys.stderr,
     )
     sys.exit(1)
+
+
+def _configure_logging(*, debug: bool) -> None:
+    """Set log levels with care: enable DEBUG on our package only.
+
+    httpx and httpcore log raw request/response bytes (including the
+    Authorization header) at DEBUG. Setting the *root* logger to DEBUG
+    would publish the bearer token to the systemd journal. Instead we:
+
+    - Leave the root logger at INFO regardless
+    - Bump our own package to DEBUG when --debug is set
+    - Clamp httpx/httpcore/h11/hpack to WARNING explicitly
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    if debug:
+        logging.getLogger("fireflies_meetings").setLevel(logging.DEBUG)
+    for noisy in ("httpx", "httpcore", "h11", "hpack"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 _log = logging.getLogger(__name__)
@@ -77,6 +111,18 @@ async def _backfill_cache(store: MeetingStore) -> None:
             await trio.sleep(3)  # ~20 fetches/min, well under 60/min rate limit
 
 
+async def _signal_listener(store: MeetingStore) -> None:
+    """Trio-native SIGUSR1 handler. Replaces signal.signal so the refresh
+    is dispatched cleanly through the trio loop instead of from arbitrary
+    interrupt context."""
+    import trio
+
+    with trio.open_signal_receiver(signal.SIGUSR1) as receiver:
+        async for _signum in receiver:
+            _log.info("SIGUSR1 received — forcing refresh")
+            await trio.to_thread.run_sync(store.force_refresh)
+
+
 async def _run_mount(store: MeetingStore) -> None:
     import pyfuse3
     import trio
@@ -84,6 +130,7 @@ async def _run_mount(store: MeetingStore) -> None:
     async with trio.open_nursery() as nursery:
         nursery.start_soon(pyfuse3.main)
         nursery.start_soon(_backfill_cache, store)
+        nursery.start_soon(_signal_listener, store)
 
 
 def cmd_mount(args: argparse.Namespace) -> None:
@@ -96,48 +143,46 @@ def cmd_mount(args: argparse.Namespace) -> None:
     from .status_cache import StatusCache
     from .store import MeetingStore
 
+    _configure_logging(debug=args.debug)
+
     api_key = _load_api_key(args.api_key)
     mountpoint = Path(args.mountpoint)
     mountpoint.mkdir(parents=True, exist_ok=True)
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-
     client = FirefliesClient(api_key)
-    status_cache = StatusCache()
-
-    user_email = os.environ.get("FIREFLIES_USER_EMAIL", "").strip()
-    if not user_email:
-        user_email = client.get_user_email() or ""
-        if user_email:
-            logging.getLogger(__name__).info("Resolved user email from API: %s", user_email)
-        else:
-            logging.getLogger(__name__).warning(
-                "Could not determine user email; mine/ directory will be unavailable"
-            )
-
-    store = MeetingStore(client, status_cache=status_cache, user_email=user_email or None)
-    ops = FirefliesMeetingOps(store)
-
-    fuse_options: set[str] = {"fsname=fireflies-meetings", "ro"}
-    if args.debug:
-        fuse_options.add("debug")
-
-    def _handle_usr1(signum: int, frame: FrameType | None) -> None:
-        store.force_refresh()
-
-    signal.signal(signal.SIGUSR1, _handle_usr1)
-
-    pyfuse3.init(ops, str(mountpoint), fuse_options)
-
     try:
-        trio.run(_run_mount, store)
-    except KeyboardInterrupt:
-        pass
+        status_cache = StatusCache()
+
+        user_email = os.environ.get("FIREFLIES_USER_EMAIL", "").strip()
+        if not user_email:
+            user_email = client.get_user_email() or ""
+            if user_email:
+                _log.info("Resolved user email from API: %s", user_email)
+            else:
+                _log.warning(
+                    "Could not determine user email; mine/ directory will be unavailable"
+                )
+
+        store = MeetingStore(client, status_cache=status_cache, user_email=user_email or None)
+        ops = FirefliesMeetingOps(store)
+
+        fuse_options: set[str] = {
+            "fsname=fireflies-meetings",
+            "ro",
+            "nosuid",
+            "nodev",
+        }
+        if args.debug:
+            fuse_options.add("debug")
+
+        pyfuse3.init(ops, str(mountpoint), fuse_options)
+        try:
+            trio.run(_run_mount, store)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            pyfuse3.close()
     finally:
-        pyfuse3.close()
         client.close()
 
 

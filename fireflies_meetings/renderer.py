@@ -14,17 +14,17 @@ def render_summary(meeting: Meeting, detail: TranscriptDetail) -> str:
     parts: list[str] = []
 
     parts.append("---")
-    parts.append(f'title: "{_escape_yaml(meeting.title)}"')
+    parts.append(f"title: {_yaml_str(meeting.title)}")
     parts.append(f"date: {meeting.date_str}")
-    parts.append(f"organizer: {meeting.organizer_email}")
+    parts.append(f"organizer: {_yaml_str(meeting.organizer_email)}")
     if meeting.duration_mins:
         mins = int(meeting.duration_mins)
         parts.append(f"duration: {mins}m")
     parts.append(f"participants: {len(meeting.participants)}")
     if meeting.transcript_url:
-        parts.append(f"url: {meeting.transcript_url}")
+        parts.append(f"url: {_yaml_str(meeting.transcript_url)}")
     status = "live" if meeting.is_live else meeting.meeting_info.summary_status or "completed"
-    parts.append(f"status: {status}")
+    parts.append(f"status: {_yaml_str(status)}")
     parts.append("---")
     parts.append("")
 
@@ -66,7 +66,7 @@ def render_transcript(meeting: Meeting, detail: TranscriptDetail) -> str:
     parts: list[str] = []
 
     parts.append("---")
-    parts.append(f'title: "{_escape_yaml(meeting.title)}"')
+    parts.append(f"title: {_yaml_str(meeting.title)}")
     parts.append(f"date: {meeting.date_str}")
     parts.append(f"speakers: {len(detail.speakers)}")
     if meeting.is_live:
@@ -102,7 +102,7 @@ def render_participants(meeting: Meeting, detail: TranscriptDetail) -> str:
     parts: list[str] = []
 
     parts.append("---")
-    parts.append(f'title: "{_escape_yaml(meeting.title)}"')
+    parts.append(f"title: {_yaml_str(meeting.title)}")
     parts.append(f"date: {meeting.date_str}")
     parts.append(f"participants: {len(meeting.participants)}")
     parts.append("---")
@@ -180,6 +180,13 @@ def render_open_script(meeting: Meeting) -> str:
     return f"#!/usr/bin/env bash\nexec xdg-open {url}\n"
 
 
-def _escape_yaml(text: str) -> str:
-    """Escape text for YAML double-quoted string."""
-    return text.replace("\\", "\\\\").replace('"', '\\"')
+def _yaml_str(text: str) -> str:
+    """Encode an arbitrary string as a YAML scalar.
+
+    JSON's double-quoted string syntax is a subset of YAML's, and
+    `json.dumps` correctly handles control chars, embedded quotes,
+    backslashes, and unicode — including the things `_escape_yaml`
+    used to miss (newlines, tabs, etc) which let a malicious title
+    inject extra YAML lines into the frontmatter.
+    """
+    return json.dumps(text, ensure_ascii=False)
