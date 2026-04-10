@@ -7,8 +7,10 @@ import logging
 import os
 import stat
 import time
+from collections.abc import Sequence
 
 import pyfuse3
+import trio
 
 from .inode_map import InodeMap
 from .store import MeetingStore
@@ -159,24 +161,26 @@ class FirefliesMeetingOps(pyfuse3.Operations):
         meeting_id, _slug, filename = parsed
         return self._store.get_file_size(meeting_id, filename)
 
-    def _resolve_content(self, path: str) -> bytes | None:
+    def _resolve_content(self, path: str) -> tuple[bytes | None, bool]:
         """Resolve a file path to its rendered content bytes.
+
+        Returns (content, is_completed).
 
         Slow path: may trigger an API fetch. Only call from `open` (which
         loads bytes for `read` to serve), never from `readdir` / `lookup` /
         `getattr`.
         """
         if path == f"/{_AUTH_EXPIRED_NAME}":
-            return _AUTH_EXPIRED_CONTENT if self._store.is_auth_fatal else None
+            return (_AUTH_EXPIRED_CONTENT, True) if self._store.is_auth_fatal else (None, False)
         parsed = self._resolve_meeting_file(path)
         if parsed is None:
-            return None
+            return None, False
         meeting_id, slug, filename = parsed
         try:
             return self._store.get_file(meeting_id, filename)
         except Exception:
             log.exception("Error getting file %s for %s", filename, slug)
-            return None
+            return None, False
 
     def _list_date_subtree(self, sub: list[str], is_mine: bool) -> list[tuple[str, bool]]:
         """List entries for the shared month/day/meeting depth levels."""
@@ -349,7 +353,10 @@ class FirefliesMeetingOps(pyfuse3.Operations):
                 attr = _make_dir_attr(child_inode)
             elif path == f"/{_LIVE_DIR}":
                 target = self._store.get_live_symlink_target(name)
-                tgt = target.encode() if target else b""
+                if target is None:
+                    # Meeting vanished between list and readdir — skip
+                    continue
+                tgt = target.encode()
                 self._symlinks[child_inode] = tgt
                 attr = _make_symlink_attr(child_inode, len(tgt))
             else:
@@ -366,20 +373,46 @@ class FirefliesMeetingOps(pyfuse3.Operations):
         flags: int,
         ctx: pyfuse3.RequestContext,
     ) -> pyfuse3.FileInfo:
+        # Read-only filesystem: reject any write-mode opens
+        if flags & (os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_TRUNC | os.O_CREAT):
+            raise pyfuse3.FUSEError(errno.EROFS)
+
         path = self._inodes.get_path(inode)
         if path is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
 
-        if inode not in self._content:
-            content = self._resolve_content(path)
-            if content is None:
-                raise pyfuse3.FUSEError(errno.ENOENT)
-            self._content[inode] = content
+        # Slow path: may trigger an API fetch. Wrapped in to_thread so the
+        # trio event loop isn't blocked during a 30s HTTP call.
+        content, is_completed = await trio.to_thread.run_sync(self._resolve_content, path)
+        if content is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        self._content[inode] = content
 
         fi = pyfuse3.FileInfo()
         fi.fh = pyfuse3.FileHandleT(inode)
-        fi.keep_cache = True
+        # Completed meetings never change — let the kernel cache them.
+        # Live/in-progress files get keep_cache=False so the next open
+        # after release() re-fetches fresh content.
+        fi.keep_cache = is_completed
         return fi
+
+    async def release(self, fh: int) -> None:
+        """Free in-memory file content when the last reader closes the file.
+
+        This ensures (a) we don't leak memory on long-lived mounts and
+        (b) live/in-progress files get re-fetched on next open rather
+        than serving stale bytes forever.
+        """
+        self._content.pop(fh, None)
+
+    async def forget(self, inode_list: Sequence[tuple[pyfuse3.InodeT, int]]) -> None:
+        """Kernel has dropped its reference to these inodes. Free our mappings."""
+        for inode, nlookup in inode_list:
+            self._inodes.forget(inode, nlookup)
+            # Also clean up any stale symlink / content entries
+            if self._inodes.get_path(inode) is None:
+                self._content.pop(inode, None)
+                self._symlinks.pop(inode, None)
 
     async def readlink(self, inode: int, ctx: pyfuse3.RequestContext) -> bytes:
         target = self._symlinks.get(inode)
@@ -402,7 +435,7 @@ class FirefliesMeetingOps(pyfuse3.Operations):
         stat_info.f_blocks = 0
         stat_info.f_bfree = 0
         stat_info.f_bavail = 0
-        stat_info.f_files = self._inodes.count
+        stat_info.f_files = 0
         stat_info.f_ffree = 0
         stat_info.f_favail = 0
         stat_info.f_namemax = 255

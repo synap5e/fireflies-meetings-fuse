@@ -69,10 +69,10 @@ def test_render_summary_completed() -> None:
     detail = _make_detail(meeting)
     result = render_summary(meeting, detail)
 
-    assert "title: \"Team Standup\"" in result
+    assert 'title: "Team Standup"' in result
     assert "date: 2026-03-31" in result
-    assert "organizer: alice@example.com" in result
-    assert "status: processed" in result
+    assert 'organizer: "alice@example.com"' in result
+    assert 'status: "processed"' in result
     assert "## Summary" in result
     assert "The team synced on daily updates." in result
     assert "## Action Items" in result
@@ -149,3 +149,93 @@ def test_render_open_script() -> None:
     result = render_open_script(meeting)
     assert "xdg-open" in result
     assert "MEET01" in result
+
+
+# === YAML frontmatter escaping ===
+#
+# Frontmatter is rendered as JSON-encoded double-quoted strings
+# (JSON ⊂ YAML for double-quoted scalars), so any control char, quote,
+# or backslash gets escaped properly. These tests lock in that no field
+# can be used to inject extra YAML lines or break the parser.
+
+
+def _frontmatter_lines(rendered: str) -> list[str]:
+    """Extract the lines between the first pair of `---` markers."""
+    lines = rendered.split("\n")
+    start = lines.index("---")
+    end = lines.index("---", start + 1)
+    return lines[start + 1 : end]
+
+
+def test_frontmatter_escapes_title_newline() -> None:
+    meeting = _make_meeting(title="line one\nline two\nINJECT: bad")
+    detail = _make_detail(meeting)
+    result = render_summary(meeting, detail)
+    fm = _frontmatter_lines(result)
+    # Title line must NOT have been split into multiple physical lines.
+    title_lines = [line for line in fm if line.startswith("title:")]
+    assert len(title_lines) == 1
+    # The injected "INJECT: bad" line must NOT appear as a frontmatter key.
+    assert not any(line.startswith("INJECT:") for line in fm)
+    # The escaped form should be present.
+    assert "\\n" in title_lines[0]
+
+
+def test_frontmatter_escapes_title_double_quote() -> None:
+    meeting = _make_meeting(title='evil "quote" here')
+    detail = _make_detail(meeting)
+    result = render_summary(meeting, detail)
+    fm = _frontmatter_lines(result)
+    title_lines = [line for line in fm if line.startswith("title:")]
+    assert len(title_lines) == 1
+    # Quotes inside the title must be escaped, not raw.
+    assert '\\"' in title_lines[0]
+
+
+def test_frontmatter_escapes_title_backslash() -> None:
+    meeting = _make_meeting(title="path\\to\\thing")
+    detail = _make_detail(meeting)
+    result = render_summary(meeting, detail)
+    fm = _frontmatter_lines(result)
+    title_lines = [line for line in fm if line.startswith("title:")]
+    assert len(title_lines) == 1
+    # Backslash must be doubled.
+    assert "\\\\" in title_lines[0]
+
+
+def test_frontmatter_escapes_organizer() -> None:
+    """Organizer is also a string field — must be escaped, not raw."""
+    meeting = _make_meeting(organizer_email='alice@example.com"\ninjected: bad')
+    detail = _make_detail(meeting)
+    result = render_summary(meeting, detail)
+    fm = _frontmatter_lines(result)
+    assert not any(line.startswith("injected:") for line in fm)
+
+
+def test_frontmatter_escapes_url() -> None:
+    meeting = _make_meeting(transcript_url='https://x"\ninjected: bad')
+    detail = _make_detail(meeting)
+    result = render_summary(meeting, detail)
+    fm = _frontmatter_lines(result)
+    assert not any(line.startswith("injected:") for line in fm)
+
+
+def test_frontmatter_unicode_preserved() -> None:
+    """Unicode in title should round-trip cleanly through the escape."""
+    meeting = _make_meeting(title="standup — w/ café crew 🎉")
+    detail = _make_detail(meeting)
+    result = render_summary(meeting, detail)
+    # The original content is preserved (just wrapped in quotes).
+    assert "café" in result
+    assert "🎉" in result
+
+
+def test_transcript_frontmatter_escapes_title() -> None:
+    """transcript.md and participants.md share the same risk surface."""
+    meeting = _make_meeting(title='evil"\ninjected: bad')
+    detail = _make_detail(meeting)
+    transcript = render_transcript(meeting, detail)
+    participants = render_participants(meeting, detail)
+    for rendered in (transcript, participants):
+        fm = _frontmatter_lines(rendered)
+        assert not any(line.startswith("injected:") for line in fm)

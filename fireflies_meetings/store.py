@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
+from pydantic import ValidationError
 
 from .api import (
     FatalAPIError,
@@ -61,6 +64,21 @@ MEETING_FILES: tuple[str, ...] = (
     "open.sh",
 )
 _IN_PROGRESS = "_in_progress"
+# Sentinel file written into detail/<meeting_id>/ AFTER all the meeting
+# files are on disk. _load_detail_from_disk and get_uncached_meeting_ids
+# both gate on this so an interrupted write doesn't leave half a meeting
+# being served forever.
+_COMPLETE_SENTINEL = ".complete"
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write `data` to `path` atomically. Crashes mid-write leave the
+    target untouched (a stale .tmp file may remain — that's fine; the
+    next write overwrites it)."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
 
 # Detail re-fetch interval for non-completed meetings
 _DETAIL_TTL = 60.0  # 1 minute (live transcripts grow in real time)
@@ -125,7 +143,9 @@ class _BackoffState:
             self.delay = retry_after
         else:
             self.delay = min(max(self.delay * 2, _BACKOFF_INITIAL), _BACKOFF_MAX)
-        jitter = self.delay * _BACKOFF_JITTER * (2 * random.random() - 1)
+        # Positive-only jitter: never schedule a retry EARLIER than the
+        # server-supplied window, otherwise we self-inflict another 429.
+        jitter = self.delay * _BACKOFF_JITTER * random.random()
         self.until = time.monotonic() + self.delay + jitter
         self.consecutive_timeouts = 0
         log.warning("Rate limited — backing off %.0fs", self.delay + jitter)
@@ -170,6 +190,11 @@ class MeetingStore:
         self.user_email: str | None = user_email
         self._list_cache_file: Path = self._status_cache.cache_dir / "list.json"
         self._detail_cache_dir: Path = self._status_cache.cache_dir / "detail"
+        # Guards mutations to _entries / _file_cache / _list_cache_time
+        # / _backoff and snapshot reads of those dicts. Held only for
+        # short critical sections — never around API calls — so a slow
+        # backfill never blocks foreground readdir/lookup ops.
+        self._lock = threading.Lock()
         self._load_list_cache()
 
     # === Disk persistence ===
@@ -181,7 +206,8 @@ class MeetingStore:
                 "fetched_at": self._list_cache_time,
                 "meetings": [e.meeting.model_dump() for e in self._entries.values()],
             }
-            self._list_cache_file.write_text(json.dumps(data))
+            self._list_cache_file.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_bytes(self._list_cache_file, json.dumps(data).encode())
         except OSError:
             log.warning("Failed to save list cache to disk")
 
@@ -199,7 +225,11 @@ class MeetingStore:
             for m in raw_meetings:
                 if not isinstance(m, dict):
                     continue
-                meeting = Meeting.model_validate(m)
+                try:
+                    meeting = Meeting.model_validate(m)
+                except ValidationError as e:
+                    log.warning("Skipping malformed cached meeting: %s", e)
+                    continue
                 entries[meeting.id] = MeetingEntry(meeting=meeting, slug=meeting.slug)
             self._entries = entries
             fetched_at = data.get("fetched_at")
@@ -210,15 +240,21 @@ class MeetingStore:
                 len(entries),
                 time.time() - self._list_cache_time,
             )
-        except (OSError, KeyError, ValueError):
+        except (OSError, json.JSONDecodeError):
             log.warning("Failed to load list cache from disk")
 
     def _save_detail_to_disk(self, meeting_id: str, files: dict[str, bytes]) -> None:
         try:
             detail_dir = self._detail_cache_dir / meeting_id
             detail_dir.mkdir(parents=True, exist_ok=True)
+            # Drop any existing sentinel before rewriting — if the writes
+            # below crash, the partially-rewritten dir won't look complete.
+            sentinel = detail_dir / _COMPLETE_SENTINEL
+            if sentinel.exists():
+                sentinel.unlink()
             for filename, content in files.items():
-                (detail_dir / filename).write_bytes(content)
+                _atomic_write_bytes(detail_dir / filename, content)
+            sentinel.touch()
         except OSError:
             log.warning("Failed to save detail cache for %s", meeting_id)
 
@@ -227,68 +263,83 @@ class MeetingStore:
             detail_dir = self._detail_cache_dir / meeting_id
             if not detail_dir.is_dir():
                 return None
-            files = {p.name: p.read_bytes() for p in detail_dir.iterdir() if p.is_file()}
+            if not (detail_dir / _COMPLETE_SENTINEL).exists():
+                return None
+            files = {
+                p.name: p.read_bytes()
+                for p in detail_dir.iterdir()
+                if p.is_file() and p.name != _COMPLETE_SENTINEL
+            }
             return _CachedFiles(files=files, fetched_at=time.monotonic()) if files else None
         except OSError:
             log.warning("Failed to load detail cache for %s", meeting_id)
             return None
 
     def _refresh_if_stale(self) -> None:
-        now = time.time()
-        if now - self._list_cache_time < self._current_ttl:
-            return
-        if self._backoff.is_backed_off:
-            log.debug("Skipping list refresh — in backoff period")
-            return
-        self._fetch_meetings()
+        with self._lock:
+            now = time.time()
+            if now - self._list_cache_time < self._current_ttl:
+                return
+            if self._backoff.is_backed_off:
+                log.debug("Skipping list refresh — in backoff period")
+                return
+            is_initial = len(self._entries) == 0
+        self._fetch_meetings(is_initial=is_initial)
 
-    def _fetch_meetings(self) -> None:
+    def _fetch_meetings(self, *, is_initial: bool) -> None:
         """Fetch meeting list from API and populate entries.
 
         First fetch: all pages. Subsequent refreshes: page 1 only, merged
         with existing entries so older meetings are preserved.
         """
-        is_initial = len(self._entries) == 0
         max_pages = None if is_initial else 1
         label = "all pages" if is_initial else "page 1"
         log.info("Fetching meeting list from Fireflies API (%s)", label)
+
+        # API call — no lock held
         try:
             meetings = self._client.list_transcripts(max_pages=max_pages)
         except RateLimitedError as e:
-            self._backoff.record_rate_limit(e.retry_after)
+            with self._lock:
+                self._backoff.record_rate_limit(e.retry_after)
             return
         except FatalAPIError:
-            self._backoff.record_fatal()
+            with self._lock:
+                self._backoff.record_fatal()
             return
         except httpx.TimeoutException:
             log.warning("Timeout fetching meeting list")
-            self._backoff.record_failure(is_timeout=True)
+            with self._lock:
+                self._backoff.record_failure(is_timeout=True)
             return
         except httpx.HTTPError as e:
             log.warning("HTTP error fetching meeting list: %s", e)
-            self._backoff.record_failure()
+            with self._lock:
+                self._backoff.record_failure()
             return
 
-        if is_initial:
-            entries: dict[str, MeetingEntry] = {}
-            for raw_meeting in meetings:
-                meeting = _with_slug(raw_meeting)
-                entries[meeting.id] = MeetingEntry(meeting=meeting, slug=meeting.slug)
-            self._entries = entries
-        else:
-            for raw_meeting in meetings:
-                meeting = _with_slug(raw_meeting)
-                self._entries[meeting.id] = MeetingEntry(meeting=meeting, slug=meeting.slug)
+        # Build new entries outside the lock (pure computation)
+        new_entries: dict[str, MeetingEntry] = {}
+        for raw_meeting in meetings:
+            meeting = _with_slug(raw_meeting)
+            new_entries[meeting.id] = MeetingEntry(meeting=meeting, slug=meeting.slug)
 
-        self._list_cache_time = time.time()
-        jitter_factor = 0.7 + random.random() * 0.6  # [0.7, 1.3]
-        self._current_ttl = self._list_ttl * jitter_factor
-        self._backoff.record_success()
-        log.info(
-            "Loaded %d meetings (next refresh in %.0fs)",
-            len(self._entries),
-            self._current_ttl,
-        )
+        # Apply under the lock
+        with self._lock:
+            if is_initial:
+                self._entries = new_entries
+            else:
+                self._entries.update(new_entries)
+
+            self._list_cache_time = time.time()
+            jitter_factor = 0.7 + random.random() * 0.6  # [0.7, 1.3]
+            self._current_ttl = self._list_ttl * jitter_factor
+            self._backoff.record_success()
+            log.info(
+                "Loaded %d meetings (next refresh in %.0fs)",
+                len(self._entries),
+                self._current_ttl,
+            )
         self._save_list_cache()
 
     def _resolve_collisions(self, entries: list[MeetingEntry]) -> dict[str, MeetingEntry]:
@@ -313,30 +364,41 @@ class MeetingStore:
         return time.monotonic() - cached.fetched_at < _DETAIL_TTL
 
     def _fetch_detail(self, meeting: Meeting) -> _CachedFiles | None:
-        """Call the API and render files for a meeting. Updates backoff state."""
+        """Call the API and render files for a meeting. Updates backoff state.
+
+        The API call runs WITHOUT self._lock held (called outside the lock by
+        _ensure_files / backfill_one). Backoff state updates are done under
+        the lock.
+        """
         meeting_id = meeting.id
         try:
             detail = self._client.get_transcript(meeting_id)
         except RateLimitedError as e:
-            self._backoff.record_rate_limit(e.retry_after)
+            with self._lock:
+                self._backoff.record_rate_limit(e.retry_after)
             return None
         except FatalAPIError:
-            self._backoff.record_fatal()
+            with self._lock:
+                self._backoff.record_fatal()
             return None
         except TransientAPIError as e:
             log.warning("Transient API error fetching detail for %s: %s", meeting_id, e)
-            self._backoff.record_failure()
+            with self._lock:
+                self._backoff.record_failure()
             return None
         except httpx.TimeoutException:
             log.warning("Timeout fetching detail for %s", meeting_id)
-            self._backoff.record_failure(is_timeout=True)
+            with self._lock:
+                self._backoff.record_failure(is_timeout=True)
             return None
         except httpx.HTTPError as e:
             log.warning("HTTP error fetching detail for %s: %s", meeting_id, e)
-            self._backoff.record_failure()
+            with self._lock:
+                self._backoff.record_failure()
             return None
 
-        self._backoff.record_success()
+        with self._lock:
+            self._backoff.record_success()
 
         # The detail's meeting object came from a separate API call; carry over
         # the slug and date that the list-side computed for this entry so the
@@ -367,34 +429,43 @@ class MeetingStore:
         Returns None only on API error or unknown meeting.
         Completed meetings are served from disk after first fetch.
         Live/in-progress meetings expire after _DETAIL_TTL seconds.
+
+        Lock is held only for the cache check / cache update — the slow
+        API call inside _fetch_detail runs without the lock.
         """
-        cached = self._file_cache.get(meeting_id)
-        if cached is not None and self._is_cache_fresh(meeting_id, cached):
-            return cached
+        # Fast path: cache hit (under lock for a consistent snapshot)
+        with self._lock:
+            cached = self._file_cache.get(meeting_id)
+            if cached is not None and self._is_cache_fresh(meeting_id, cached):
+                return cached
 
-        if cached is not None:
-            log.info("Detail TTL expired for in-progress meeting %s, re-fetching", meeting_id)
-            del self._file_cache[meeting_id]
+            if cached is not None:
+                log.info("Detail TTL expired for in-progress meeting %s, re-fetching", meeting_id)
+                del self._file_cache[meeting_id]
 
-        entry = self._entries.get(meeting_id)
-        if entry is None:
-            return None
+            entry = self._entries.get(meeting_id)
+            if entry is None:
+                return None
 
-        # Completed meetings: serve from disk, no API call needed
-        if self._status_cache.is_completed(meeting_id):
-            disk = self._load_detail_from_disk(meeting_id)
-            if disk is not None:
-                self._file_cache[meeting_id] = disk
-                return disk
+            # Completed meetings: serve from disk, no API call needed
+            if self._status_cache.is_completed(meeting_id):
+                disk = self._load_detail_from_disk(meeting_id)
+                if disk is not None:
+                    self._file_cache[meeting_id] = disk
+                    return disk
 
-        if self._backoff.is_backed_off:
-            log.debug("Skipping detail fetch for %s — in backoff period", meeting_id)
-            return cached
+            if self._backoff.is_backed_off:
+                log.debug("Skipping detail fetch for %s — in backoff period", meeting_id)
+                return cached
 
-        log.info("Fetching detail for meeting %s: %s", meeting_id, entry.meeting.title)
-        new_cached = self._fetch_detail(entry.meeting)
+            meeting = entry.meeting  # snapshot for the API call outside lock
+
+        # Slow path: API call without the lock
+        log.info("Fetching detail for meeting %s: %s", meeting_id, meeting.title)
+        new_cached = self._fetch_detail(meeting)
         if new_cached is not None:
-            self._file_cache[meeting_id] = new_cached
+            with self._lock:
+                self._file_cache[meeting_id] = new_cached
         return new_cached
 
     # === Public API ===
@@ -402,15 +473,19 @@ class MeetingStore:
     def list_year_months(self) -> list[str]:
         """Return sorted list of YYYY-MM strings, newest first."""
         self._refresh_if_stale()
-        months = {e.meeting.date_str[:7] for e in self._entries.values() if e.meeting.date_str}
+        with self._lock:
+            snapshot = list(self._entries.values())
+        months = {e.meeting.date_str[:7] for e in snapshot if e.meeting.date_str}
         return sorted(months, reverse=True)
 
     def list_days(self, year_month: str) -> list[str]:
         """Return sorted list of DD strings for a given YYYY-MM, newest first."""
         self._refresh_if_stale()
+        with self._lock:
+            snapshot = list(self._entries.values())
         days = {
             e.meeting.date_str[8:10]
-            for e in self._entries.values()
+            for e in snapshot
             if e.meeting.date_str and e.meeting.date_str[:7] == year_month
         }
         return sorted(days, reverse=True)
@@ -418,7 +493,8 @@ class MeetingStore:
     def list_meetings(self, date_str: str) -> dict[str, MeetingEntry]:
         """Return dirname -> MeetingEntry for a YYYY-MM-DD date, with collision handling."""
         self._refresh_if_stale()
-        entries = [e for e in self._entries.values() if e.meeting.date_str == date_str]
+        with self._lock:
+            entries = [e for e in self._entries.values() if e.meeting.date_str == date_str]
         return self._resolve_collisions(entries)
 
     def list_year_months_mine(self) -> list[str]:
@@ -426,9 +502,11 @@ class MeetingStore:
         self._refresh_if_stale()
         if not self.user_email:
             return []
+        with self._lock:
+            snapshot = list(self._entries.values())
         months = {
             e.meeting.date_str[:7]
-            for e in self._entries.values()
+            for e in snapshot
             if e.meeting.date_str and e.meeting.organizer_email == self.user_email
         }
         return sorted(months, reverse=True)
@@ -438,9 +516,11 @@ class MeetingStore:
         self._refresh_if_stale()
         if not self.user_email:
             return []
+        with self._lock:
+            snapshot = list(self._entries.values())
         days = {
             e.meeting.date_str[8:10]
-            for e in self._entries.values()
+            for e in snapshot
             if e.meeting.date_str
             and e.meeting.date_str[:7] == year_month
             and e.meeting.organizer_email == self.user_email
@@ -452,22 +532,31 @@ class MeetingStore:
         self._refresh_if_stale()
         if not self.user_email:
             return {}
-        entries = [
-            e for e in self._entries.values()
-            if e.meeting.date_str == date_str and e.meeting.organizer_email == self.user_email
-        ]
+        with self._lock:
+            entries = [
+                e for e in self._entries.values()
+                if e.meeting.date_str == date_str and e.meeting.organizer_email == self.user_email
+            ]
         return self._resolve_collisions(entries)
 
     def list_live_meeting_ids(self) -> list[str]:
         """Return IDs of currently live meetings."""
         self._refresh_if_stale()
-        return [mid for mid, e in self._entries.items() if e.meeting.is_live]
+        with self._lock:
+            return [mid for mid, e in self._entries.items() if e.meeting.is_live]
 
     def get_uncached_meeting_ids(self) -> list[str]:
-        """Return IDs of completed meetings that have no disk detail cache yet."""
+        """Return IDs of completed meetings that have no disk detail cache yet.
+
+        Gates on the .complete sentinel so a half-populated dir from an
+        interrupted write gets re-fetched instead of being treated as cached.
+        """
+        with self._lock:
+            snapshot = list(self._entries.items())
         return [
-            mid for mid, e in self._entries.items()
-            if e.meeting.is_completed and not (self._detail_cache_dir / mid).is_dir()
+            mid for mid, e in snapshot
+            if e.meeting.is_completed
+            and not (self._detail_cache_dir / mid / _COMPLETE_SENTINEL).exists()
         ]
 
     def backfill_one(self, meeting_id: str) -> None:
@@ -477,11 +566,14 @@ class MeetingStore:
         Raises RateLimitedError, FatalAPIError, or TransientAPIError on API errors;
         caller handles backoff. No-ops if already cached or entry not found.
         """
-        if (self._detail_cache_dir / meeting_id).is_dir():
+        if (self._detail_cache_dir / meeting_id / _COMPLETE_SENTINEL).exists():
             return
-        entry = self._entries.get(meeting_id)
+        with self._lock:
+            entry = self._entries.get(meeting_id)
         if entry is None:
             return
+        # API call outside lock; caller (get_uncached_meeting_ids) already
+        # verified the meeting is_completed so marking it as such is correct.
         raw_detail = self._client.get_transcript(meeting_id)
         detail = raw_detail.model_copy(update={
             "meeting": raw_detail.meeting.model_copy(update={
@@ -509,17 +601,20 @@ class MeetingStore:
                 return f"../{year_month}/{day}/{dirname}"
         return None
 
-    def get_file(self, meeting_id: str, filename: str) -> bytes | None:
-        """Return rendered file bytes for a meeting, or None on failure.
+    def get_file(self, meeting_id: str, filename: str) -> tuple[bytes | None, bool]:
+        """Return (file_bytes, is_completed) for a meeting.
 
         Slow path: may trigger an API fetch if the meeting isn't on disk and
         isn't in the in-memory cache. Only call from `open` / `read`, never
         from `readdir` / `lookup` / `getattr`.
+
+        Returns (None, False) on failure.
         """
         cached = self._ensure_files(meeting_id)
         if cached is None:
-            return None
-        return cached.files.get(filename)
+            return None, False
+        completed = self._status_cache.is_completed(meeting_id)
+        return cached.files.get(filename), completed
 
     def get_file_size(self, meeting_id: str, filename: str) -> int:
         """Cheap stat-only size lookup. Never blocks on the network.
@@ -530,11 +625,12 @@ class MeetingStore:
         the backfill task fetches it. Used by `readdir` / `lookup` / `getattr`
         so that listing a directory never blocks on an API call.
         """
-        cached = self._file_cache.get(meeting_id)
-        if cached is not None:
-            data = cached.files.get(filename)
-            if data is not None:
-                return len(data)
+        with self._lock:
+            cached = self._file_cache.get(meeting_id)
+            if cached is not None:
+                data = cached.files.get(filename)
+                if data is not None:
+                    return len(data)
         try:
             return (self._detail_cache_dir / meeting_id / filename).stat().st_size
         except OSError:
@@ -555,7 +651,8 @@ class MeetingStore:
 
     def invalidate(self) -> None:
         """Force re-fetch of meeting list on next access."""
-        self._list_cache_time = 0.0
+        with self._lock:
+            self._list_cache_time = 0.0
 
     @property
     def is_auth_fatal(self) -> bool:
@@ -564,14 +661,15 @@ class MeetingStore:
 
     def force_refresh(self) -> None:
         """Full cache invalidation: list, non-completed details, backoff."""
-        self._list_cache_time = 0.0
-        self._backoff = _BackoffState()
-        to_evict = [
-            mid for mid in self._file_cache
-            if not self._status_cache.is_completed(mid)
-        ]
-        for mid in to_evict:
-            del self._file_cache[mid]
+        with self._lock:
+            self._list_cache_time = 0.0
+            self._backoff = _BackoffState()
+            to_evict = [
+                mid for mid in self._file_cache
+                if not self._status_cache.is_completed(mid)
+            ]
+            for mid in to_evict:
+                del self._file_cache[mid]
         log.info(
             "Force refresh: cleared list cache, backoff, and %d non-completed file caches",
             len(to_evict),
