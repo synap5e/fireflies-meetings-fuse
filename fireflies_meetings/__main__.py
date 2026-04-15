@@ -24,6 +24,26 @@ def _default_api_key_path() -> str:
     return os.path.expanduser("~/.config/fireflies-meetings/api_key")
 
 
+def _default_chat_token_path() -> str:
+    return os.path.expanduser("~/.config/fireflies-meetings/google_chat_token.json")
+
+
+def _resolve_chat_credentials(explicit: str | None) -> Path | None:
+    """Find the Google Chat OAuth client-secret JSON.
+
+    Order: --chat-credentials arg, project-local `secrets/client_secret_*.json`
+    (relative to CWD), ~/.config/fireflies-meetings/google_chat_credentials.json.
+    """
+    if explicit:
+        p = Path(explicit).expanduser()
+        return p if p.exists() else None
+    local = sorted(Path("secrets").glob("client_secret_*.json"))
+    if local:
+        return local[0]
+    home = Path.home() / ".config" / "fireflies-meetings" / "google_chat_credentials.json"
+    return home if home.exists() else None
+
+
 def _load_api_key(api_key_path: str) -> str:
     """Load API key from file or FIREFLIES_API_KEY env var."""
     env_key = os.environ.get("FIREFLIES_API_KEY", "").strip()
@@ -123,7 +143,57 @@ async def _signal_listener(store: MeetingStore) -> None:
             await trio.to_thread.run_sync(store.force_refresh)
 
 
-async def _run_mount(store: MeetingStore) -> None:
+async def _chat_watch_loop(
+    store: MeetingStore,
+    token_path: Path,
+    *,
+    poll_interval: float = 30.0,
+    lookback_seconds: float = 7 * 86400.0,
+) -> None:
+    """Poll Google Chat for Fireflies live-meeting URLs and register IDs.
+
+    The Fireflies `transcripts` list query hides live meetings from
+    non-admin users. This loop reads the user's Chat spaces for messages
+    containing `app.fireflies.ai/live/<id>` URLs (posted by Meet when the
+    Fireflies bot joins) and feeds those IDs into `store.watch_meeting`.
+    """
+    import httpx
+    import trio
+
+    from .chat_watcher import ChatWatcher, load_credentials
+
+    creds = load_credentials(token_path)
+    if creds is None:
+        _log.warning(
+            "Google Chat token at %s is missing or invalid; "
+            "live meeting discovery disabled. Run `fireflies-meetings auth-chat` to set it up.",
+            token_path,
+        )
+        return
+
+    watcher = ChatWatcher(creds, token_path=token_path)
+    _log.info("Google Chat watcher started (polling every %.0fs)", poll_interval)
+    try:
+        while True:
+            try:
+                ids = await trio.to_thread.run_sync(
+                    functools.partial(watcher.find_live_meeting_ids, lookback_seconds=lookback_seconds),
+                )
+            except (OSError, httpx.HTTPError, ValueError):
+                _log.exception("Chat watcher poll failed; retrying next interval")
+                await trio.sleep(poll_interval)
+                continue
+
+            if ids:
+                _log.debug("Chat watcher found %d candidate meeting IDs", len(ids))
+            for mid in ids:
+                await trio.to_thread.run_sync(store.watch_meeting, mid)
+            await trio.sleep(poll_interval)
+    finally:
+        watcher.close()
+
+
+async def _run_mount(store: MeetingStore, chat_token_path: Path | None) -> None:
     import pyfuse3
     import trio
 
@@ -131,6 +201,8 @@ async def _run_mount(store: MeetingStore) -> None:
         nursery.start_soon(pyfuse3.main)
         nursery.start_soon(_backfill_cache, store)
         nursery.start_soon(_signal_listener, store)
+        if chat_token_path is not None:
+            nursery.start_soon(_chat_watch_loop, store, chat_token_path)
 
 
 def cmd_mount(args: argparse.Namespace) -> None:
@@ -149,7 +221,8 @@ def cmd_mount(args: argparse.Namespace) -> None:
     mountpoint = Path(args.mountpoint)
     mountpoint.mkdir(parents=True, exist_ok=True)
 
-    client = FirefliesClient(api_key)
+    session_token = os.environ.get("FIREFLIES_SESSION_TOKEN", "").strip() or None
+    client = FirefliesClient(api_key, session_token=session_token)
     try:
         status_cache = StatusCache()
 
@@ -175,15 +248,46 @@ def cmd_mount(args: argparse.Namespace) -> None:
         if args.debug:
             fuse_options.add("debug")
 
+        chat_token_path = Path(args.chat_token).expanduser()
+        chat_token_arg: Path | None = chat_token_path if chat_token_path.exists() else None
+        if chat_token_arg is None:
+            _log.info(
+                "No Google Chat token at %s; live meeting discovery disabled.",
+                chat_token_path,
+            )
+
         pyfuse3.init(ops, str(mountpoint), fuse_options)
         try:
-            trio.run(_run_mount, store)
+            trio.run(_run_mount, store, chat_token_arg)
         except KeyboardInterrupt:
             pass
         finally:
             pyfuse3.close()
     finally:
         client.close()
+
+
+def cmd_auth_chat(args: argparse.Namespace) -> None:
+    """Run the Google Chat OAuth flow and save the token."""
+    from .chat_watcher import authorize
+
+    _configure_logging(debug=False)
+    creds_path = _resolve_chat_credentials(args.chat_credentials)
+    if creds_path is None:
+        print(
+            "Google Chat credentials not found. Place the OAuth client_secret JSON at "
+            "./secrets/client_secret_*.json or ~/.config/fireflies-meetings/google_chat_credentials.json, "
+            "or pass --chat-credentials PATH.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    token_path = Path(args.chat_token).expanduser()
+    print(f"Using credentials: {creds_path}")
+    print(f"Token will be saved to: {token_path}")
+    print("Opening a browser for OAuth authorization...")
+    authorize(creds_path, token_path)
+    print(f"Success. Token saved to {token_path}")
 
 
 def cmd_unmount(args: argparse.Namespace) -> None:
@@ -224,7 +328,35 @@ def main() -> None:
         action="store_true",
         help="Enable FUSE debug output",
     )
+    mount_parser.add_argument(
+        "--chat-token",
+        default=_default_chat_token_path(),
+        help=(
+            f"Path to saved Google Chat OAuth token (default: {_default_chat_token_path()}). "
+            "If missing, live meeting discovery is disabled."
+        ),
+    )
     mount_parser.set_defaults(func=cmd_mount)
+
+    auth_chat_parser = sub.add_parser(
+        "auth-chat",
+        help="Run Google Chat OAuth flow (enables live meeting discovery)",
+    )
+    auth_chat_parser.add_argument(
+        "--chat-credentials",
+        default=None,
+        help=(
+            "Path to Google Chat OAuth client_secret JSON. "
+            "Default: first match of ./secrets/client_secret_*.json, "
+            "then ~/.config/fireflies-meetings/google_chat_credentials.json"
+        ),
+    )
+    auth_chat_parser.add_argument(
+        "--chat-token",
+        default=_default_chat_token_path(),
+        help=f"Path to save the token (default: {_default_chat_token_path()})",
+    )
+    auth_chat_parser.set_defaults(func=cmd_auth_chat)
 
     unmount_parser = sub.add_parser("unmount", help="Unmount the filesystem")
     unmount_parser.add_argument(

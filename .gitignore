@@ -1,5 +1,7 @@
 # Secrets
 .env
+secrets/*
+!secrets/.gitkeep
 
 # Python
 __pycache__/

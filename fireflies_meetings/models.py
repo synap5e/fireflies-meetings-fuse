@@ -9,7 +9,7 @@ frozen so any "mutation" must go through `model_copy(update=...)`.
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import cast
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -123,7 +123,7 @@ class MeetingInfo(_FFBaseModel):
 def _epoch_ms_to_date_str(epoch_ms: float) -> str:
     if not epoch_ms:
         return ""
-    return datetime.fromtimestamp(epoch_ms / 1000, tz=UTC).strftime("%Y-%m-%d")
+    return datetime.fromtimestamp(epoch_ms / 1000).strftime("%Y-%m-%d")
 
 
 class Meeting(_FFBaseModel):
@@ -167,12 +167,15 @@ class Meeting(_FFBaseModel):
     @model_validator(mode="before")
     @classmethod
     def _derive_date_str(cls, data: object) -> object:
-        """Fill in `date_str` from `date_epoch_ms` / `date` if not provided."""
+        """Always derive `date_str` from the epoch timestamp.
+
+        Re-derives even when `date_str` is already present (e.g. from the
+        disk cache) so that a timezone change takes effect without nuking
+        the cache.
+        """
         if not isinstance(data, dict):
             return data
         typed = cast("dict[str, object]", data)
-        if typed.get("date_str"):
-            return typed
         epoch_raw = typed.get("date_epoch_ms") or typed.get("date")
         if isinstance(epoch_raw, (int, float)) and epoch_raw:
             new_data: dict[str, object] = dict(typed)

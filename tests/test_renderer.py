@@ -88,6 +88,16 @@ def test_render_summary_no_summary() -> None:
     assert "in progress" in result.lower()
 
 
+def test_render_summary_not_found() -> None:
+    meeting = _make_meeting(
+        meeting_info=MeetingInfo(summary_status="not_found"),
+    )
+    detail = _make_detail(meeting, summary=None)
+    result = render_summary(meeting, detail)
+    assert "no longer available" in result.lower()
+    assert 'status: "not_found"' in result
+
+
 def test_render_transcript_timestamps() -> None:
     meeting = _make_meeting()
     detail = _make_detail(meeting)
