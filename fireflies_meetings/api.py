@@ -10,12 +10,14 @@ from datetime import datetime
 import httpx
 from pydantic import ValidationError
 
-from .models import Meeting, TranscriptDetail
+from .models import Meeting, Sentence, TranscriptDetail
+from .session_auth import SessionAuth, internal_request_headers
 
 log = logging.getLogger(__name__)
 
 _ENDPOINT = "https://api.fireflies.ai/graphql"
 _HIVE_ENDPOINT = "https://app.fireflies.ai/api/v4/hive"
+_INTERNAL_GRAPHQL_ENDPOINT = "https://app.fireflies.ai/api/v4/graphql"
 _PAGE_SIZE = 50
 
 # Recursive JSON type for untyped API responses
@@ -46,6 +48,14 @@ _USER_QUERY = """
 query {
   user {
     email
+  }
+}
+"""
+
+_ACTIVE_MEETINGS_QUERY = """
+query ActiveMeetings($states: [MeetingState!]) {
+  active_meetings(input: { states: $states }) {
+    id
   }
 }
 """
@@ -92,6 +102,61 @@ query Transcript($id: String!) {
 }
 """
 
+_INTERNAL_DETAIL_QUERY = """
+query fetchNotepadMeeting($meetingNoteId: String!) {
+  meetingNote(_id: $meetingNoteId) {
+    _id
+    parseId
+    title
+    date
+    creator_email
+    allEmails
+    processMeetingStatus
+    summaryStatus
+    audioServiceMetadata {
+      silentMeeting
+      preferredLanguage
+      numCaptions
+    }
+    speakerMeta
+    captions {
+      index
+      sentence
+      speaker_id
+      time
+      endTime
+    }
+    attendees {
+      displayName
+      email
+    }
+    summary {
+      gist
+      shortSummary
+    }
+  }
+}
+"""
+
+_INTERNAL_REALTIME_TOKEN_QUERY = """
+query getTranscriptFFAuth($meetingId: String!) {
+  getTranscriptFFAuth(meetingId: $meetingId)
+}
+"""
+
+_INTERNAL_LIVE_TRANSCRIPT_QUERY = """
+query getLiveTranscript($meetingId: String!, $realtimeToken: String!) {
+  getLiveTranscript(meetingId: $meetingId, realtimeToken: $realtimeToken) {
+    sentence
+    speaker_name
+    speaker_id
+    transcript_id
+    time
+    endTime
+  }
+}
+"""
+
 
 class RateLimitedError(Exception):
     """Raised when the API rate limit is hit."""
@@ -128,6 +193,86 @@ def _nest_meeting_fields(raw: JsonObject) -> JsonObject:
     if "meeting" in raw:
         return raw
     return {**raw, "meeting": raw}
+
+
+def _partial_error_for_path(errors: JsonValue, path: tuple[str, ...]) -> str:
+    """Return a short message if a GraphQL partial error hit `path`."""
+    if not isinstance(errors, list):
+        return ""
+    for raw_error in errors:
+        if not isinstance(raw_error, dict):
+            continue
+        raw_path = raw_error.get("path")
+        if not isinstance(raw_path, list) or tuple(raw_path) != path:
+            continue
+        code = raw_error.get("code")
+        if not isinstance(code, str):
+            extensions = raw_error.get("extensions")
+            if isinstance(extensions, dict):
+                ext_code = extensions.get("code")
+                code = ext_code if isinstance(ext_code, str) else ""
+        field = ".".join(path)
+        return f"Fireflies returned {code or 'an error'} for {field}"
+    return ""
+
+
+def _merge_detail(primary: TranscriptDetail, fallback: TranscriptDetail) -> TranscriptDetail:
+    """Prefer public API metadata, but use internal fallback transcript sentences."""
+    return primary.model_copy(update={
+        "meeting": fallback.meeting.model_copy(update={
+            "is_live": primary.meeting.is_live or fallback.meeting.is_live,
+            "organizer_email": primary.meeting.organizer_email or fallback.meeting.organizer_email,
+            "participants": primary.meeting.participants or fallback.meeting.participants,
+            "transcript_url": primary.meeting.transcript_url or fallback.meeting.transcript_url,
+            "meeting_info": primary.meeting.meeting_info,
+        }),
+        "sentences": fallback.sentences,
+        "speakers": primary.speakers or fallback.speakers,
+        "summary": primary.summary or fallback.summary,
+        "attendees": fallback.attendees or primary.attendees,
+        "transcript_error": "",
+    })
+
+
+def _normalize_live_transcript_items(raw_items: JsonValue) -> list[Sentence]:
+    """Normalize internal live transcript rows into our Sentence model."""
+    if not isinstance(raw_items, list):
+        return []
+
+    sentences: list[Sentence] = []
+    for position, raw_item in enumerate(raw_items):
+        if not isinstance(raw_item, dict):
+            continue
+
+        text = raw_item.get("sentence")
+        if not isinstance(text, str) or not text.strip():
+            continue
+
+        speaker_name = raw_item.get("speaker_name")
+        if not isinstance(speaker_name, str) or not speaker_name:
+            speaker_id = raw_item.get("speaker_id")
+            speaker_name = str(speaker_id) if speaker_id is not None else ""
+
+        index = position
+        transcript_id = raw_item.get("transcript_id")
+        if isinstance(transcript_id, int):
+            index = transcript_id
+        elif isinstance(transcript_id, str) and transcript_id.isdigit():
+            index = int(transcript_id)
+
+        try:
+            sentences.append(Sentence.model_validate({
+                "index": index,
+                "sentence": text,
+                "time": raw_item.get("time"),
+                "endTime": raw_item.get("endTime"),
+                "speaker_name": speaker_name,
+            }))
+        except ValidationError as e:
+            log.warning("Skipping malformed live transcript sentence: %s", e)
+
+    sentences.sort(key=lambda sentence: (sentence.start_time, sentence.index))
+    return sentences
 
 
 # --- Internal "hive" API fallback ---
@@ -215,9 +360,10 @@ class FirefliesClient:
         self,
         api_key: str,
         *,
-        session_token: str | None = None,
+        session_auth: SessionAuth | None = None,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
+        self._session_auth = session_auth
         headers: dict[str, str] = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -233,18 +379,147 @@ class FirefliesClient:
         # without discarding the response we already received.
         self._rate_limit_blocked_until: float = 0.0
 
+        internal_headers = {
+            "Content-Type": "application/json",
+            "Origin": "https://app.fireflies.ai",
+        }
+        if session_auth is not None:
+            internal_headers.update(internal_request_headers(
+                session_auth,
+                referer="https://app.fireflies.ai/",
+            ))
+        if transport is not None:
+            self._internal_client = httpx.Client(
+                headers=internal_headers,
+                timeout=30.0,
+                transport=transport,
+            )
+        else:
+            self._internal_client = httpx.Client(headers=internal_headers, timeout=30.0)
+
         # Optional internal API client for fallback when the public
         # `transcripts` query is broken. Uses session-based JWT auth
         # from the Fireflies web app.
         self._hive_client: httpx.Client | None = None
-        if session_token:
+        if session_auth is not None:
             self._hive_client = httpx.Client(
-                headers={
-                    "authorization": session_token,
-                    "Content-Type": "application/json",
-                },
+                headers=internal_request_headers(
+                    session_auth,
+                    referer="https://app.fireflies.ai/",
+                ),
                 timeout=30.0,
+                transport=transport,
             )
+
+    @property
+    def has_internal_auth(self) -> bool:
+        return self._session_auth is not None
+
+    def get_internal_realtime_token(self, meeting_id: str) -> str | None:
+        return self._get_internal_realtime_token(meeting_id)
+
+    def _post_internal(
+        self,
+        query: str,
+        variables: dict[str, JsonValue],
+        *,
+        operation_name: str,
+        referer: str,
+    ) -> JsonObject | None:
+        """Execute the internal web-app GraphQL query.
+
+        This path is only a best-effort fallback for cases where the public
+        transcript query omits or errors on live captions.
+        """
+        if self._session_auth is None:
+            return None
+
+        try:
+            resp = self._internal_client.post(
+                _INTERNAL_GRAPHQL_ENDPOINT,
+                headers={"Referer": referer},
+                json={
+                    "operationName": operation_name,
+                    "query": query,
+                    "variables": variables,
+                },
+            )
+            resp.raise_for_status()
+            body: JsonObject = resp.json()
+        except (httpx.HTTPError, json.JSONDecodeError, ValueError) as e:
+            log.debug("Internal Fireflies fallback failed for %s: %s", operation_name, e)
+            return None
+
+        data = body.get("data")
+        if not isinstance(data, dict) and body.get("errors"):
+            log.debug("Internal Fireflies fallback returned only errors: %s", body["errors"])
+            return None
+        return body
+
+    def _get_internal_transcript(self, meeting_id: str) -> TranscriptDetail | None:
+        body = self._post_internal(
+            _INTERNAL_DETAIL_QUERY,
+            {"meetingNoteId": meeting_id},
+            operation_name="fetchNotepadMeeting",
+            referer=f"https://app.fireflies.ai/view/{meeting_id}",
+        )
+        if body is None:
+            return None
+        data = body.get("data")
+        raw = data.get("meetingNote") if isinstance(data, dict) else None
+        if not isinstance(raw, dict) or not raw:
+            return None
+        try:
+            return TranscriptDetail.model_validate(_nest_meeting_fields(raw))
+        except ValidationError as e:
+            log.warning("Skipping malformed internal transcript detail: %s", e)
+            return None
+
+    def _get_internal_realtime_token(self, meeting_id: str) -> str | None:
+        body = self._post_internal(
+            _INTERNAL_REALTIME_TOKEN_QUERY,
+            {"meetingId": meeting_id},
+            operation_name="getTranscriptFFAuth",
+            referer=f"https://app.fireflies.ai/view/{meeting_id}",
+        )
+        if body is None:
+            return None
+
+        data = body.get("data")
+        raw_token = data.get("getTranscriptFFAuth") if isinstance(data, dict) else None
+        if isinstance(raw_token, str) and raw_token:
+            return raw_token
+
+        log.debug("Internal Fireflies realtime auth returned no token for %s", meeting_id)
+        return None
+
+    def _get_internal_live_transcript(
+        self,
+        meeting_id: str,
+        base_detail: TranscriptDetail,
+    ) -> TranscriptDetail | None:
+        token = self._get_internal_realtime_token(meeting_id)
+        if token is None:
+            return None
+
+        body = self._post_internal(
+            _INTERNAL_LIVE_TRANSCRIPT_QUERY,
+            {"meetingId": meeting_id, "realtimeToken": token},
+            operation_name="getLiveTranscript",
+            referer=f"https://app.fireflies.ai/view/{meeting_id}",
+        )
+        if body is None:
+            return None
+
+        data = body.get("data")
+        raw_items = data.get("getLiveTranscript") if isinstance(data, dict) else None
+        sentences = _normalize_live_transcript_items(raw_items)
+        if not sentences:
+            log.debug("Internal Fireflies live transcript returned no sentences for %s", meeting_id)
+            return None
+
+        log.debug("Internal Fireflies live transcript returned %d sentences for %s", len(sentences), meeting_id)
+        return base_detail.model_copy(update={"sentences": sentences, "transcript_error": ""})
 
     def _post(self, query: str, variables: dict[str, JsonValue]) -> JsonObject:
         """Execute a GraphQL query, handle rate limit headers and errors."""
@@ -407,6 +682,13 @@ class FirefliesClient:
         data = body.get("data")
         raw = data.get("transcript") if isinstance(data, dict) else None
         if not isinstance(raw, dict) or not raw:
+            internal_detail = self._get_internal_transcript(meeting_id)
+            if internal_detail is not None and internal_detail.sentences:
+                return internal_detail
+            if internal_detail is not None:
+                live_detail = self._get_internal_live_transcript(meeting_id, internal_detail)
+                if live_detail is not None:
+                    return live_detail
             # Distinguish permanent 404 (deleted transcript) from transient errors.
             errors = body.get("errors")
             if isinstance(errors, list) and any(
@@ -417,7 +699,20 @@ class FirefliesClient:
                     f"Transcript {meeting_id} no longer exists"
                 )
             raise TransientAPIError(f"No transcript data returned for {meeting_id}")
-        return TranscriptDetail.model_validate(_nest_meeting_fields(raw))
+        detail = TranscriptDetail.model_validate(_nest_meeting_fields(raw))
+        transcript_error = _partial_error_for_path(
+            body.get("errors"), ("transcript", "sentences"),
+        )
+        if detail.meeting.is_live and (transcript_error or not detail.sentences):
+            internal_detail = self._get_internal_transcript(meeting_id)
+            if internal_detail is not None and internal_detail.sentences:
+                return _merge_detail(detail, internal_detail)
+            live_detail = self._get_internal_live_transcript(meeting_id, internal_detail or detail)
+            if live_detail is not None:
+                return _merge_detail(detail, live_detail)
+        if transcript_error:
+            return detail.model_copy(update={"transcript_error": transcript_error})
+        return detail
 
     def get_user_email(self) -> str | None:
         """Fetch the authenticated user's email address."""
@@ -433,7 +728,25 @@ class FirefliesClient:
         email = user.get("email")
         return str(email) if isinstance(email, str) and email else None
 
+    def list_active_meeting_ids(self) -> list[str]:
+        """Fetch IDs for meetings currently in active or paused state."""
+        body = self._post(_ACTIVE_MEETINGS_QUERY, {"states": ["active", "paused"]})
+        data = body.get("data")
+        raw_list = data.get("active_meetings") if isinstance(data, dict) else None
+        if not isinstance(raw_list, list):
+            return []
+
+        result: list[str] = []
+        for raw_meeting in raw_list:
+            if not isinstance(raw_meeting, dict):
+                continue
+            meeting_id = raw_meeting.get("id")
+            if isinstance(meeting_id, str) and meeting_id:
+                result.append(meeting_id)
+        return result
+
     def close(self) -> None:
         self._client.close()
+        self._internal_client.close()
         if self._hive_client is not None:
             self._hive_client.close()

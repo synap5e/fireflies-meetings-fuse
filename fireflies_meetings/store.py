@@ -22,7 +22,7 @@ from .api import (
     TranscriptNotFoundError,
     TransientAPIError,
 )
-from .models import Meeting, TranscriptDetail
+from .models import Meeting, Sentence, TranscriptDetail
 from .renderer import (
     render_meeting_json,
     render_open_script,
@@ -60,12 +60,31 @@ def _make_stub_detail(meeting: Meeting) -> tuple[Meeting, TranscriptDetail]:
     """Create a stub TranscriptDetail for a meeting whose transcript is gone from Fireflies.
 
     Returns (updated_meeting, stub_detail). The meeting's summary_status is set to
-    "not_found" so renderers show an appropriate message instead of "not yet available".
+    "missing_from_api" so renderers show an appropriate message instead of "not yet available".
     """
     stub_meeting = meeting.model_copy(update={
-        "meeting_info": meeting.meeting_info.model_copy(update={"summary_status": "not_found"}),
+        "meeting_info": meeting.meeting_info.model_copy(update={"summary_status": "missing_from_api"}),
     })
     return stub_meeting, TranscriptDetail(meeting=stub_meeting)
+
+
+def _can_persist_detail(detail: TranscriptDetail) -> bool:
+    """Return True when a detail fetch is terminal and complete enough to cache forever."""
+    return detail.meeting.is_completed and not detail.transcript_error
+
+
+def _render_in_progress_status(detail: TranscriptDetail) -> bytes:
+    status_text = (
+        f"is_live: {detail.meeting.is_live}\n"
+        f"summary_status: {detail.meeting.meeting_info.summary_status}\n"
+    )
+    if detail.transcript_error:
+        status_text += f"transcript_error: {detail.transcript_error}\n"
+    return status_text.encode()
+
+
+def _sort_sentences(sentences: list[Sentence]) -> list[Sentence]:
+    return sorted(sentences, key=lambda sentence: (sentence.start_time, sentence.index))
 
 
 # Files inside each meeting directory
@@ -195,6 +214,8 @@ class MeetingStore:
         self._client = client
         self._entries: dict[str, MeetingEntry] = {}  # meeting_id -> entry
         self._file_cache: dict[str, _CachedFiles] = {}  # meeting_id -> cached files
+        self._live_details: dict[str, TranscriptDetail] = {}
+        self._live_transcript_rows: dict[str, dict[str, Sentence]] = {}
         self._list_cache_time: float = 0.0
         self._list_ttl = list_ttl
         self._current_ttl = list_ttl
@@ -374,6 +395,9 @@ class MeetingStore:
         """Return True if cached data is still valid and should be returned as-is."""
         if self._status_cache.is_completed(meeting_id):
             return True
+        entry = self._entries.get(meeting_id)
+        if entry is not None and entry.meeting.is_live:
+            return False
         return time.monotonic() - cached.fetched_at < _DETAIL_TTL
 
     def _fetch_detail(self, meeting: Meeting) -> _CachedFiles | None:
@@ -422,6 +446,7 @@ class MeetingStore:
 
         with self._lock:
             self._backoff.record_success()
+            detail = self._merge_live_stream_state_locked(meeting_id, detail)
 
         # The detail's meeting object came from a separate API call; carry over
         # the slug and date that the list-side computed for this entry so the
@@ -434,17 +459,38 @@ class MeetingStore:
         })
 
         files = _render_files(detail.meeting, detail)
-        if detail.meeting.is_completed:
+        if _can_persist_detail(detail):
             self._status_cache.mark_completed(meeting_id)
             self._save_detail_to_disk(meeting_id, files)
         else:
-            status_text = (
-                f"is_live: {detail.meeting.is_live}\n"
-                f"summary_status: {detail.meeting.meeting_info.summary_status}\n"
-            )
-            files[_IN_PROGRESS] = status_text.encode()
+            files[_IN_PROGRESS] = _render_in_progress_status(detail)
 
         return _CachedFiles(files=files, fetched_at=time.monotonic())
+
+    def _cache_rendered_detail_locked(self, meeting_id: str, detail: TranscriptDetail) -> None:
+        files = _render_files(detail.meeting, detail)
+        if not _can_persist_detail(detail):
+            files[_IN_PROGRESS] = _render_in_progress_status(detail)
+        self._file_cache[meeting_id] = _CachedFiles(files=files, fetched_at=time.monotonic())
+
+    def _merge_live_stream_state_locked(
+        self,
+        meeting_id: str,
+        detail: TranscriptDetail,
+    ) -> TranscriptDetail:
+        if not detail.meeting.is_live:
+            self._live_details.pop(meeting_id, None)
+            self._live_transcript_rows.pop(meeting_id, None)
+            return detail
+
+        live_rows = self._live_transcript_rows.get(meeting_id)
+        if live_rows:
+            detail = detail.model_copy(update={
+                "sentences": _sort_sentences(list(live_rows.values())),
+                "transcript_error": "",
+            })
+        self._live_details[meeting_id] = detail
+        return detail
 
     def _ensure_files(self, meeting_id: str) -> _CachedFiles | None:
         """Ensure meeting files are fetched and rendered.
@@ -619,6 +665,8 @@ class MeetingStore:
                 "date_str": entry.meeting.date_str,
             }),
         })
+        if detail.transcript_error:
+            raise TransientAPIError(detail.transcript_error)
         files = _render_files(detail.meeting, detail)
         self._save_detail_to_disk(meeting_id, files)
         self._status_cache.mark_completed(meeting_id)
@@ -680,17 +728,15 @@ class MeetingStore:
         meeting = _with_slug(detail.meeting)
         detail = detail.model_copy(update={"meeting": meeting})
         files = _render_files(meeting, detail)
-        if meeting.is_completed:
+        if _can_persist_detail(detail):
             self._status_cache.mark_completed(meeting_id)
             self._save_detail_to_disk(meeting_id, files)
         else:
-            files[_IN_PROGRESS] = (
-                f"is_live: {meeting.is_live}\n"
-                f"summary_status: {meeting.meeting_info.summary_status}\n"
-            ).encode()
+            files[_IN_PROGRESS] = _render_in_progress_status(detail)
 
         with self._lock:
             self._backoff.record_success()
+            detail = self._merge_live_stream_state_locked(meeting_id, detail)
             if meeting.id in self._entries:
                 return True
             self._entries[meeting.id] = MeetingEntry(meeting=meeting, slug=meeting.slug)
@@ -703,6 +749,52 @@ class MeetingStore:
         )
         self._save_list_cache()
         return True
+
+    def sync_active_meeting_ids(self, active_ids: list[str]) -> None:
+        """Update cached live flags from the authoritative active_meetings query."""
+        active = set(active_ids)
+        with self._lock:
+            for meeting_id, entry in list(self._entries.items()):
+                is_live = meeting_id in active
+                if entry.meeting.is_live == is_live:
+                    continue
+
+                meeting = entry.meeting.model_copy(update={"is_live": is_live})
+                self._entries[meeting_id] = MeetingEntry(meeting=meeting, slug=entry.slug)
+
+                detail = self._live_details.get(meeting_id)
+                if detail is None:
+                    continue
+                updated_detail = detail.model_copy(update={"meeting": meeting})
+                self._live_details[meeting_id] = updated_detail
+                self._cache_rendered_detail_locked(meeting_id, updated_detail)
+
+    def apply_live_transcript_update(
+        self,
+        meeting_id: str,
+        transcript_id: str,
+        sentence: Sentence,
+    ) -> None:
+        """Merge one realtime transcript row into the in-memory live render cache."""
+        with self._lock:
+            entry = self._entries.get(meeting_id)
+            if entry is None:
+                return
+
+            detail = self._live_details.get(meeting_id)
+            if detail is None:
+                detail = TranscriptDetail(meeting=entry.meeting)
+
+            rows = self._live_transcript_rows.setdefault(meeting_id, {})
+            rows[transcript_id] = sentence
+
+            updated_detail = detail.model_copy(update={
+                "meeting": entry.meeting,
+                "sentences": _sort_sentences(list(rows.values())),
+                "transcript_error": "",
+            })
+            self._live_details[meeting_id] = updated_detail
+            self._cache_rendered_detail_locked(meeting_id, updated_detail)
 
     def get_live_symlink_target(self, meeting_id: str) -> str | None:
         """Return the relative symlink target for a live meeting from the /live/ directory.

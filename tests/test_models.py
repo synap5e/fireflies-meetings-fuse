@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from fireflies_meetings.models import Meeting
+from fireflies_meetings.models import Meeting, MeetingInfo
 
 
 def _make(id_value: str) -> dict[str, object]:
@@ -67,3 +67,14 @@ def test_valid_meeting_ids_accepted(valid_id: str) -> None:
 def test_invalid_meeting_ids_rejected(bad_id: str) -> None:
     with pytest.raises(ValidationError):
         Meeting.model_validate(_make(bad_id))
+
+
+def test_summary_status_not_found_normalizes_to_missing_from_api() -> None:
+    meeting = Meeting(
+        id="MEET01",
+        title="x",
+        date_epoch_ms=1774891800000.0,
+        meeting_info=MeetingInfo(summary_status="not_found"),
+    )
+    assert meeting.meeting_info.summary_status == "missing_from_api"
+    assert meeting.is_completed

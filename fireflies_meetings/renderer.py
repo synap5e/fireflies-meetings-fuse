@@ -34,7 +34,7 @@ def render_summary(meeting: Meeting, detail: TranscriptDetail) -> str:
             parts.append("*Meeting is in progress. Summary will be available after it ends.*")
         elif meeting.meeting_info.summary_status == "skipped":
             parts.append("*Summary skipped by Fireflies (likely too short or filtered).*")
-        elif meeting.meeting_info.summary_status == "not_found":
+        elif meeting.meeting_info.summary_status in {"missing_from_api", "not_found"}:
             parts.append("*Transcript no longer available from Fireflies.*")
         else:
             parts.append("*Summary not yet available.*")
@@ -77,6 +77,10 @@ def render_transcript(meeting: Meeting, detail: TranscriptDetail) -> str:
     parts.append("")
 
     if not detail.sentences:
+        if detail.transcript_error:
+            parts.append(f"*Transcript temporarily unavailable: {detail.transcript_error}.*")
+            parts.append("")
+            return "\n".join(parts)
         parts.append("*No transcript available.*")
         parts.append("")
         return "\n".join(parts)
@@ -115,6 +119,12 @@ def render_participants(meeting: Meeting, detail: TranscriptDetail) -> str:
         speaker_secs[sentence.speaker_name] += max(0.0, sentence.end_time - sentence.start_time)
 
     if not speaker_secs:
+        if detail.transcript_error:
+            parts.append(
+                f"*Participant data temporarily unavailable: {detail.transcript_error}.*",
+            )
+            parts.append("")
+            return "\n".join(parts)
         parts.append("*No participant data available.*")
         parts.append("")
         return "\n".join(parts)
@@ -162,6 +172,7 @@ def render_meeting_json(meeting: Meeting, detail: TranscriptDetail) -> str:
             "gist": detail.summary.gist,
             "short_summary": detail.summary.short_summary,
         } if detail.summary else None,
+        "transcript_error": detail.transcript_error or None,
         "transcript": [
             {
                 "index": s.index,

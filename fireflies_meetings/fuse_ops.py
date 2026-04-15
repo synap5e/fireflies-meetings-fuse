@@ -394,6 +394,10 @@ class FirefliesMeetingOps(pyfuse3.Operations):
         # Live/in-progress files get keep_cache=False so the next open
         # after release() re-fetches fresh content.
         fi.keep_cache = is_completed
+        # In-progress files are listed before we've fetched their bytes, so
+        # getattr/lookup often reported st_size=0. direct_io makes readers use
+        # our read() result instead of stopping at that stale zero-length stat.
+        fi.direct_io = not is_completed
         return fi
 
     async def release(self, fh: int) -> None:
