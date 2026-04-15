@@ -19,6 +19,7 @@ from .api import (
     FirefliesClient,
     JsonObject,
     RateLimitedError,
+    TranscriptNotFoundError,
     TransientAPIError,
 )
 from .models import Meeting, TranscriptDetail
@@ -53,6 +54,18 @@ def _render_files(meeting: Meeting, detail: TranscriptDetail) -> dict[str, bytes
         "meeting.json": render_meeting_json(meeting, detail).encode(),
         "open.sh": render_open_script(meeting).encode(),
     }
+
+
+def _make_stub_detail(meeting: Meeting) -> tuple[Meeting, TranscriptDetail]:
+    """Create a stub TranscriptDetail for a meeting whose transcript is gone from Fireflies.
+
+    Returns (updated_meeting, stub_detail). The meeting's summary_status is set to
+    "not_found" so renderers show an appropriate message instead of "not yet available".
+    """
+    stub_meeting = meeting.model_copy(update={
+        "meeting_info": meeting.meeting_info.model_copy(update={"summary_status": "not_found"}),
+    })
+    return stub_meeting, TranscriptDetail(meeting=stub_meeting)
 
 
 # Files inside each meeting directory
@@ -373,6 +386,16 @@ class MeetingStore:
         meeting_id = meeting.id
         try:
             detail = self._client.get_transcript(meeting_id)
+        except TranscriptNotFoundError:
+            log.info(
+                "Transcript %s no longer available from Fireflies; writing stub",
+                meeting_id,
+            )
+            stub_meeting, stub_detail = _make_stub_detail(meeting)
+            files = _render_files(stub_meeting, stub_detail)
+            self._status_cache.mark_completed(meeting_id)
+            self._save_detail_to_disk(meeting_id, files)
+            return _CachedFiles(files=files, fetched_at=time.monotonic())
         except RateLimitedError as e:
             with self._lock:
                 self._backoff.record_rate_limit(e.retry_after)
@@ -565,6 +588,10 @@ class MeetingStore:
         Safe to call from a background thread — touches only disk and the API client.
         Raises RateLimitedError, FatalAPIError, or TransientAPIError on API errors;
         caller handles backoff. No-ops if already cached or entry not found.
+
+        Permanently-deleted transcripts (404 / object_not_found) are handled
+        internally: stub files are written so the meeting stays visible with
+        its list metadata, and the backfill loop never retries it.
         """
         if (self._detail_cache_dir / meeting_id / _COMPLETE_SENTINEL).exists():
             return
@@ -572,9 +599,20 @@ class MeetingStore:
             entry = self._entries.get(meeting_id)
         if entry is None:
             return
+        try:
+            raw_detail = self._client.get_transcript(meeting_id)
+        except TranscriptNotFoundError:
+            log.info(
+                "Transcript %s no longer available from Fireflies; writing stub",
+                meeting_id,
+            )
+            stub_meeting, stub_detail = _make_stub_detail(entry.meeting)
+            files = _render_files(stub_meeting, stub_detail)
+            self._save_detail_to_disk(meeting_id, files)
+            self._status_cache.mark_completed(meeting_id)
+            return
         # API call outside lock; caller (get_uncached_meeting_ids) already
         # verified the meeting is_completed so marking it as such is correct.
-        raw_detail = self._client.get_transcript(meeting_id)
         detail = raw_detail.model_copy(update={
             "meeting": raw_detail.meeting.model_copy(update={
                 "slug": entry.meeting.slug,
@@ -584,6 +622,87 @@ class MeetingStore:
         files = _render_files(detail.meeting, detail)
         self._save_detail_to_disk(meeting_id, files)
         self._status_cache.mark_completed(meeting_id)
+
+    def _fetch_detail_for_watch(self, meeting_id: str) -> TranscriptDetail | None:
+        """Fetch detail for a watch-meeting call, handling backoff book-keeping.
+
+        Returns None on any API error (backoff state is updated accordingly).
+        """
+        try:
+            return self._client.get_transcript(meeting_id)
+        except TranscriptNotFoundError:
+            log.info("watch_meeting(%s): transcript not found, skipping", meeting_id)
+            return None
+        except RateLimitedError as e:
+            with self._lock:
+                self._backoff.record_rate_limit(e.retry_after)
+            return None
+        except FatalAPIError:
+            with self._lock:
+                self._backoff.record_fatal()
+            return None
+        except TransientAPIError as e:
+            log.warning("watch_meeting(%s): transient error: %s", meeting_id, e)
+            with self._lock:
+                self._backoff.record_failure()
+            return None
+        except httpx.TimeoutException:
+            log.warning("watch_meeting(%s): timeout", meeting_id)
+            with self._lock:
+                self._backoff.record_failure(is_timeout=True)
+            return None
+        except httpx.HTTPError as e:
+            log.warning("watch_meeting(%s): HTTP error: %s", meeting_id, e)
+            with self._lock:
+                self._backoff.record_failure()
+            return None
+
+    def watch_meeting(self, meeting_id: str) -> bool:
+        """Fetch a meeting by ID and add it to the entry map.
+
+        Used by the Google Chat watcher to surface live meetings that the
+        `transcripts` list query hides from non-admin users. No-op if the
+        meeting is already known. Returns True if the entry is present
+        after the call (either newly added or pre-existing), False on
+        API error.
+        """
+        with self._lock:
+            if meeting_id in self._entries:
+                return True
+            if self._backoff.is_backed_off:
+                log.debug("watch_meeting(%s): backed off", meeting_id)
+                return False
+
+        detail = self._fetch_detail_for_watch(meeting_id)
+        if detail is None:
+            return False
+
+        meeting = _with_slug(detail.meeting)
+        detail = detail.model_copy(update={"meeting": meeting})
+        files = _render_files(meeting, detail)
+        if meeting.is_completed:
+            self._status_cache.mark_completed(meeting_id)
+            self._save_detail_to_disk(meeting_id, files)
+        else:
+            files[_IN_PROGRESS] = (
+                f"is_live: {meeting.is_live}\n"
+                f"summary_status: {meeting.meeting_info.summary_status}\n"
+            ).encode()
+
+        with self._lock:
+            self._backoff.record_success()
+            if meeting.id in self._entries:
+                return True
+            self._entries[meeting.id] = MeetingEntry(meeting=meeting, slug=meeting.slug)
+            self._file_cache[meeting.id] = _CachedFiles(
+                files=files, fetched_at=time.monotonic(),
+            )
+        log.info(
+            "watch_meeting: added %s %r (is_live=%s, date=%s)",
+            meeting.id, meeting.title, meeting.is_live, meeting.date_str,
+        )
+        self._save_list_cache()
+        return True
 
     def get_live_symlink_target(self, meeting_id: str) -> str | None:
         """Return the relative symlink target for a live meeting from the /live/ directory.
