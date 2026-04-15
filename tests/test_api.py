@@ -15,6 +15,7 @@ under test:
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 
 import httpx
@@ -26,6 +27,7 @@ from fireflies_meetings.api import (
     RateLimitedError,
     TransientAPIError,
 )
+from fireflies_meetings.session_auth import SessionAuth
 
 
 def _make_client(handler: Callable[[httpx.Request], httpx.Response]) -> FirefliesClient:
@@ -90,6 +92,371 @@ def test_graphql_errors_without_data_raises_transient() -> None:
         client.list_transcripts()
 
 
+def test_get_transcript_marks_partial_sentences_error() -> None:
+    """A partial error on transcript.sentences must not look like a true empty transcript."""
+
+    def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transcript": {
+                        "id": "MEET01",
+                        "title": "Live Standup",
+                        "date": 1774891800000,
+                        "is_live": True,
+                        "sentences": None,
+                        "speakers": [],
+                    },
+                },
+                "errors": [
+                    {
+                        "message": "Something unexpected happened. Please try again",
+                        "path": ["transcript", "sentences"],
+                        "code": "INTERNAL_SERVER_ERROR",
+                    },
+                ],
+            },
+        )
+
+    client = _make_client(handler)
+    detail = client.get_transcript("MEET01")
+
+    assert detail.sentences == []
+    assert "transcript.sentences" in detail.transcript_error
+    assert "INTERNAL_SERVER_ERROR" in detail.transcript_error
+
+
+def test_get_transcript_falls_back_to_internal_meeting_captions() -> None:
+    """Live caption fallback should use the internal meetingNote.captions query."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url == httpx.URL("https://api.fireflies.ai/graphql"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "transcript": {
+                            "id": "MEET01",
+                            "title": "Live Standup",
+                            "date": 1774891800000,
+                            "is_live": True,
+                            "organizer_email": "alice@example.com",
+                            "participants": ["alice@example.com", "bob@example.com"],
+                            "transcript_url": "https://app.fireflies.ai/view/MEET01",
+                            "meeting_info": {
+                                "fred_joined": True,
+                                "silent_meeting": False,
+                                "summary_status": "",
+                            },
+                            "sentences": None,
+                            "speakers": [],
+                        },
+                    },
+                    "errors": [
+                        {
+                            "message": "Something unexpected happened. Please try again",
+                            "path": ["transcript", "sentences"],
+                            "code": "INTERNAL_SERVER_ERROR",
+                        },
+                    ],
+                },
+            )
+
+        if req.url == httpx.URL("https://app.fireflies.ai/api/v4/graphql"):
+            payload = json.loads(req.content.decode())
+            assert payload["operationName"] == "fetchNotepadMeeting"
+            assert req.headers["origin"] == "https://app.fireflies.ai"
+            assert req.headers["referer"] == "https://app.fireflies.ai/view/MEET01"
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "meetingNote": {
+                            "_id": "MEET01",
+                            "parseId": "MEET01",
+                            "title": "Live Standup",
+                            "date": "2026-03-31T12:00:00.000Z",
+                            "creator_email": "alice@example.com",
+                            "allEmails": "alice@example.com bob@example.com",
+                            "captions": [
+                                {
+                                    "index": 0,
+                                    "sentence": "Hello everyone.",
+                                    "speaker_id": "speaker-1",
+                                    "time": 5.0,
+                                    "endTime": 7.0,
+                                },
+                            ],
+                            "speakerMeta": {
+                                "speaker-1": {"name": "Alice"},
+                            },
+                        },
+                    },
+                },
+            )
+
+        raise AssertionError(f"Unexpected request URL: {req.url}")
+
+    client = FirefliesClient(
+        "dummy-key",
+        session_auth=SessionAuth(access_token="Bearer access-token", refresh_token="refresh-token"),
+        transport=httpx.MockTransport(handler),
+    )
+    detail = client.get_transcript("MEET01")
+
+    assert detail.transcript_error == ""
+    assert [sentence.text for sentence in detail.sentences] == ["Hello everyone."]
+    assert detail.sentences[0].speaker_name == "Alice"
+    assert detail.meeting.organizer_email == "alice@example.com"
+    assert detail.meeting.transcript_url == "https://app.fireflies.ai/view/MEET01"
+
+
+def test_internal_fallback_sends_refresh_headers_and_cookies() -> None:
+    """Internal fallback requests should include the full browser-session shape."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url == httpx.URL("https://api.fireflies.ai/graphql"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "transcript": {
+                            "id": "MEET01",
+                            "title": "Live Standup",
+                            "date": 1774891800000,
+                            "is_live": True,
+                            "sentences": None,
+                            "speakers": [],
+                        },
+                    },
+                    "errors": [
+                        {
+                            "message": "Something unexpected happened. Please try again",
+                            "path": ["transcript", "sentences"],
+                            "code": "INTERNAL_SERVER_ERROR",
+                        },
+                    ],
+                },
+            )
+
+        if req.url == httpx.URL("https://app.fireflies.ai/api/v4/graphql"):
+            assert req.headers["authorization"] == "access-token"
+            assert req.headers["x-refresh-token"] == "refresh-token"
+            assert req.headers["x-auth-provider"] == "gauth"
+            cookie = req.headers["cookie"]
+            assert "authorization=Bearer%20access-token" in cookie
+            assert "x-cache=refresh-token" in cookie
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "meetingNote": {
+                            "_id": "MEET01",
+                            "parseId": "MEET01",
+                            "title": "Live Standup",
+                            "date": "2026-03-31T12:00:00.000Z",
+                            "captions": [
+                                {
+                                    "index": 0,
+                                    "sentence": "Hello everyone.",
+                                    "speaker_id": "speaker-1",
+                                    "time": 5.0,
+                                    "endTime": 7.0,
+                                },
+                            ],
+                            "speakerMeta": {
+                                "speaker-1": {"name": "Alice"},
+                            },
+                        },
+                    },
+                },
+            )
+
+        raise AssertionError(f"Unexpected request URL: {req.url}")
+
+    client = FirefliesClient(
+        "dummy-key",
+        session_auth=SessionAuth(access_token="Bearer access-token", refresh_token="refresh-token"),
+        transport=httpx.MockTransport(handler),
+    )
+    detail = client.get_transcript("MEET01")
+
+    assert [sentence.text for sentence in detail.sentences] == ["Hello everyone."]
+
+
+def test_get_transcript_falls_back_to_internal_live_transcript_polling() -> None:
+    """When meetingNote.captions is empty, poll the internal live transcript query."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url == httpx.URL("https://api.fireflies.ai/graphql"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "transcript": {
+                            "id": "MEET01",
+                            "title": "Live Standup",
+                            "date": 1774891800000,
+                            "is_live": True,
+                            "organizer_email": "alice@example.com",
+                            "participants": ["alice@example.com", "bob@example.com"],
+                            "transcript_url": "https://app.fireflies.ai/view/MEET01",
+                            "meeting_info": {
+                                "fred_joined": True,
+                                "silent_meeting": False,
+                                "summary_status": "",
+                            },
+                            "sentences": None,
+                            "speakers": [],
+                        },
+                    },
+                    "errors": [
+                        {
+                            "message": "Something unexpected happened. Please try again",
+                            "path": ["transcript", "sentences"],
+                            "code": "INTERNAL_SERVER_ERROR",
+                        },
+                    ],
+                },
+            )
+
+        if req.url == httpx.URL("https://app.fireflies.ai/api/v4/graphql"):
+            payload = json.loads(req.content.decode())
+            operation = payload["operationName"]
+            assert req.headers["origin"] == "https://app.fireflies.ai"
+            assert req.headers["referer"] == "https://app.fireflies.ai/view/MEET01"
+
+            if operation == "fetchNotepadMeeting":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "meetingNote": {
+                                "_id": "MEET01",
+                                "parseId": "MEET01",
+                                "title": "Live Standup",
+                                "date": "2026-03-31T12:00:00.000Z",
+                                "captions": [],
+                            },
+                        },
+                    },
+                )
+
+            if operation == "getTranscriptFFAuth":
+                assert payload["variables"] == {"meetingId": "MEET01"}
+                return httpx.Response(200, json={"data": {"getTranscriptFFAuth": "realtime-token"}})
+
+            if operation == "getLiveTranscript":
+                assert payload["variables"] == {
+                    "meetingId": "MEET01",
+                    "realtimeToken": "realtime-token",
+                }
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "getLiveTranscript": [
+                                {
+                                    "sentence": "Hello everyone.",
+                                    "speaker_name": "Alice",
+                                    "speaker_id": -1,
+                                    "transcript_id": "65110",
+                                    "time": 5.0,
+                                    "endTime": 7.0,
+                                },
+                                {
+                                    "sentence": "Status update.",
+                                    "speaker_name": "Bob",
+                                    "speaker_id": -2,
+                                    "transcript_id": "65111",
+                                    "time": 8.5,
+                                    "endTime": 10.0,
+                                },
+                            ],
+                        },
+                    },
+                )
+
+        raise AssertionError(f"Unexpected request URL: {req.url}")
+
+    client = FirefliesClient(
+        "dummy-key",
+        session_auth=SessionAuth(access_token="Bearer access-token", refresh_token="refresh-token"),
+        transport=httpx.MockTransport(handler),
+    )
+    detail = client.get_transcript("MEET01")
+
+    assert detail.transcript_error == ""
+    assert [sentence.text for sentence in detail.sentences] == ["Hello everyone.", "Status update."]
+    assert [sentence.index for sentence in detail.sentences] == [65110, 65111]
+    assert detail.meeting.organizer_email == "alice@example.com"
+    assert detail.meeting.transcript_url == "https://app.fireflies.ai/view/MEET01"
+
+
+def test_get_transcript_preserves_partial_error_when_live_polling_has_no_token() -> None:
+    """If internal live polling can't acquire a realtime token, keep the public partial-error state."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url == httpx.URL("https://api.fireflies.ai/graphql"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "transcript": {
+                            "id": "MEET01",
+                            "title": "Live Standup",
+                            "date": 1774891800000,
+                            "is_live": True,
+                            "sentences": None,
+                            "speakers": [],
+                        },
+                    },
+                    "errors": [
+                        {
+                            "message": "Something unexpected happened. Please try again",
+                            "path": ["transcript", "sentences"],
+                            "code": "INTERNAL_SERVER_ERROR",
+                        },
+                    ],
+                },
+            )
+
+        if req.url == httpx.URL("https://app.fireflies.ai/api/v4/graphql"):
+            payload = json.loads(req.content.decode())
+            operation = payload["operationName"]
+            if operation == "fetchNotepadMeeting":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "meetingNote": {
+                                "_id": "MEET01",
+                                "parseId": "MEET01",
+                                "title": "Live Standup",
+                                "date": "2026-03-31T12:00:00.000Z",
+                                "captions": [],
+                            },
+                        },
+                    },
+                )
+            if operation == "getTranscriptFFAuth":
+                return httpx.Response(200, json={"data": {"getTranscriptFFAuth": ""}})
+
+        raise AssertionError(f"Unexpected request URL: {req.url}")
+
+    client = FirefliesClient(
+        "dummy-key",
+        session_auth=SessionAuth(access_token="Bearer access-token", refresh_token="refresh-token"),
+        transport=httpx.MockTransport(handler),
+    )
+    detail = client.get_transcript("MEET01")
+
+    assert detail.sentences == []
+    assert "transcript.sentences" in detail.transcript_error
+    assert "INTERNAL_SERVER_ERROR" in detail.transcript_error
+
+
 def test_list_transcripts_skips_invalid_records() -> None:
     """One bad record (path-traversal id) plus two good ones returns the two good."""
 
@@ -147,3 +514,41 @@ def test_get_user_email_returns_none_on_fatal() -> None:
 
     client = _make_client(handler)
     assert client.get_user_email() is None
+
+
+def test_list_active_meeting_ids_returns_ids() -> None:
+    def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "active_meetings": [
+                        {"id": "MEET01"},
+                        {"id": "MEET02"},
+                    ],
+                },
+            },
+        )
+
+    client = _make_client(handler)
+    assert client.list_active_meeting_ids() == ["MEET01", "MEET02"]
+
+
+def test_list_active_meeting_ids_skips_malformed_records() -> None:
+    def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "active_meetings": [
+                        {"id": "MEET01"},
+                        {"name": "missing-id"},
+                        "bad",
+                        {"id": "MEET02"},
+                    ],
+                },
+            },
+        )
+
+    client = _make_client(handler)
+    assert client.list_active_meeting_ids() == ["MEET01", "MEET02"]

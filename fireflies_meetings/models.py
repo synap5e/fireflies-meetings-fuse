@@ -32,9 +32,109 @@ _MODEL_CONFIG = ConfigDict(
 # - "processed": summary generated successfully (the common case)
 # - "skipped":   Fireflies decided not to summarize (usually short / single-attendee
 #                meetings). Still terminal — no summary will ever appear.
+# - "missing_from_api": Fireflies returned 404 / object_not_found for a previously
+#                known transcript. Terminal, but the meeting should keep
+#                showing as cached with a "gone from API" message.
 # Anything else (e.g. "" for in-flight, "processing", "failed") is in-flight and
 # the meeting should be re-fetched on subsequent reads.
-_TERMINAL_STATUSES = frozenset({"processed", "skipped"})
+_TERMINAL_STATUSES = frozenset({"processed", "skipped", "missing_from_api"})
+
+type RawObjectDict = dict[str, object]
+
+
+def _normalize_summary_status(value: object) -> object:
+    if value == "completed":
+        return "processed"
+    if value == "not_found":
+        return "missing_from_api"
+    return value
+
+
+def _speaker_name_from_candidate(candidate: object) -> str:
+    if isinstance(candidate, str):
+        return candidate
+    if not isinstance(candidate, dict):
+        return ""
+    typed = cast("RawObjectDict", candidate)
+    for key in ("speaker_name", "speakerName", "displayName", "name"):
+        value = typed.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _speaker_name_from_speakers(speakers: object, speaker_key: str) -> str:
+    if not isinstance(speakers, list):
+        return ""
+    for item in cast("list[object]", speakers):
+        if not isinstance(item, dict):
+            continue
+        typed = cast("RawObjectDict", item)
+        if str(typed.get("id")) != speaker_key:
+            continue
+        return _speaker_name_from_candidate(typed)
+    return ""
+
+
+def _speaker_name_from_meta(speaker_id: object, speaker_meta: object) -> str:
+    if speaker_id is None:
+        return ""
+    speaker_key = str(speaker_id)
+    if not isinstance(speaker_meta, dict):
+        return speaker_key
+    typed = cast("RawObjectDict", speaker_meta)
+    candidate = typed.get(speaker_key)
+    if candidate is None:
+        candidate = typed.get(str(speaker_id))
+    name = _speaker_name_from_candidate(candidate)
+    if name:
+        return name
+    name = _speaker_name_from_speakers(typed.get("speakers"), speaker_key)
+    if name:
+        return name
+    return speaker_key
+
+
+def _internal_meeting_info(raw: RawObjectDict) -> RawObjectDict:
+    audio_meta = raw.get("audioServiceMetadata")
+    silent_meeting = False
+    if isinstance(audio_meta, dict):
+        typed_audio_meta = cast("RawObjectDict", audio_meta)
+        silent_raw = typed_audio_meta.get("silentMeeting", False)
+        if isinstance(silent_raw, bool):
+            silent_meeting = silent_raw
+    return {
+        "silent_meeting": silent_meeting,
+        "summary_status": _normalize_summary_status(
+            raw.get("summaryStatus") or raw.get("processMeetingStatus") or "",
+        ),
+    }
+
+
+def _internal_transcript_url(raw: RawObjectDict) -> str:
+    parse_id = raw.get("parseId") or raw.get("_id") or raw.get("id")
+    if isinstance(parse_id, str) and parse_id:
+        return f"https://app.fireflies.ai/view/{parse_id}"
+    return ""
+
+
+def _internal_participants(raw: RawObjectDict) -> list[str] | None:
+    all_emails = raw.get("allEmails")
+    if isinstance(all_emails, str) and all_emails:
+        return all_emails.split()
+    return None
+
+
+def _coerce_epoch_ms(raw: object) -> float | None:
+    if isinstance(raw, (int, float)) and raw:
+        return float(raw)
+    if isinstance(raw, str) and raw:
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return dt.timestamp() * 1000
+    return None
 
 
 class _FFBaseModel(BaseModel):
@@ -54,7 +154,7 @@ class _FFBaseModel(BaseModel):
     def _drop_nones(cls, data: object) -> object:
         if not isinstance(data, dict):
             return data
-        typed = cast("dict[str, object]", data)
+        typed = cast("RawObjectDict", data)
         return {k: v for k, v in typed.items() if v is not None}
 
 
@@ -69,10 +169,10 @@ class Sentence(_FFBaseModel):
     """A single sentence in the transcript."""
 
     index: int = 0
-    text: str = ""
-    start_time: float = 0.0  # seconds from meeting start
-    end_time: float = 0.0  # seconds from meeting start
-    speaker_name: str = ""
+    text: str = Field(default="", validation_alias=AliasChoices("text", "sentence"))
+    start_time: float = Field(default=0.0, validation_alias=AliasChoices("start_time", "time"))
+    end_time: float = Field(default=0.0, validation_alias=AliasChoices("end_time", "endTime"))
+    speaker_name: str = Field(default="", validation_alias=AliasChoices("speaker_name", "speakerName"))
 
 
 class Summary(_FFBaseModel):
@@ -116,8 +216,19 @@ class MeetingInfo(_FFBaseModel):
     """Metadata about the Fireflies bot's participation."""
 
     fred_joined: bool = False
-    silent_meeting: bool = False
-    summary_status: str = ""
+    silent_meeting: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("silent_meeting", "silentMeeting"),
+    )
+    summary_status: str = Field(
+        default="",
+        validation_alias=AliasChoices("summary_status", "summaryStatus", "processMeetingStatus"),
+    )
+
+    @field_validator("summary_status", mode="before")
+    @classmethod
+    def _normalize_summary_status(cls, value: object) -> object:
+        return _normalize_summary_status(value)
 
 
 def _epoch_ms_to_date_str(epoch_ms: float) -> str:
@@ -135,7 +246,7 @@ class Meeting(_FFBaseModel):
     `model_copy(update={"slug": ...})`.
     """
 
-    id: str
+    id: str = Field(validation_alias=AliasChoices("id", "parseId", "_id"))
     title: str = ""
     # API uses "date" (epoch ms); disk cache uses "date_epoch_ms"
     date_epoch_ms: float = Field(
@@ -145,10 +256,13 @@ class Meeting(_FFBaseModel):
     date_str: str = ""  # YYYY-MM-DD, derived from date_epoch_ms when missing
     duration_mins: float = Field(
         default=0.0,
-        validation_alias=AliasChoices("duration_mins", "duration"),
+        validation_alias=AliasChoices("duration_mins", "duration", "durationMins"),
     )
     is_live: bool = False
-    organizer_email: str = ""
+    organizer_email: str = Field(
+        default="",
+        validation_alias=AliasChoices("organizer_email", "creator_email"),
+    )
     participants: list[str] = Field(default_factory=list)
     transcript_url: str = ""
     meeting_info: MeetingInfo = Field(default_factory=MeetingInfo)
@@ -175,13 +289,28 @@ class Meeting(_FFBaseModel):
         """
         if not isinstance(data, dict):
             return data
-        typed = cast("dict[str, object]", data)
-        epoch_raw = typed.get("date_epoch_ms") or typed.get("date")
-        if isinstance(epoch_raw, (int, float)) and epoch_raw:
-            new_data: dict[str, object] = dict(typed)
-            new_data["date_str"] = _epoch_ms_to_date_str(float(epoch_raw))
+        typed = cast("RawObjectDict", data)
+        new_data: RawObjectDict = dict(typed)
+
+        if "meeting_info" not in new_data:
+            new_data["meeting_info"] = _internal_meeting_info(new_data)
+
+        if not new_data.get("participants"):
+            participants = _internal_participants(new_data)
+            if participants is not None:
+                new_data["participants"] = participants
+
+        if not new_data.get("transcript_url"):
+            transcript_url = _internal_transcript_url(new_data)
+            if transcript_url:
+                new_data["transcript_url"] = transcript_url
+
+        epoch_ms = _coerce_epoch_ms(new_data.get("date_epoch_ms") or new_data.get("date"))
+        if epoch_ms is not None:
+            new_data["date_epoch_ms"] = epoch_ms
+            new_data["date_str"] = _epoch_ms_to_date_str(epoch_ms)
             return new_data
-        return typed
+        return new_data
 
     @property
     def is_completed(self) -> bool:
@@ -204,10 +333,48 @@ class TranscriptDetail(_FFBaseModel):
     """
 
     meeting: Meeting
-    sentences: list[Sentence] = Field(default_factory=list)
+    sentences: list[Sentence] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("sentences", "captions"),
+    )
     speakers: list[Speaker] = Field(default_factory=list)
     summary: Summary | None = None
     attendees: list[MeetingAttendee] = Field(
         default_factory=list,
         validation_alias=AliasChoices("attendees", "meeting_attendees"),
     )
+    # Internal, not from Fireflies: set when the API returns partial data but
+    # fails a critical transcript field such as transcript.sentences.
+    transcript_error: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_internal_captions(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+        typed = cast("RawObjectDict", data)
+        raw_captions = typed.get("captions")
+        if not isinstance(raw_captions, list) or not raw_captions:
+            return typed
+
+        speaker_meta = typed.get("speakerMeta")
+        normalized: list[object] = []
+        changed = False
+        for raw_caption in cast("list[object]", raw_captions):
+            if not isinstance(raw_caption, dict):
+                normalized.append(raw_caption)
+                continue
+            typed_caption = cast("RawObjectDict", raw_caption)
+            caption: RawObjectDict = dict(typed_caption)
+            if not caption.get("speaker_name"):
+                caption["speaker_name"] = _speaker_name_from_meta(
+                    typed_caption.get("speaker_id"), speaker_meta,
+                )
+                changed = True
+            normalized.append(caption)
+
+        if not changed:
+            return typed
+        new_data = dict(typed)
+        new_data["captions"] = normalized
+        return new_data

@@ -88,14 +88,14 @@ def test_render_summary_no_summary() -> None:
     assert "in progress" in result.lower()
 
 
-def test_render_summary_not_found() -> None:
+def test_render_summary_missing_from_api() -> None:
     meeting = _make_meeting(
-        meeting_info=MeetingInfo(summary_status="not_found"),
+        meeting_info=MeetingInfo(summary_status="missing_from_api"),
     )
     detail = _make_detail(meeting, summary=None)
     result = render_summary(meeting, detail)
     assert "no longer available" in result.lower()
-    assert 'status: "not_found"' in result
+    assert 'status: "missing_from_api"' in result
 
 
 def test_render_transcript_timestamps() -> None:
@@ -108,6 +108,22 @@ def test_render_transcript_timestamps() -> None:
     assert "[00:05] Hello everyone." in result
     assert "[00:07] Good morning." in result
     assert "[00:08] Let's get started." in result
+
+
+def test_render_transcript_partial_error() -> None:
+    meeting = _make_meeting(is_live=True)
+    detail = _make_detail(
+        meeting,
+        sentences=[],
+    ).model_copy(update={
+        "speakers": [],
+        "transcript_error": "Fireflies returned INTERNAL_SERVER_ERROR for transcript.sentences",
+    })
+    result = render_transcript(meeting, detail)
+
+    assert "temporarily unavailable" in result
+    assert "INTERNAL_SERVER_ERROR" in result
+    assert "No transcript available" not in result
 
 
 def test_render_transcript_groups_same_speaker() -> None:
