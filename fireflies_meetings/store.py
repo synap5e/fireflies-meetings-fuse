@@ -363,7 +363,25 @@ class MeetingStore:
             if is_initial:
                 self._entries = new_entries
             else:
-                self._entries.update(new_entries)
+                for mid, new_entry in new_entries.items():
+                    existing = self._entries.get(mid)
+                    if (
+                        existing is not None
+                        and existing.meeting.is_live
+                        and not new_entry.meeting.is_live
+                        and not new_entry.meeting.summary_is_terminal
+                    ):
+                        # List API doesn't reflect live state reliably (is_live
+                        # is False even for in-progress meetings). watch_meeting
+                        # and active_meetings poll are the positive sources;
+                        # list refresh only flips live→done when summary_status
+                        # goes terminal.
+                        preserved = new_entry.meeting.model_copy(update={"is_live": True})
+                        self._entries[mid] = MeetingEntry(
+                            meeting=preserved, slug=new_entry.slug,
+                        )
+                    else:
+                        self._entries[mid] = new_entry
 
             self._list_cache_time = time.time()
             jitter_factor = 0.7 + random.random() * 0.6  # [0.7, 1.3]
@@ -481,6 +499,21 @@ class MeetingStore:
         if not detail.meeting.is_live:
             self._live_details.pop(meeting_id, None)
             self._live_transcript_rows.pop(meeting_id, None)
+            if detail.meeting.summary_is_terminal:
+                # Detail fetch is the authoritative negative signal for
+                # Chat-discovered meetings: when summary_status goes terminal
+                # the meeting is done, so clear the locally-held is_live flag.
+                entry = self._entries.get(meeting_id)
+                if entry is not None and entry.meeting.is_live:
+                    done = entry.meeting.model_copy(update={"is_live": False})
+                    self._entries[meeting_id] = MeetingEntry(
+                        meeting=done, slug=entry.slug,
+                    )
+                    log.info(
+                        "Detail fetch: marked %s %r as done (summary_status=%s)",
+                        meeting_id, done.title,
+                        done.meeting_info.summary_status,
+                    )
             return detail
 
         live_rows = self._live_transcript_rows.get(meeting_id)
@@ -608,11 +641,22 @@ class MeetingStore:
             ]
         return self._resolve_collisions(entries)
 
-    def list_live_meeting_ids(self) -> list[str]:
-        """Return IDs of currently live meetings."""
+    def list_live_dirnames(self) -> list[str]:
+        """Return collision-resolved slug dirnames of currently-live meetings.
+
+        Names are slug-based (e.g. ``backend-roundtable``) so ``/live/`` reads
+        like a human-named directory. Collisions within the live subset get
+        ``-2``, ``-3`` suffixes via ``_resolve_collisions``.
+        """
         self._refresh_if_stale()
         with self._lock:
-            return [mid for mid, e in self._entries.items() if e.meeting.is_live]
+            live = [e for e in self._entries.values() if e.meeting.is_live]
+        return list(self._resolve_collisions(live).keys())
+
+    def _live_entry_by_dirname(self, dirname: str) -> MeetingEntry | None:
+        with self._lock:
+            live = [e for e in self._entries.values() if e.meeting.is_live]
+        return self._resolve_collisions(live).get(dirname)
 
     def get_uncached_meeting_ids(self) -> list[str]:
         """Return IDs of completed meetings that have no disk detail cache yet.
@@ -709,13 +753,23 @@ class MeetingStore:
         """Fetch a meeting by ID and add it to the entry map.
 
         Used by the Google Chat watcher to surface live meetings that the
-        `transcripts` list query hides from non-admin users. No-op if the
-        meeting is already known. Returns True if the entry is present
-        after the call (either newly added or pre-existing), False on
-        API error.
+        `transcripts` list query hides from non-admin users. If the entry is
+        already known but not yet marked live, re-marks it live (the list
+        cache typically loads with is_live=False). Returns True if the entry
+        is present after the call, False on API error.
         """
         with self._lock:
-            if meeting_id in self._entries:
+            existing = self._entries.get(meeting_id)
+            if existing is not None:
+                if not existing.meeting.is_live and not existing.meeting.is_completed:
+                    meeting = existing.meeting.model_copy(update={"is_live": True})
+                    self._entries[meeting_id] = MeetingEntry(
+                        meeting=meeting, slug=existing.slug,
+                    )
+                    log.info(
+                        "watch_meeting: re-marked %s %r as live",
+                        meeting_id, meeting.title,
+                    )
                 return True
             if self._backoff.is_backed_off:
                 log.debug("watch_meeting(%s): backed off", meeting_id)
@@ -751,15 +805,23 @@ class MeetingStore:
         return True
 
     def sync_active_meeting_ids(self, active_ids: list[str]) -> None:
-        """Update cached live flags from the authoritative active_meetings query."""
+        """Mark meetings in the active_meetings query as live.
+
+        Positive-only: we set is_live=True for IDs that appear in active_ids,
+        but never flip is_live=True→False based on absence. The
+        active_meetings query returns [] for non-admin users, so treating its
+        absence as authoritative wipes out state set by watch_meeting /
+        Google Chat discovery. Meetings transition out of live via terminal
+        summary_status, handled in _fetch_meetings.
+        """
         active = set(active_ids)
         with self._lock:
-            for meeting_id, entry in list(self._entries.items()):
-                is_live = meeting_id in active
-                if entry.meeting.is_live == is_live:
+            for meeting_id in active:
+                entry = self._entries.get(meeting_id)
+                if entry is None or entry.meeting.is_live:
                     continue
 
-                meeting = entry.meeting.model_copy(update={"is_live": is_live})
+                meeting = entry.meeting.model_copy(update={"is_live": True})
                 self._entries[meeting_id] = MeetingEntry(meeting=meeting, slug=entry.slug)
 
                 detail = self._live_details.get(meeting_id)
@@ -796,20 +858,22 @@ class MeetingStore:
             self._live_details[meeting_id] = updated_detail
             self._cache_rendered_detail_locked(meeting_id, updated_detail)
 
-    def get_live_symlink_target(self, meeting_id: str) -> str | None:
-        """Return the relative symlink target for a live meeting from the /live/ directory.
+    def get_live_symlink_target(self, dirname: str) -> str | None:
+        """Return the relative symlink target for a live meeting from /live/.
 
-        Target is of the form ../YYYY-MM/DD/<dirname> where dirname is the
-        collision-resolved name in the full date tree.
+        Target is of the form ``../YYYY-MM/DD/<datedir>`` where ``datedir`` is
+        the collision-resolved name in the full date tree. ``dirname`` is the
+        slug-based name returned by ``list_live_dirnames``.
         """
-        entry = self._entries.get(meeting_id)
-        if entry is None or not entry.meeting.is_live:
+        entry = self._live_entry_by_dirname(dirname)
+        if entry is None:
             return None
+        meeting_id = entry.meeting.id
         date_str = entry.meeting.date_str
         year_month, day = date_str[:7], date_str[8:10]
-        for dirname, e in self.list_meetings(date_str).items():
+        for datedir, e in self.list_meetings(date_str).items():
             if e.meeting.id == meeting_id:
-                return f"../{year_month}/{day}/{dirname}"
+                return f"../{year_month}/{day}/{datedir}"
         return None
 
     def get_file(self, meeting_id: str, filename: str) -> tuple[bytes | None, bool]:

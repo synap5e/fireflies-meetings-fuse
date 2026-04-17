@@ -223,7 +223,7 @@ class FirefliesMeetingOps(pyfuse3.Operations):
                     entries.insert(0, (_AUTH_EXPIRED_NAME, False))
                 return entries
             if not is_mine and len(sub) == 1 and sub[0] == _LIVE_DIR:
-                return [(mid, False) for mid in self._store.list_live_meeting_ids()]
+                return [(name, False) for name in self._store.list_live_dirnames()]
             if is_mine and not sub:
                 return [(m, True) for m in self._store.list_year_months_mine()]
             return self._list_date_subtree(sub, is_mine)

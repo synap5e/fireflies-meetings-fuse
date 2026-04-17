@@ -320,7 +320,17 @@ class Meeting(_FFBaseModel):
         summarize but the meeting itself is done; treat as terminal so the
         backfill loop caches it instead of re-fetching forever.
         """
-        return not self.is_live and self.meeting_info.summary_status in _TERMINAL_STATUSES
+        return not self.is_live and self.summary_is_terminal
+
+    @property
+    def summary_is_terminal(self) -> bool:
+        """True if the API reports a terminal summary_status regardless of is_live.
+
+        Used to decide whether a list refresh is allowed to flip a locally-held
+        is_live=True flag back to False. Checking only summary_status avoids the
+        circular dependency is_completed has with is_live.
+        """
+        return self.meeting_info.summary_status in _TERMINAL_STATUSES
 
 
 class TranscriptDetail(_FFBaseModel):
