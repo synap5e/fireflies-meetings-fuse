@@ -108,7 +108,7 @@ The daemon also does a best-effort non-interactive refresh from your local brows
 │           ├── meeting.json
 │           └── open.sh        # executable, runs xdg-open on the transcript URL
 ├── live/                      # contains a symlink per currently-live meeting,
-│                              # named by raw meeting ID, → ../YYYY-MM/DD/<slug>
+│                              # named by slug, → ../YYYY-MM/DD/<slug>
 └── mine/                      # entire date tree filtered to meetings you organized
                                # (only appears if FIREFLIES_USER_EMAIL is configured)
 ```
