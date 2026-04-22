@@ -6,8 +6,11 @@ import errno
 import logging
 import os
 import stat
+import sys
+import threading
 import time
 from collections.abc import Sequence
+from pathlib import Path
 
 import pyfuse3
 import trio
@@ -16,6 +19,32 @@ from .inode_map import InodeMap
 from .store import MeetingStore
 
 log = logging.getLogger(__name__)
+
+
+def _resolve_cli_path() -> str:
+    """Best-effort absolute path to the `fireflies-meetings` entry point.
+
+    Uses the running interpreter's bin dir so the marker text copy-pastes
+    into a shell without activating the venv. Falls back to the bare name
+    if the file isn't adjacent to the interpreter.
+    """
+    candidate = Path(sys.executable).parent / "fireflies-meetings"
+    return str(candidate) if candidate.exists() else "fireflies-meetings"
+
+
+def _resolve_env_path() -> str:
+    """Best-effort absolute path to the service's .env.
+
+    The systemd unit uses %h/agentic/fireflies-meetings-fuse/.env. In an
+    editable install this module lives inside that tree, so we can infer
+    the project root from __file__. Falls back to a sensible default.
+    """
+    candidate = Path(__file__).resolve().parents[1] / ".env"
+    return str(candidate) if candidate.exists() else "~/agentic/fireflies-meetings-fuse/.env"
+
+
+_CLI_PATH = _resolve_cli_path()
+_ENV_PATH = _resolve_env_path()
 
 # Path structure (non-mine):
 #   depth 0  /
@@ -33,13 +62,54 @@ _MINE_DIR = "mine"
 _LIVE_DIR = "live"
 _EXECUTABLE_NAMES = frozenset({"open.sh"})
 _AUTH_EXPIRED_NAME = "AUTHENTICATION_EXPIRED"
-_AUTH_EXPIRED_CONTENT = b"""\
-Authentication has expired. Check that your API key is valid and run:
+_AUTH_EXPIRED_CONTENT = (
+    f"""\
+Fireflies API authentication failed (401/403). All background fetches are
+stopped until the service is restarted with working credentials.
 
-    fireflies-meetings mount --api-key ~/.config/fireflies-meetings/api_key
+To recover:
 
-Then restart the service.
+    1. Get a fresh API key from:
+
+           https://app.fireflies.ai/integrations/custom/fireflies
+
+       Paste it as the FIREFLIES_API_KEY value in:
+
+           {_ENV_PATH}
+
+       (or write it to ~/.config/fireflies-meetings/api_key as one line.)
+
+    2. If the internal live-caption fallback also needs a refresh
+       (FIREFLIES_SESSION_TOKEN, session.json), run:
+
+           {_CLI_PATH} auth-session
+
+       This scrapes the session cookie from your logged-in browser and
+       auto-restarts the service on success.
+
+    3. systemctl --user restart fireflies-meetings
+
+Do NOT run `{_CLI_PATH} mount` manually while the systemd service
+still owns the mountpoint -- that only starts a second, failing mount.
 """
+).encode("ascii")
+
+_CHAT_AUTH_EXPIRED_NAME = "CHAT_AUTH_EXPIRED"
+_CHAT_AUTH_EXPIRED_CONTENT = (
+    f"""\
+Google Chat credentials are missing or revoked. Live meeting discovery via
+Chat is disabled. (The Fireflies API side may still be working -- see
+AUTHENTICATION_EXPIRED if that file is also present.)
+
+To recover:
+
+    1. {_CLI_PATH} auth-chat
+
+       (runs the OAuth flow in a browser; refreshes the chat token file)
+
+    2. systemctl --user restart fireflies-meetings
+"""
+).encode("ascii")
 
 # sub_depth = number of path components after stripping the optional "mine/" prefix.
 # Directories have sub_depth 0-3; files have sub_depth 4.
@@ -47,18 +117,23 @@ _SUB_DEPTH_MONTH = 1
 _SUB_DEPTH_DAY = 2
 _SUB_DEPTH_MEETING = 3
 _SUB_DEPTH_FILE = 4
+_DYNAMIC_TIMEOUT = 0.0
+_STATIC_TIMEOUT = 300.0
+_IN_PROGRESS_FILE = "_in_progress"
 
 
 def _now_ns() -> int:
     return int(time.time() * 1e9)
 
 
-def _make_dir_attr(inode: int) -> pyfuse3.EntryAttributes:
+def _make_dir_attr(inode: int, *, timeout: float = _STATIC_TIMEOUT) -> pyfuse3.EntryAttributes:
     entry = pyfuse3.EntryAttributes()
     entry.st_ino = pyfuse3.InodeT(inode)
     entry.st_mode = stat.S_IFDIR | 0o555
     entry.st_nlink = 2
     entry.st_size = 0
+    entry.attr_timeout = timeout
+    entry.entry_timeout = timeout
     now = _now_ns()
     entry.st_atime_ns = now
     entry.st_mtime_ns = now
@@ -68,12 +143,19 @@ def _make_dir_attr(inode: int) -> pyfuse3.EntryAttributes:
     return entry
 
 
-def _make_symlink_attr(inode: int, target_len: int) -> pyfuse3.EntryAttributes:
+def _make_symlink_attr(
+    inode: int,
+    target_len: int,
+    *,
+    timeout: float = _STATIC_TIMEOUT,
+) -> pyfuse3.EntryAttributes:
     entry = pyfuse3.EntryAttributes()
     entry.st_ino = pyfuse3.InodeT(inode)
     entry.st_mode = stat.S_IFLNK | 0o777
     entry.st_nlink = 1
     entry.st_size = target_len
+    entry.attr_timeout = timeout
+    entry.entry_timeout = timeout
     now = _now_ns()
     entry.st_atime_ns = now
     entry.st_mtime_ns = now
@@ -85,12 +167,15 @@ def _make_symlink_attr(inode: int, target_len: int) -> pyfuse3.EntryAttributes:
 
 def _make_file_attr(
     inode: int, size: int, *, executable: bool = False,
+    timeout: float = _STATIC_TIMEOUT,
 ) -> pyfuse3.EntryAttributes:
     entry = pyfuse3.EntryAttributes()
     entry.st_ino = pyfuse3.InodeT(inode)
     entry.st_mode = stat.S_IFREG | (0o555 if executable else 0o444)
     entry.st_nlink = 1
     entry.st_size = size
+    entry.attr_timeout = timeout
+    entry.entry_timeout = timeout
     now = _now_ns()
     entry.st_atime_ns = now
     entry.st_mtime_ns = now
@@ -118,7 +203,112 @@ class FirefliesMeetingOps(pyfuse3.Operations):
         self._store = store
         self._inodes = InodeMap()
         self._content: dict[int, bytes] = {}
+        self._dynamic_fhs: set[int] = set()
         self._symlinks: dict[int, bytes] = {}  # inode -> symlink target bytes
+        self._state_lock = threading.Lock()
+        self._store.set_live_change_callback(self._invalidate_meeting)
+
+    def _get_path(self, inode: int) -> str | None:
+        with self._state_lock:
+            return self._inodes.get_path(inode)
+
+    def _get_or_create_inode(self, path: str) -> int:
+        with self._state_lock:
+            return self._inodes.get_or_create(path)
+
+    def _get_inode(self, path: str) -> int | None:
+        with self._state_lock:
+            return self._inodes.get_inode(path)
+
+    def _remember_symlink(self, inode: int, target: bytes) -> None:
+        with self._state_lock:
+            self._symlinks[inode] = target
+
+    def _remember_static_content(self, inode: int, content: bytes) -> None:
+        with self._state_lock:
+            self._content[inode] = content
+            self._dynamic_fhs.discard(inode)
+
+    def _mark_dynamic_handle(self, inode: int) -> None:
+        with self._state_lock:
+            self._content.pop(inode, None)
+            self._dynamic_fhs.add(inode)
+
+    def _is_dynamic_handle(self, inode: int) -> bool:
+        with self._state_lock:
+            return inode in self._dynamic_fhs
+
+    def _get_static_content(self, inode: int) -> bytes | None:
+        with self._state_lock:
+            return self._content.get(inode)
+
+    def _release_handle(self, inode: int) -> None:
+        with self._state_lock:
+            self._content.pop(inode, None)
+            self._dynamic_fhs.discard(inode)
+
+    def _forget_inode(self, inode: int, nlookup: int) -> None:
+        with self._state_lock:
+            self._inodes.forget(inode, nlookup)
+            if self._inodes.get_path(inode) is None:
+                self._content.pop(inode, None)
+                self._dynamic_fhs.discard(inode)
+                self._symlinks.pop(inode, None)
+
+    def _is_dynamic_path(self, path: str) -> bool:
+        if path == f"/{_LIVE_DIR}":
+            return True
+
+        is_mine, sub = _parse_path(path)
+        if not is_mine and len(sub) == 2 and sub[0] == _LIVE_DIR:
+            return True
+        if len(sub) not in {_SUB_DEPTH_MEETING, _SUB_DEPTH_FILE}:
+            return False
+
+        year_month, day, slug = sub[:3]
+        date_str = f"{year_month}-{day}"
+        try:
+            meetings = (
+                self._store.list_meetings_mine(date_str) if is_mine
+                else self._store.list_meetings(date_str)
+            )
+            entry = meetings.get(slug)
+        except Exception:
+            log.exception("Error resolving dynamic path %s", path)
+            return False
+        if entry is None:
+            return False
+        return self._store.is_meeting_dynamic(entry.meeting.id)
+
+    def _timeout_for_path(self, path: str) -> float:
+        return _DYNAMIC_TIMEOUT if self._is_dynamic_path(path) else _STATIC_TIMEOUT
+
+    def _invalidate_meeting(self, meeting_id: str) -> None:
+        paths = self._store.get_meeting_paths(meeting_id)
+        if paths is None:
+            return
+
+        meeting_dir, live_path, mine_path = paths
+        candidate_paths = [meeting_dir, "/live"]
+        for optional_path in (live_path, mine_path):
+            if optional_path is not None:
+                candidate_paths.append(optional_path)
+
+        for filename in (*self._store.list_files(meeting_id), _IN_PROGRESS_FILE):
+            candidate_paths.append(f"{meeting_dir}/{filename}")
+            if mine_path is not None:
+                candidate_paths.append(f"{mine_path}/{filename}")
+
+        seen_inodes: set[int] = set()
+        for path in candidate_paths:
+            inode = self._get_inode(path)
+            if inode is None or inode in seen_inodes:
+                continue
+            seen_inodes.add(inode)
+            try:
+                pyfuse3.invalidate_inode(pyfuse3.InodeT(inode))
+            except OSError:
+                log.debug("Skipping inode invalidation for %s", path, exc_info=True)
 
     def _resolve_meeting_file(self, path: str) -> tuple[str, str, str] | None:
         """Parse a path into (meeting_id, slug, filename) if it's a meeting file.
@@ -155,6 +345,8 @@ class FirefliesMeetingOps(pyfuse3.Operations):
         """
         if path == f"/{_AUTH_EXPIRED_NAME}":
             return len(_AUTH_EXPIRED_CONTENT) if self._store.is_auth_fatal else None
+        if path == f"/{_CHAT_AUTH_EXPIRED_NAME}":
+            return len(_CHAT_AUTH_EXPIRED_CONTENT) if self._store.is_chat_auth_fatal else None
         parsed = self._resolve_meeting_file(path)
         if parsed is None:
             return None
@@ -172,6 +364,11 @@ class FirefliesMeetingOps(pyfuse3.Operations):
         """
         if path == f"/{_AUTH_EXPIRED_NAME}":
             return (_AUTH_EXPIRED_CONTENT, True) if self._store.is_auth_fatal else (None, False)
+        if path == f"/{_CHAT_AUTH_EXPIRED_NAME}":
+            return (
+                (_CHAT_AUTH_EXPIRED_CONTENT, True) if self._store.is_chat_auth_fatal
+                else (None, False)
+            )
         parsed = self._resolve_meeting_file(path)
         if parsed is None:
             return None, False
@@ -219,6 +416,8 @@ class FirefliesMeetingOps(pyfuse3.Operations):
                 entries.append((_LIVE_DIR, True))
                 if self._store.user_email:
                     entries.append((_MINE_DIR, True))
+                if self._store.is_chat_auth_fatal:
+                    entries.insert(0, (_CHAT_AUTH_EXPIRED_NAME, False))
                 if self._store.is_auth_fatal:
                     entries.insert(0, (_AUTH_EXPIRED_NAME, False))
                 return entries
@@ -236,11 +435,11 @@ class FirefliesMeetingOps(pyfuse3.Operations):
         inode: int,
         ctx: pyfuse3.RequestContext,
     ) -> pyfuse3.EntryAttributes:
-        path = self._inodes.get_path(inode)
+        path = self._get_path(inode)
         if path is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
 
-        if path == f"/{_AUTH_EXPIRED_NAME}":
+        if path in (f"/{_AUTH_EXPIRED_NAME}", f"/{_CHAT_AUTH_EXPIRED_NAME}"):
             size = self._resolve_size(path)
             if size is None:
                 raise pyfuse3.FUSEError(errno.ENOENT)
@@ -254,8 +453,8 @@ class FirefliesMeetingOps(pyfuse3.Operations):
             if target is None:
                 raise pyfuse3.FUSEError(errno.ENOENT)
             tgt = target.encode()
-            self._symlinks[inode] = tgt
-            return _make_symlink_attr(inode, len(tgt))
+            self._remember_symlink(inode, tgt)
+            return _make_symlink_attr(inode, len(tgt), timeout=self._timeout_for_path(path))
 
         # /mine/ requires user_email to be configured
         if is_mine and not sub and not self._store.user_email:
@@ -263,7 +462,7 @@ class FirefliesMeetingOps(pyfuse3.Operations):
 
         # Directories: root, live, mine root, month, day, meeting
         if len(sub) < _SUB_DEPTH_FILE:
-            return _make_dir_attr(inode)
+            return _make_dir_attr(inode, timeout=self._timeout_for_path(path))
 
         # Files — cheap stat-only path (no API calls).
         if len(sub) == _SUB_DEPTH_FILE:
@@ -271,7 +470,12 @@ class FirefliesMeetingOps(pyfuse3.Operations):
             if size is None:
                 raise pyfuse3.FUSEError(errno.ENOENT)
             name = path.rsplit("/", 1)[-1]
-            return _make_file_attr(inode, size, executable=name in _EXECUTABLE_NAMES)
+            return _make_file_attr(
+                inode,
+                size,
+                executable=name in _EXECUTABLE_NAMES,
+                timeout=self._timeout_for_path(path),
+            )
 
         raise pyfuse3.FUSEError(errno.ENOENT)
 
@@ -281,7 +485,7 @@ class FirefliesMeetingOps(pyfuse3.Operations):
         name: bytes,
         ctx: pyfuse3.RequestContext,
     ) -> pyfuse3.EntryAttributes:
-        parent_path = self._inodes.get_path(parent_inode)
+        parent_path = self._get_path(parent_inode)
         if parent_path is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
 
@@ -300,10 +504,10 @@ class FirefliesMeetingOps(pyfuse3.Operations):
         if not found:
             raise pyfuse3.FUSEError(errno.ENOENT)
 
-        inode = self._inodes.get_or_create(child_path)
+        inode = self._get_or_create_inode(child_path)
 
         if is_dir:
-            return _make_dir_attr(inode)
+            return _make_dir_attr(inode, timeout=self._timeout_for_path(child_path))
 
         # /live/<meeting-id> entries are symlinks
         if parent_path == f"/{_LIVE_DIR}":
@@ -311,21 +515,26 @@ class FirefliesMeetingOps(pyfuse3.Operations):
             if target is None:
                 raise pyfuse3.FUSEError(errno.ENOENT)
             tgt = target.encode()
-            self._symlinks[inode] = tgt
-            return _make_symlink_attr(inode, len(tgt))
+            self._remember_symlink(inode, tgt)
+            return _make_symlink_attr(inode, len(tgt), timeout=self._timeout_for_path(child_path))
 
         # Cheap stat-only — no API calls. `open` does the actual fetch.
         size = self._resolve_size(child_path)
         if size is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
-        return _make_file_attr(inode, size, executable=child_name in _EXECUTABLE_NAMES)
+        return _make_file_attr(
+            inode,
+            size,
+            executable=child_name in _EXECUTABLE_NAMES,
+            timeout=self._timeout_for_path(child_path),
+        )
 
     async def opendir(
         self,
         inode: int,
         ctx: pyfuse3.RequestContext,
     ) -> pyfuse3.FileHandleT:
-        path = self._inodes.get_path(inode)
+        path = self._get_path(inode)
         if path is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
         return pyfuse3.FileHandleT(inode)
@@ -336,7 +545,7 @@ class FirefliesMeetingOps(pyfuse3.Operations):
         start_id: int,
         token: pyfuse3.ReaddirToken,
     ) -> None:
-        path = self._inodes.get_path(fh)
+        path = self._get_path(fh)
         if path is None:
             return
 
@@ -347,22 +556,31 @@ class FirefliesMeetingOps(pyfuse3.Operations):
                 continue
 
             child_path = f"/{name}" if path == "/" else f"{path}/{name}"
-            child_inode = self._inodes.get_or_create(child_path)
+            child_inode = self._get_or_create_inode(child_path)
 
             if is_dir:
-                attr = _make_dir_attr(child_inode)
+                attr = _make_dir_attr(child_inode, timeout=self._timeout_for_path(child_path))
             elif path == f"/{_LIVE_DIR}":
                 target = self._store.get_live_symlink_target(name)
                 if target is None:
                     # Meeting vanished between list and readdir — skip
                     continue
                 tgt = target.encode()
-                self._symlinks[child_inode] = tgt
-                attr = _make_symlink_attr(child_inode, len(tgt))
+                self._remember_symlink(child_inode, tgt)
+                attr = _make_symlink_attr(
+                    child_inode,
+                    len(tgt),
+                    timeout=self._timeout_for_path(child_path),
+                )
             else:
                 # Cheap stat-only — `open` will do the actual fetch on read.
                 size = self._resolve_size(child_path) or 0
-                attr = _make_file_attr(child_inode, size, executable=name in _EXECUTABLE_NAMES)
+                attr = _make_file_attr(
+                    child_inode,
+                    size,
+                    executable=name in _EXECUTABLE_NAMES,
+                    timeout=self._timeout_for_path(child_path),
+                )
 
             if not pyfuse3.readdir_reply(token, name.encode("utf-8"), attr, idx + 1):
                 break
@@ -377,7 +595,7 @@ class FirefliesMeetingOps(pyfuse3.Operations):
         if flags & (os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_TRUNC | os.O_CREAT):
             raise pyfuse3.FUSEError(errno.EROFS)
 
-        path = self._inodes.get_path(inode)
+        path = self._get_path(inode)
         if path is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
 
@@ -386,7 +604,10 @@ class FirefliesMeetingOps(pyfuse3.Operations):
         content, is_completed = await trio.to_thread.run_sync(self._resolve_content, path)
         if content is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
-        self._content[inode] = content
+        if is_completed:
+            self._remember_static_content(inode, content)
+        else:
+            self._mark_dynamic_handle(inode)
 
         fi = pyfuse3.FileInfo()
         fi.fh = pyfuse3.FileHandleT(inode)
@@ -407,25 +628,39 @@ class FirefliesMeetingOps(pyfuse3.Operations):
         (b) live/in-progress files get re-fetched on next open rather
         than serving stale bytes forever.
         """
-        self._content.pop(fh, None)
+        self._release_handle(fh)
 
     async def forget(self, inode_list: Sequence[tuple[pyfuse3.InodeT, int]]) -> None:
         """Kernel has dropped its reference to these inodes. Free our mappings."""
         for inode, nlookup in inode_list:
-            self._inodes.forget(inode, nlookup)
-            # Also clean up any stale symlink / content entries
-            if self._inodes.get_path(inode) is None:
-                self._content.pop(inode, None)
-                self._symlinks.pop(inode, None)
+            self._forget_inode(inode, nlookup)
 
     async def readlink(self, inode: int, ctx: pyfuse3.RequestContext) -> bytes:
-        target = self._symlinks.get(inode)
+        with self._state_lock:
+            target = self._symlinks.get(inode)
         if target is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
         return target
 
     async def read(self, fh: int, off: int, size: int) -> bytes:
-        content = self._content.get(fh)
+        if self._is_dynamic_handle(fh):
+            path = self._get_path(fh)
+            if path is None:
+                raise pyfuse3.FUSEError(errno.ENOENT)
+            parsed = self._resolve_meeting_file(path)
+            if parsed is None:
+                raise pyfuse3.FUSEError(errno.EIO)
+            meeting_id, _slug, filename = parsed
+            content = await trio.to_thread.run_sync(
+                self._store.get_cached_file_content,
+                meeting_id,
+                filename,
+            )
+            if content is None:
+                raise pyfuse3.FUSEError(errno.EIO)
+            return content[off : off + size]
+
+        content = self._get_static_content(fh)
         if content is None:
             raise pyfuse3.FUSEError(errno.EIO)
         return content[off : off + size]

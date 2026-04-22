@@ -244,7 +244,7 @@ async def _chat_watch_loop(
     import httpx
     import trio
 
-    from .chat_watcher import ChatWatcher, load_credentials
+    from .chat_watcher import ChatAuthExpiredError, ChatWatcher, load_credentials
 
     creds = load_credentials(token_path)
     if creds is None:
@@ -253,6 +253,7 @@ async def _chat_watch_loop(
             "live meeting discovery disabled. Run `fireflies-meetings auth-chat` to set it up.",
             token_path,
         )
+        store.mark_chat_auth_fatal()
         return
 
     watcher = ChatWatcher(creds, token_path=token_path)
@@ -263,6 +264,15 @@ async def _chat_watch_loop(
                 ids = await trio.to_thread.run_sync(
                     functools.partial(watcher.find_live_meeting_ids, lookback_seconds=lookback_seconds),
                 )
+            except ChatAuthExpiredError as e:
+                _log.warning(
+                    "Google Chat credentials unusable: %s. "
+                    "Live meeting discovery disabled until `fireflies-meetings auth-chat` "
+                    "is re-run and the service is restarted.",
+                    e,
+                )
+                store.mark_chat_auth_fatal()
+                return
             except (OSError, httpx.HTTPError, ValueError):
                 _log.exception("Chat watcher poll failed; retrying next interval")
                 await trio.sleep(poll_interval)

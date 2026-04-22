@@ -8,6 +8,7 @@ import os
 import random
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -85,6 +86,18 @@ def _render_in_progress_status(detail: TranscriptDetail) -> bytes:
 
 def _sort_sentences(sentences: list[Sentence]) -> list[Sentence]:
     return sorted(sentences, key=lambda sentence: (sentence.start_time, sentence.index))
+
+
+def _merge_sentences(
+    base_sentences: list[Sentence],
+    live_rows: dict[str, Sentence] | None,
+) -> list[Sentence]:
+    if not live_rows:
+        return _sort_sentences(list(base_sentences))
+
+    merged = {str(sentence.index): sentence for sentence in base_sentences}
+    merged.update(live_rows)
+    return _sort_sentences(list(merged.values()))
 
 
 # Files inside each meeting directory
@@ -224,6 +237,8 @@ class MeetingStore:
         self.user_email: str | None = user_email
         self._list_cache_file: Path = self._status_cache.cache_dir / "list.json"
         self._detail_cache_dir: Path = self._status_cache.cache_dir / "detail"
+        self._live_change_callback: Callable[[str], None] | None = None
+        self._chat_auth_fatal: bool = False
         # Guards mutations to _entries / _file_cache / _list_cache_time
         # / _backoff and snapshot reads of those dicts. Held only for
         # short critical sections — never around API calls — so a slow
@@ -413,12 +428,9 @@ class MeetingStore:
         """Return True if cached data is still valid and should be returned as-is."""
         if self._status_cache.is_completed(meeting_id):
             return True
-        entry = self._entries.get(meeting_id)
-        if entry is not None and entry.meeting.is_live:
-            return False
         return time.monotonic() - cached.fetched_at < _DETAIL_TTL
 
-    def _fetch_detail(self, meeting: Meeting) -> _CachedFiles | None:
+    def _fetch_detail(self, meeting: Meeting) -> tuple[_CachedFiles | None, bool]:
         """Call the API and render files for a meeting. Updates backoff state.
 
         The API call runs WITHOUT self._lock held (called outside the lock by
@@ -437,34 +449,34 @@ class MeetingStore:
             files = _render_files(stub_meeting, stub_detail)
             self._status_cache.mark_completed(meeting_id)
             self._save_detail_to_disk(meeting_id, files)
-            return _CachedFiles(files=files, fetched_at=time.monotonic())
+            return _CachedFiles(files=files, fetched_at=time.monotonic()), True
         except RateLimitedError as e:
             with self._lock:
                 self._backoff.record_rate_limit(e.retry_after)
-            return None
+            return None, False
         except FatalAPIError:
             with self._lock:
                 self._backoff.record_fatal()
-            return None
+            return None, False
         except TransientAPIError as e:
             log.warning("Transient API error fetching detail for %s: %s", meeting_id, e)
             with self._lock:
                 self._backoff.record_failure()
-            return None
+            return None, False
         except httpx.TimeoutException:
             log.warning("Timeout fetching detail for %s", meeting_id)
             with self._lock:
                 self._backoff.record_failure(is_timeout=True)
-            return None
+            return None, False
         except httpx.HTTPError as e:
             log.warning("HTTP error fetching detail for %s: %s", meeting_id, e)
             with self._lock:
                 self._backoff.record_failure()
-            return None
+            return None, False
 
         with self._lock:
             self._backoff.record_success()
-            detail = self._merge_live_stream_state_locked(meeting_id, detail)
+            detail, live_state_changed = self._merge_live_stream_state_locked(meeting_id, detail)
 
         # The detail's meeting object came from a separate API call; carry over
         # the slug and date that the list-side computed for this entry so the
@@ -483,7 +495,7 @@ class MeetingStore:
         else:
             files[_IN_PROGRESS] = _render_in_progress_status(detail)
 
-        return _CachedFiles(files=files, fetched_at=time.monotonic())
+        return _CachedFiles(files=files, fetched_at=time.monotonic()), live_state_changed
 
     def _cache_rendered_detail_locked(self, meeting_id: str, detail: TranscriptDetail) -> None:
         files = _render_files(detail.meeting, detail)
@@ -491,11 +503,21 @@ class MeetingStore:
             files[_IN_PROGRESS] = _render_in_progress_status(detail)
         self._file_cache[meeting_id] = _CachedFiles(files=files, fetched_at=time.monotonic())
 
+    def _overlay_live_rows_locked(self, meeting_id: str, detail: TranscriptDetail) -> TranscriptDetail:
+        live_rows = self._live_transcript_rows.get(meeting_id)
+        if live_rows is None:
+            return detail
+        return detail.model_copy(update={
+            "sentences": _merge_sentences(detail.sentences, live_rows),
+            "transcript_error": "",
+        })
+
     def _merge_live_stream_state_locked(
         self,
         meeting_id: str,
         detail: TranscriptDetail,
-    ) -> TranscriptDetail:
+    ) -> tuple[TranscriptDetail, bool]:
+        live_state_changed = False
         if not detail.meeting.is_live:
             self._live_details.pop(meeting_id, None)
             self._live_transcript_rows.pop(meeting_id, None)
@@ -509,21 +531,16 @@ class MeetingStore:
                     self._entries[meeting_id] = MeetingEntry(
                         meeting=done, slug=entry.slug,
                     )
+                    live_state_changed = True
                     log.info(
                         "Detail fetch: marked %s %r as done (summary_status=%s)",
                         meeting_id, done.title,
                         done.meeting_info.summary_status,
                     )
-            return detail
+            return detail, live_state_changed
 
-        live_rows = self._live_transcript_rows.get(meeting_id)
-        if live_rows:
-            detail = detail.model_copy(update={
-                "sentences": _sort_sentences(list(live_rows.values())),
-                "transcript_error": "",
-            })
         self._live_details[meeting_id] = detail
-        return detail
+        return self._overlay_live_rows_locked(meeting_id, detail), live_state_changed
 
     def _ensure_files(self, meeting_id: str) -> _CachedFiles | None:
         """Ensure meeting files are fetched and rendered.
@@ -536,6 +553,7 @@ class MeetingStore:
         API call inside _fetch_detail runs without the lock.
         """
         # Fast path: cache hit (under lock for a consistent snapshot)
+        stale_cached: _CachedFiles | None = None
         with self._lock:
             cached = self._file_cache.get(meeting_id)
             if cached is not None and self._is_cache_fresh(meeting_id, cached):
@@ -543,7 +561,7 @@ class MeetingStore:
 
             if cached is not None:
                 log.info("Detail TTL expired for in-progress meeting %s, re-fetching", meeting_id)
-                del self._file_cache[meeting_id]
+                stale_cached = cached
 
             entry = self._entries.get(meeting_id)
             if entry is None:
@@ -564,11 +582,13 @@ class MeetingStore:
 
         # Slow path: API call without the lock
         log.info("Fetching detail for meeting %s: %s", meeting_id, meeting.title)
-        new_cached = self._fetch_detail(meeting)
+        new_cached, _ = self._fetch_detail(meeting)
         if new_cached is not None:
             with self._lock:
                 self._file_cache[meeting_id] = new_cached
-        return new_cached
+            self._notify_live_change(meeting_id)
+            return new_cached
+        return stale_cached
 
     # === Public API ===
 
@@ -579,6 +599,11 @@ class MeetingStore:
             snapshot = list(self._entries.values())
         months = {e.meeting.date_str[:7] for e in snapshot if e.meeting.date_str}
         return sorted(months, reverse=True)
+
+    def mark_list_cache_fresh(self) -> None:
+        """Mark the in-memory list snapshot as freshly fetched."""
+        with self._lock:
+            self._list_cache_time = time.time()
 
     def list_days(self, year_month: str) -> list[str]:
         """Return sorted list of DD strings for a given YYYY-MM, newest first."""
@@ -758,6 +783,8 @@ class MeetingStore:
         cache typically loads with is_live=False). Returns True if the entry
         is present after the call, False on API error.
         """
+        should_notify = False
+        should_save_list = False
         with self._lock:
             existing = self._entries.get(meeting_id)
             if existing is not None:
@@ -770,10 +797,18 @@ class MeetingStore:
                         "watch_meeting: re-marked %s %r as live",
                         meeting_id, meeting.title,
                     )
-                return True
-            if self._backoff.is_backed_off:
+                    should_notify = True
+                    should_save_list = True
+                else:
+                    return True
+            elif self._backoff.is_backed_off:
                 log.debug("watch_meeting(%s): backed off", meeting_id)
                 return False
+        if should_save_list:
+            self._save_list_cache()
+        if should_notify:
+            self._notify_live_change(meeting_id)
+            return True
 
         detail = self._fetch_detail_for_watch(meeting_id)
         if detail is None:
@@ -790,18 +825,21 @@ class MeetingStore:
 
         with self._lock:
             self._backoff.record_success()
-            detail = self._merge_live_stream_state_locked(meeting_id, detail)
+            detail, _live_state_changed = self._merge_live_stream_state_locked(meeting_id, detail)
             if meeting.id in self._entries:
                 return True
             self._entries[meeting.id] = MeetingEntry(meeting=meeting, slug=meeting.slug)
             self._file_cache[meeting.id] = _CachedFiles(
-                files=files, fetched_at=time.monotonic(),
+                files=_render_files(detail.meeting, detail), fetched_at=time.monotonic(),
             )
+            if not _can_persist_detail(detail):
+                self._file_cache[meeting.id].files[_IN_PROGRESS] = _render_in_progress_status(detail)
         log.info(
             "watch_meeting: added %s %r (is_live=%s, date=%s)",
             meeting.id, meeting.title, meeting.is_live, meeting.date_str,
         )
         self._save_list_cache()
+        self._notify_live_change(meeting_id)
         return True
 
     def sync_active_meeting_ids(self, active_ids: list[str]) -> None:
@@ -815,6 +853,7 @@ class MeetingStore:
         summary_status, handled in _fetch_meetings.
         """
         active = set(active_ids)
+        notify_ids: list[str] = []
         with self._lock:
             for meeting_id in active:
                 entry = self._entries.get(meeting_id)
@@ -823,13 +862,19 @@ class MeetingStore:
 
                 meeting = entry.meeting.model_copy(update={"is_live": True})
                 self._entries[meeting_id] = MeetingEntry(meeting=meeting, slug=entry.slug)
+                notify_ids.append(meeting_id)
 
                 detail = self._live_details.get(meeting_id)
                 if detail is None:
                     continue
                 updated_detail = detail.model_copy(update={"meeting": meeting})
                 self._live_details[meeting_id] = updated_detail
-                self._cache_rendered_detail_locked(meeting_id, updated_detail)
+                self._cache_rendered_detail_locked(
+                    meeting_id,
+                    self._overlay_live_rows_locked(meeting_id, updated_detail),
+                )
+        for meeting_id in notify_ids:
+            self._notify_live_change(meeting_id)
 
     def apply_live_transcript_update(
         self,
@@ -838,6 +883,7 @@ class MeetingStore:
         sentence: Sentence,
     ) -> None:
         """Merge one realtime transcript row into the in-memory live render cache."""
+        should_notify = False
         with self._lock:
             entry = self._entries.get(meeting_id)
             if entry is None:
@@ -850,13 +896,91 @@ class MeetingStore:
             rows = self._live_transcript_rows.setdefault(meeting_id, {})
             rows[transcript_id] = sentence
 
-            updated_detail = detail.model_copy(update={
-                "meeting": entry.meeting,
-                "sentences": _sort_sentences(list(rows.values())),
-                "transcript_error": "",
-            })
-            self._live_details[meeting_id] = updated_detail
-            self._cache_rendered_detail_locked(meeting_id, updated_detail)
+            baseline_detail = detail.model_copy(update={"meeting": entry.meeting})
+            self._live_details[meeting_id] = baseline_detail
+            self._cache_rendered_detail_locked(
+                meeting_id,
+                self._overlay_live_rows_locked(meeting_id, baseline_detail),
+            )
+            should_notify = True
+        if should_notify:
+            self._notify_live_change(meeting_id)
+
+    def set_live_change_callback(self, callback: Callable[[str], None] | None) -> None:
+        self._live_change_callback = callback
+
+    def _notify_live_change(self, meeting_id: str) -> None:
+        callback = self._live_change_callback
+        if callback is not None:
+            callback(meeting_id)
+
+    def is_meeting_dynamic(self, meeting_id: str) -> bool:
+        if self._status_cache.is_completed(meeting_id):
+            return False
+        with self._lock:
+            entry = self._entries.get(meeting_id)
+        return entry is not None and not entry.meeting.is_completed
+
+    def get_meeting_paths(self, meeting_id: str) -> tuple[str, str | None, str | None] | None:
+        with self._lock:
+            entry = self._entries.get(meeting_id)
+            if entry is None or not entry.meeting.date_str:
+                return None
+
+            date_str = entry.meeting.date_str
+            dated_entries = [
+                candidate
+                for candidate in self._entries.values()
+                if candidate.meeting.date_str == date_str
+            ]
+            datedir = next(
+                (
+                    dirname
+                    for dirname, candidate in self._resolve_collisions(dated_entries).items()
+                    if candidate.meeting.id == meeting_id
+                ),
+                None,
+            )
+            if datedir is None:
+                return None
+
+            year_month, day = date_str[:7], date_str[8:10]
+            dated_path = f"/{year_month}/{day}/{datedir}"
+
+            live_path: str | None = None
+            if entry.meeting.is_live:
+                live_entries = [candidate for candidate in self._entries.values() if candidate.meeting.is_live]
+                live_dirname = next(
+                    (
+                        dirname
+                        for dirname, candidate in self._resolve_collisions(live_entries).items()
+                        if candidate.meeting.id == meeting_id
+                    ),
+                    None,
+                )
+                if live_dirname is not None:
+                    live_path = f"/live/{live_dirname}"
+
+            mine_path: str | None = None
+            if self.user_email and entry.meeting.organizer_email == self.user_email:
+                mine_entries = [
+                    candidate
+                    for candidate in self._entries.values()
+                    if candidate.meeting.date_str == date_str
+                    and candidate.meeting.organizer_email == self.user_email
+                ]
+                mine_dirname = next(
+                    (
+                        dirname
+                        for dirname, candidate in self._resolve_collisions(mine_entries).items()
+                        if candidate.meeting.id == meeting_id
+                    ),
+                    None,
+                )
+                if mine_dirname is not None:
+                    mine_path = f"/mine/{year_month}/{day}/{mine_dirname}"
+
+        return dated_path, live_path, mine_path
 
     def get_live_symlink_target(self, dirname: str) -> str | None:
         """Return the relative symlink target for a live meeting from /live/.
@@ -890,6 +1014,13 @@ class MeetingStore:
             return None, False
         completed = self._status_cache.is_completed(meeting_id)
         return cached.files.get(filename), completed
+
+    def get_cached_file_content(self, meeting_id: str, filename: str) -> bytes | None:
+        with self._lock:
+            cached = self._file_cache.get(meeting_id)
+            if cached is None:
+                return None
+            return cached.files.get(filename)
 
     def get_file_size(self, meeting_id: str, filename: str) -> int:
         """Cheap stat-only size lookup. Never blocks on the network.
@@ -934,11 +1065,20 @@ class MeetingStore:
         """True if a fatal 401/403 has stopped all retries."""
         return self._backoff.fatal
 
+    @property
+    def is_chat_auth_fatal(self) -> bool:
+        """True if Google Chat credentials are missing or unrefreshable."""
+        return self._chat_auth_fatal
+
+    def mark_chat_auth_fatal(self) -> None:
+        self._chat_auth_fatal = True
+
     def force_refresh(self) -> None:
         """Full cache invalidation: list, non-completed details, backoff."""
         with self._lock:
             self._list_cache_time = 0.0
             self._backoff = _BackoffState()
+            self._chat_auth_fatal = False
             to_evict = [
                 mid for mid in self._file_cache
                 if not self._status_cache.is_completed(mid)
