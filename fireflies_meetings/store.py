@@ -30,6 +30,7 @@ from .renderer import (
     render_participants,
     render_summary,
     render_transcript,
+    render_views,
 )
 from .slug import slugify
 from .status_cache import StatusCache
@@ -52,6 +53,7 @@ def _render_files(meeting: Meeting, detail: TranscriptDetail) -> dict[str, bytes
         "summary.md": render_summary(meeting, detail).encode(),
         "transcript.md": render_transcript(meeting, detail).encode(),
         "participants.md": render_participants(meeting, detail).encode(),
+        "views.md": render_views(meeting, detail).encode(),
         "meeting.json": render_meeting_json(meeting, detail).encode(),
         "open.sh": render_open_script(meeting).encode(),
     }
@@ -105,10 +107,22 @@ MEETING_FILES: tuple[str, ...] = (
     "summary.md",
     "transcript.md",
     "participants.md",
+    "views.md",
     "meeting.json",
     "open.sh",
 )
 _IN_PROGRESS = "_in_progress"
+
+# Stub content for MEETING_FILES entries added after a meeting's on-disk
+# cache was first written. Served verbatim so a listing / read never
+# diverges from what MEETING_FILES advertises.
+_STUB_MISSING_FILE_CONTENT: dict[str, bytes] = {
+    "views.md": (
+        b"---\nviews: missing-from-cache\n---\n\n"
+        b"*This meeting was cached before the access-log feature landed. "
+        b"Clear ~/.cache/fireflies-meetings/detail/<meeting-id>/ to repopulate.*\n"
+    ),
+}
 # Sentinel file written into detail/<meeting_id>/ AFTER all the meeting
 # files are on disk. _load_detail_from_disk and get_uncached_meeting_ids
 # both gate on this so an interrupted write doesn't leave half a meeting
@@ -319,7 +333,16 @@ class MeetingStore:
                 for p in detail_dir.iterdir()
                 if p.is_file() and p.name != _COMPLETE_SENTINEL
             }
-            return _CachedFiles(files=files, fetched_at=time.monotonic()) if files else None
+            if not files:
+                return None
+            # Files added after the initial cache write (e.g. views.md) are
+            # missing from older on-disk caches. Synthesize a stub so readdir
+            # stays consistent with read -- otherwise the file appears in
+            # listings but opens ENOENT.
+            for name in MEETING_FILES:
+                if name not in files:
+                    files[name] = _STUB_MISSING_FILE_CONTENT.get(name, b"")
+            return _CachedFiles(files=files, fetched_at=time.monotonic())
         except OSError:
             log.warning("Failed to load detail cache for %s", meeting_id)
             return None
@@ -1040,7 +1063,14 @@ class MeetingStore:
         try:
             return (self._detail_cache_dir / meeting_id / filename).stat().st_size
         except OSError:
-            return 0
+            pass
+        # File missing from cache and disk. If it's a MEETING_FILES entry
+        # with a stub (e.g. views.md on pre-access-log caches), report the
+        # stub's size so the kernel doesn't cache 0 and short-circuit read.
+        stub = _STUB_MISSING_FILE_CONTENT.get(filename)
+        if stub is not None and self._status_cache.is_completed(meeting_id):
+            return len(stub)
+        return 0
 
     def list_files(self, meeting_id: str) -> list[str]:
         """Return filenames available for a meeting.

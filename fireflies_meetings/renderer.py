@@ -144,6 +144,46 @@ def render_participants(meeting: Meeting, detail: TranscriptDetail) -> str:
     return "\n".join(parts)
 
 
+def render_views(meeting: Meeting, detail: TranscriptDetail) -> str:
+    """Render views.md: one-row-per-access-log-entry table.
+
+    Sourced from the internal Fireflies API (`getMeetingSummaryAccessLogs`),
+    so only populated when session auth is configured. For completed
+    meetings the snapshot is frozen into the on-disk cache at first fetch.
+    """
+    parts: list[str] = []
+
+    parts.append("---")
+    parts.append(f"title: {_yaml_str(meeting.title)}")
+    parts.append(f"date: {meeting.date_str}")
+    parts.append(f"entries: {len(detail.access_logs)}")
+    parts.append("---")
+    parts.append("")
+
+    if not detail.access_logs:
+        if meeting.is_live:
+            parts.append("*Access log not collected while the meeting is live.*")
+        else:
+            parts.append("*No access-log entries recorded, or session auth is not configured.*")
+        parts.append("")
+        return "\n".join(parts)
+
+    # Newest first -- who looked at this most recently matters most.
+    sorted_entries = sorted(
+        detail.access_logs, key=lambda e: e.timestamp, reverse=True,
+    )
+
+    parts.append("| When | Who | Email | Action |")
+    parts.append("|------|-----|-------|--------|")
+    for entry in sorted_entries:
+        parts.append(
+            f"| {entry.timestamp} | {entry.user_name} | {entry.user_email} | {entry.action} |",
+        )
+    parts.append("")
+
+    return "\n".join(parts)
+
+
 def render_meeting_json(meeting: Meeting, detail: TranscriptDetail) -> str:
     """Render meeting.json with all meeting data."""
     data = {
@@ -164,6 +204,17 @@ def render_meeting_json(meeting: Meeting, detail: TranscriptDetail) -> str:
         "speakers": [{"id": s.id, "name": s.name} for s in detail.speakers],
         "attendees": [
             {"display_name": a.display_name, "email": a.email} for a in detail.attendees
+        ],
+        "access_logs": [
+            {
+                "id": e.id,
+                "user_id": e.user_id,
+                "user_email": e.user_email,
+                "user_name": e.user_name,
+                "action": e.action,
+                "timestamp": e.timestamp,
+            }
+            for e in detail.access_logs
         ],
         "summary": {
             "keywords": detail.summary.keywords,
