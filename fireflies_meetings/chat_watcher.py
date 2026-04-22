@@ -28,6 +28,15 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 
 log = logging.getLogger(__name__)
 
+
+class ChatAuthExpiredError(Exception):
+    """Raised when Google Chat credentials are missing, revoked, or unrefreshable.
+
+    Callers should treat this as fatal: no amount of retry will succeed until
+    the user runs `fireflies-meetings auth-chat` and the service restarts.
+    """
+
+
 _SCOPES = [
     "https://www.googleapis.com/auth/chat.messages.readonly",
     "https://www.googleapis.com/auth/chat.spaces.readonly",
@@ -105,7 +114,7 @@ class ChatWatcher:
             try:
                 self._creds.refresh(GoogleAuthRequest())
             except (RefreshError, GoogleAuthError) as e:
-                raise httpx.HTTPError(f"Chat credentials refresh failed: {e}") from e
+                raise ChatAuthExpiredError(str(e)) from e
             if self._token_path is not None:
                 try:
                     self._token_path.write_text(self._creds.to_json())
@@ -113,7 +122,7 @@ class ChatWatcher:
                     log.warning("Failed to persist refreshed token: %s", e)
         token = self._creds.token
         if not isinstance(token, str):
-            raise httpx.HTTPError("Chat credentials have no access token")
+            raise ChatAuthExpiredError("Chat credentials have no access token")
         return {"Authorization": f"Bearer {token}"}
 
     def _paginate(
