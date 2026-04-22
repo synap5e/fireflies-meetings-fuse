@@ -20,6 +20,14 @@ _HIVE_ENDPOINT = "https://app.fireflies.ai/api/v4/hive"
 _INTERNAL_GRAPHQL_ENDPOINT = "https://app.fireflies.ai/api/v4/graphql"
 _PAGE_SIZE = 50
 
+# Browser-ish UA required to clear the Cloudflare edge in front of api.fireflies.ai
+# -- the bare httpx default ("python-httpx/x.y.z") gets served an HTML 403 challenge
+# page. Any plausible UA seems to work; pick a current Chrome string.
+_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36"
+)
+
 # Recursive JSON type for untyped API responses
 type JsonValue = str | int | float | bool | None | dict[str, JsonValue] | list[JsonValue]
 type JsonObject = dict[str, JsonValue]
@@ -367,6 +375,7 @@ class FirefliesClient:
         headers: dict[str, str] = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            "User-Agent": _USER_AGENT,
         }
         if transport is not None:
             self._client = httpx.Client(
@@ -382,6 +391,7 @@ class FirefliesClient:
         internal_headers = {
             "Content-Type": "application/json",
             "Origin": "https://app.fireflies.ai",
+            "User-Agent": _USER_AGENT,
         }
         if session_auth is not None:
             internal_headers.update(internal_request_headers(
@@ -542,6 +552,16 @@ class FirefliesClient:
             raise RateLimitedError(retry_after=reset_secs)
 
         if resp.status_code in (401, 403):
+            # Cloudflare (and other edge proxies) serve an HTML challenge page
+            # with 403 when they dislike our TLS/UA fingerprint. That's not an
+            # auth problem -- treat as transient so we keep retrying instead
+            # of flipping the fatal flag.
+            body_preview = resp.text.lstrip()[:1]
+            if body_preview == "<":
+                raise TransientAPIError(
+                    f"HTTP {resp.status_code} with HTML body -- likely edge-proxy challenge, "
+                    f"not an auth failure. Content-Type={resp.headers.get('content-type')!r}",
+                )
             raise FatalAPIError(f"Auth error: HTTP {resp.status_code}")
 
         resp.raise_for_status()
