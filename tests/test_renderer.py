@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from fireflies_meetings.models import (
+    AccessLogEntry,
     Meeting,
     MeetingAttendee,
     MeetingInfo,
@@ -19,6 +20,7 @@ from fireflies_meetings.renderer import (
     render_participants,
     render_summary,
     render_transcript,
+    render_views,
 )
 
 
@@ -265,3 +267,72 @@ def test_transcript_frontmatter_escapes_title() -> None:
     for rendered in (transcript, participants):
         fm = _frontmatter_lines(rendered)
         assert not any(line.startswith("injected:") for line in fm)
+
+
+def test_render_views_empty_non_live() -> None:
+    """No access logs on a completed meeting -> empty-state body, still valid markdown."""
+    meeting = _make_meeting()
+    detail = _make_detail(meeting)
+    result = render_views(meeting, detail)
+    assert "entries: 0" in result
+    assert "session auth is not configured" in result
+
+
+def test_render_views_empty_live() -> None:
+    """Empty-state message is different when the meeting is still live."""
+    meeting = _make_meeting(is_live=True, meeting_info=MeetingInfo(summary_status=""))
+    detail = _make_detail(meeting)
+    result = render_views(meeting, detail)
+    assert "not collected while the meeting is live" in result
+
+
+def test_render_views_populated_sorts_newest_first() -> None:
+    meeting = _make_meeting()
+    detail = _make_detail(meeting).model_copy(update={
+        "access_logs": [
+            AccessLogEntry(
+                id="a", user_id="u1", user_email="alice@example.com",
+                user_name="Alice", action="view_summary",
+                timestamp="2026-04-01T10:00:00.000Z",
+            ),
+            AccessLogEntry(
+                id="b", user_id="u2", user_email="bob@example.com",
+                user_name="Bob", action="view_summary",
+                timestamp="2026-04-03T10:00:00.000Z",
+            ),
+        ],
+    })
+    result = render_views(meeting, detail)
+    assert "entries: 2" in result
+    assert "| When | Who | Email | Action |" in result
+    bob_idx = result.index("Bob")
+    alice_idx = result.index("Alice")
+    assert bob_idx < alice_idx, "newest (2026-04-03) should render before older (2026-04-01)"
+
+
+def test_render_views_frontmatter_escapes_title() -> None:
+    meeting = _make_meeting(title='evil"\ninjected: bad')
+    detail = _make_detail(meeting)
+    result = render_views(meeting, detail)
+    fm = _frontmatter_lines(result)
+    assert not any(line.startswith("injected:") for line in fm)
+
+
+def test_meeting_json_includes_access_logs() -> None:
+    meeting = _make_meeting()
+    detail = _make_detail(meeting).model_copy(update={
+        "access_logs": [
+            AccessLogEntry(
+                id="a", user_id="u1", user_email="alice@example.com",
+                user_name="Alice", action="view_summary",
+                timestamp="2026-04-01T10:00:00.000Z",
+            ),
+        ],
+    })
+    result = render_meeting_json(meeting, detail)
+    data = json.loads(result)
+    assert data["access_logs"] == [{
+        "id": "a", "user_id": "u1", "user_email": "alice@example.com",
+        "user_name": "Alice", "action": "view_summary",
+        "timestamp": "2026-04-01T10:00:00.000Z",
+    }]

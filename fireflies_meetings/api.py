@@ -10,7 +10,7 @@ from datetime import datetime
 import httpx
 from pydantic import ValidationError
 
-from .models import Meeting, Sentence, TranscriptDetail
+from .models import AccessLogEntry, Meeting, Sentence, TranscriptDetail
 from .session_auth import SessionAuth, internal_request_headers
 
 log = logging.getLogger(__name__)
@@ -142,6 +142,19 @@ query fetchNotepadMeeting($meetingNoteId: String!) {
       gist
       shortSummary
     }
+  }
+}
+"""
+
+_INTERNAL_ACCESS_LOGS_QUERY = """
+query GetMeetingSummaryAccessLogs($meetingId: ID!) {
+  getMeetingSummaryAccessLogs(meetingId: $meetingId) {
+    id
+    userId
+    userEmail
+    userName
+    action
+    timestamp
   }
 }
 """
@@ -485,6 +498,36 @@ class FirefliesClient:
             log.warning("Skipping malformed internal transcript detail: %s", e)
             return None
 
+    def get_access_logs(self, meeting_id: str) -> list[AccessLogEntry]:
+        """Fetch the meeting's summary-access log via the internal API.
+
+        Returns an empty list when session auth isn't configured, when the
+        internal call fails, or when the log is genuinely empty -- callers
+        can't distinguish these, which is fine for a best-effort secondary
+        data source.
+        """
+        body = self._post_internal(
+            _INTERNAL_ACCESS_LOGS_QUERY,
+            {"meetingId": meeting_id},
+            operation_name="GetMeetingSummaryAccessLogs",
+            referer=f"https://app.fireflies.ai/view/{meeting_id}",
+        )
+        if body is None:
+            return []
+        data = body.get("data")
+        raw = data.get("getMeetingSummaryAccessLogs") if isinstance(data, dict) else None
+        if not isinstance(raw, list):
+            return []
+        entries: list[AccessLogEntry] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            try:
+                entries.append(AccessLogEntry.model_validate(item))
+            except ValidationError as e:
+                log.debug("Skipping malformed access-log entry for %s: %s", meeting_id, e)
+        return entries
+
     def _get_internal_realtime_token(self, meeting_id: str) -> str | None:
         body = self._post_internal(
             _INTERNAL_REALTIME_TOKEN_QUERY,
@@ -732,7 +775,20 @@ class FirefliesClient:
                 return _merge_detail(detail, live_detail)
         if transcript_error:
             return detail.model_copy(update={"transcript_error": transcript_error})
-        return detail
+        return self._enrich_with_access_logs(detail)
+
+    def _enrich_with_access_logs(self, detail: TranscriptDetail) -> TranscriptDetail:
+        """Attach access-log entries to a completed meeting's detail.
+
+        Best-effort: skipped for live / in-flight meetings (would add an
+        internal-API call on every TTL refresh for near-empty data).
+        """
+        if not detail.meeting.is_completed:
+            return detail
+        access_logs = self.get_access_logs(detail.meeting.id)
+        if not access_logs:
+            return detail
+        return detail.model_copy(update={"access_logs": access_logs})
 
     def get_user_email(self) -> str | None:
         """Fetch the authenticated user's email address."""

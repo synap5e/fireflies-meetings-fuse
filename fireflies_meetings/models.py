@@ -212,6 +212,23 @@ class MeetingAttendee(_FFBaseModel):
     email: str = ""
 
 
+class AccessLogEntry(_FFBaseModel):
+    """One row from the Fireflies meeting access log.
+
+    Sourced from the internal `getMeetingSummaryAccessLogs` GraphQL op;
+    available only when session auth is configured. Each entry records one
+    action (e.g. "view_summary") by one user at one timestamp.
+    """
+
+    id: str = ""
+    user_id: str = Field(default="", validation_alias=AliasChoices("user_id", "userId"))
+    user_email: str = Field(default="", validation_alias=AliasChoices("user_email", "userEmail"))
+    user_name: str = Field(default="", validation_alias=AliasChoices("user_name", "userName"))
+    action: str = ""
+    # ISO-8601 string; rendered as-is. Kept as str so we don't have to guess at TZ-naive vs aware.
+    timestamp: str = ""
+
+
 class MeetingInfo(_FFBaseModel):
     """Metadata about the Fireflies bot's participation."""
 
@@ -353,6 +370,7 @@ class TranscriptDetail(_FFBaseModel):
         default_factory=list,
         validation_alias=AliasChoices("attendees", "meeting_attendees"),
     )
+    access_logs: list[AccessLogEntry] = Field(default_factory=list)
     # Internal, not from Fireflies: set when the API returns partial data but
     # fails a critical transcript field such as transcript.sentences.
     transcript_error: str = ""
