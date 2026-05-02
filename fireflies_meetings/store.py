@@ -904,8 +904,9 @@ class MeetingStore:
         """Fetch, render, and persist one meeting to disk.
 
         Safe to call from a background thread — touches only disk and the API client.
-        Raises RateLimitedError, FatalAPIError, or TransientAPIError on API errors;
-        caller handles backoff. No-ops if already cached or entry not found.
+        Updates _BackoffState on failure/success and re-raises typed API errors so
+        the caller can decide whether to keep iterating. No-ops if already cached
+        or entry not found.
 
         Permanently-deleted transcripts (404 / object_not_found) are handled
         internally: stub files are written so the meeting stays visible with
@@ -929,9 +930,30 @@ class MeetingStore:
             self._save_detail_to_disk(meeting_id, files)
             self._status_cache.mark_completed(meeting_id)
             with self._lock:
+                self._backoff.record_success()
                 self._file_cache[meeting_id] = _CachedFiles(files=files, fetched_at=time.monotonic())
             self._notify_live_change(meeting_id)
             return
+        except RateLimitedError as e:
+            with self._lock:
+                self._backoff.record_rate_limit(e.retry_after)
+            raise
+        except FatalAPIError:
+            with self._lock:
+                self._backoff.record_fatal()
+            raise
+        except TransientAPIError:
+            with self._lock:
+                self._backoff.record_failure()
+            raise
+        except httpx.TimeoutException:
+            with self._lock:
+                self._backoff.record_failure(is_timeout=True)
+            raise
+        except httpx.HTTPError:
+            with self._lock:
+                self._backoff.record_failure()
+            raise
         # API call outside lock; caller (get_uncached_meeting_ids) already
         # verified the meeting is_completed so marking it as such is correct.
         detail = raw_detail.model_copy(update={
@@ -941,11 +963,14 @@ class MeetingStore:
             }),
         })
         if detail.transcript_error:
+            with self._lock:
+                self._backoff.record_failure()
             raise TransientAPIError(detail.transcript_error)
         files = _render_files(detail.meeting, detail)
         self._save_detail_to_disk(meeting_id, files)
         self._status_cache.mark_completed(meeting_id)
         with self._lock:
+            self._backoff.record_success()
             self._file_cache[meeting_id] = _CachedFiles(files=files, fetched_at=time.monotonic())
         self._notify_live_change(meeting_id)
 
@@ -1515,6 +1540,13 @@ class MeetingStore:
     def is_auth_fatal(self) -> bool:
         """True if a fatal 401/403 has stopped all retries."""
         return self._backoff.fatal
+
+    def backoff_remaining(self) -> float:
+        """Seconds until the backoff window expires, or 0.0 if not backed off."""
+        with self._lock:
+            if not self._backoff.is_backed_off or self._backoff.fatal:
+                return 0.0
+            return max(0.0, self._backoff.until - time.monotonic())
 
     @property
     def is_chat_auth_fatal(self) -> bool:

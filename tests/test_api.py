@@ -83,6 +83,19 @@ def test_403_raises_fatal_error() -> None:
         client.list_transcripts()
 
 
+def test_5xx_raises_transient_error() -> None:
+    """504 (and other 5xx) from the upstream gateway should map to TransientAPIError
+    so the caller engages backoff rather than letting raw httpx.HTTPStatusError leak."""
+
+    for status in (500, 502, 503, 504):
+        def handler(_req: httpx.Request, code: int = status) -> httpx.Response:
+            return httpx.Response(code)
+
+        client = _make_client(handler)
+        with pytest.raises(TransientAPIError):
+            client.list_transcripts()
+
+
 def test_graphql_errors_without_data_raises_transient() -> None:
     def handler(_req: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"errors": [{"message": "boom"}]})

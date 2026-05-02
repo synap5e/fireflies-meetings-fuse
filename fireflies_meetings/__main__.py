@@ -198,13 +198,17 @@ async def _backfill_cache(store: MeetingStore) -> None:
             await trio.sleep(60)
             continue
         for mid in pending:
+            wait = store.backoff_remaining()
+            if wait > 0:
+                _log.info("Backfill waiting %.0fs for backoff window to expire", wait)
+                await trio.sleep(wait)
             try:
                 await trio.to_thread.run_sync(functools.partial(store.backfill_one, mid))
                 _log.debug("Backfilled %s", mid)
             except RateLimitedError as e:
-                wait = e.retry_after if e.retry_after else 60.0
-                _log.info("Rate limited during backfill; sleeping %.0fs", wait)
-                await trio.sleep(wait)
+                # backfill_one already recorded rate limit in _BackoffState;
+                # the next iteration's backoff_remaining() check will sleep.
+                _log.info("Rate limited during backfill (retry_after=%s)", e.retry_after)
             except FatalAPIError:
                 _log.warning("Fatal API error during backfill; stopping")
                 return
