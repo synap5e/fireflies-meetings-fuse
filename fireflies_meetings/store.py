@@ -748,6 +748,9 @@ class MeetingStore:
             files = _render_files(stub_meeting, stub_detail)
             self._save_detail_to_disk(meeting_id, files)
             self._status_cache.mark_completed(meeting_id)
+            with self._lock:
+                self._file_cache[meeting_id] = _CachedFiles(files=files, fetched_at=time.monotonic())
+            self._notify_live_change(meeting_id)
             return
         # API call outside lock; caller (get_uncached_meeting_ids) already
         # verified the meeting is_completed so marking it as such is correct.
@@ -762,6 +765,9 @@ class MeetingStore:
         files = _render_files(detail.meeting, detail)
         self._save_detail_to_disk(meeting_id, files)
         self._status_cache.mark_completed(meeting_id)
+        with self._lock:
+            self._file_cache[meeting_id] = _CachedFiles(files=files, fetched_at=time.monotonic())
+        self._notify_live_change(meeting_id)
 
     def _fetch_detail_for_watch(self, meeting_id: str) -> TranscriptDetail | None:
         """Fetch detail for a watch-meeting call, handling backoff book-keeping.
