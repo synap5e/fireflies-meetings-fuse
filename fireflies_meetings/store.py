@@ -11,6 +11,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 import httpx
 from pydantic import ValidationError
@@ -88,6 +89,21 @@ def _render_in_progress_status(detail: TranscriptDetail) -> bytes:
 
 def _sort_sentences(sentences: list[Sentence]) -> list[Sentence]:
     return sorted(sentences, key=lambda sentence: (sentence.start_time, sentence.index))
+
+
+def _normalize_sentence_text(text: str) -> str:
+    return text.strip().casefold()
+
+
+def _format_sentence_time(sentence: Sentence) -> str:
+    offset_sec = max(0, int(sentence.start_time))
+    minutes = offset_sec // 60
+    seconds = offset_sec % 60
+    return f"{minutes}:{seconds:02d}"
+
+
+def _markdown_table_cell(text: str) -> str:
+    return text.replace("\n", " ").replace("|", "\\|").strip()
 
 
 def _merge_sentences(
@@ -240,6 +256,8 @@ class MeetingStore:
     ) -> None:
         self._client = client
         self._entries: dict[str, MeetingEntry] = {}  # meeting_id -> entry
+        self._ghost_map: dict[str, str] = {}  # real_meeting_id -> ghost_meeting_id
+        self._overlap_map: dict[str, list[str]] = {}  # primary_meeting_id -> overlap_meeting_ids
         self._file_cache: dict[str, _CachedFiles] = {}  # meeting_id -> cached files
         self._live_details: dict[str, TranscriptDetail] = {}
         self._live_transcript_rows: dict[str, dict[str, Sentence]] = {}
@@ -447,6 +465,152 @@ class MeetingStore:
 
         return result
 
+    @staticmethod
+    def _is_ghost_candidate(entry: MeetingEntry) -> bool:
+        return entry.meeting.duration_mins == 0 and entry.meeting.summary_is_terminal
+
+    def _split_ghosts(self, entries: list[MeetingEntry]) -> tuple[list[MeetingEntry], dict[str, str]]:
+        groups: dict[str, list[MeetingEntry]] = {}
+        for entry in entries:
+            groups.setdefault(entry.slug, []).append(entry)
+
+        folded_ids: set[str] = set()
+        ghost_map: dict[str, str] = {}
+        for group_entries in groups.values():
+            if len(group_entries) != 2:
+                continue
+
+            ghost_entries = [
+                entry for entry in group_entries
+                if self._is_ghost_candidate(entry)
+            ]
+            if len(ghost_entries) != 1:
+                continue
+
+            real_entries = [
+                entry for entry in group_entries
+                if entry.meeting.duration_mins > 0
+            ]
+            if not real_entries:
+                continue
+
+            real_entry = min(real_entries, key=lambda entry: entry.meeting.date_epoch_ms)
+            ghost_entry = ghost_entries[0]
+            folded_ids.add(ghost_entry.meeting.id)
+            ghost_map[real_entry.meeting.id] = ghost_entry.meeting.id
+
+        non_ghost_entries = [
+            entry for entry in entries
+            if entry.meeting.id not in folded_ids
+        ]
+        return non_ghost_entries, ghost_map
+
+    @staticmethod
+    def _windows_overlap(a: MeetingEntry, b: MeetingEntry) -> bool:
+        """True if the two meetings' time windows intersect."""
+        a_start = a.meeting.date_epoch_ms
+        a_end = a_start + a.meeting.duration_mins * 60_000
+        b_start = b.meeting.date_epoch_ms
+        b_end = b_start + b.meeting.duration_mins * 60_000
+        return max(a_start, b_start) < min(a_end, b_end)
+
+    def _split_overlaps(
+        self,
+        entries: list[MeetingEntry],
+    ) -> tuple[list[MeetingEntry], dict[str, list[str]]]:
+        """Fold overlapping same-slug meetings under the longest recording."""
+        groups: dict[tuple[str, str], list[MeetingEntry]] = {}
+        for entry in entries:
+            groups.setdefault((entry.slug, entry.meeting.date_str), []).append(entry)
+
+        folded_ids: set[str] = set()
+        overlap_map: dict[str, list[str]] = {}
+        for group_entries in groups.values():
+            if len(group_entries) < 2:
+                continue
+            if any(entry.meeting.duration_mins <= 0 for entry in group_entries):
+                continue
+
+            primary = min(
+                group_entries,
+                key=lambda entry: (-entry.meeting.duration_mins, entry.meeting.date_epoch_ms),
+            )
+            overlaps = sorted(
+                (
+                    entry
+                    for entry in group_entries
+                    if entry.meeting.id != primary.meeting.id
+                    and self._windows_overlap(primary, entry)
+                ),
+                key=lambda entry: entry.meeting.date_epoch_ms,
+            )
+            if not overlaps:
+                continue
+
+            folded_ids.update(entry.meeting.id for entry in overlaps)
+            overlap_map[primary.meeting.id] = [entry.meeting.id for entry in overlaps]
+
+        non_overlap_entries = [
+            entry for entry in entries
+            if entry.meeting.id not in folded_ids
+        ]
+        return non_overlap_entries, overlap_map
+
+    def _resolve_with_ghosts_and_overlaps(
+        self,
+        entries: list[MeetingEntry],
+    ) -> tuple[dict[str, MeetingEntry], dict[str, str], dict[str, list[str]]]:
+        non_ghost_entries, ghost_map = self._split_ghosts(entries)
+        non_overlap_entries, overlap_map = self._split_overlaps(non_ghost_entries)
+        return self._resolve_collisions(non_overlap_entries), ghost_map, overlap_map
+
+    def _replace_ghost_context_locked(
+        self,
+        entries: list[MeetingEntry],
+        ghost_map: dict[str, str],
+    ) -> None:
+        context_ids = {entry.meeting.id for entry in entries}
+        stale_real_ids = [
+            real_id for real_id, ghost_id in self._ghost_map.items()
+            if real_id in context_ids or ghost_id in context_ids
+        ]
+        for real_id in stale_real_ids:
+            del self._ghost_map[real_id]
+        self._ghost_map.update(ghost_map)
+
+    def _replace_ghost_context(
+        self,
+        entries: list[MeetingEntry],
+        ghost_map: dict[str, str],
+    ) -> None:
+        with self._lock:
+            self._replace_ghost_context_locked(entries, ghost_map)
+
+    def _replace_overlap_context_locked(
+        self,
+        entries: list[MeetingEntry],
+        overlap_map: dict[str, list[str]],
+    ) -> None:
+        context_ids = {entry.meeting.id for entry in entries}
+        stale_primary_ids = [
+            primary_id for primary_id, overlap_ids in self._overlap_map.items()
+            if primary_id in context_ids or any(overlap_id in context_ids for overlap_id in overlap_ids)
+        ]
+        for primary_id in stale_primary_ids:
+            del self._overlap_map[primary_id]
+        self._overlap_map.update({
+            primary_id: list(overlap_ids)
+            for primary_id, overlap_ids in overlap_map.items()
+        })
+
+    def _replace_overlap_context(
+        self,
+        entries: list[MeetingEntry],
+        overlap_map: dict[str, list[str]],
+    ) -> None:
+        with self._lock:
+            self._replace_overlap_context_locked(entries, overlap_map)
+
     def _is_cache_fresh(self, meeting_id: str, cached: _CachedFiles) -> bool:
         """Return True if cached data is still valid and should be returned as-is."""
         if self._status_cache.is_completed(meeting_id):
@@ -645,7 +809,10 @@ class MeetingStore:
         self._refresh_if_stale()
         with self._lock:
             entries = [e for e in self._entries.values() if e.meeting.date_str == date_str]
-        return self._resolve_collisions(entries)
+        meetings, ghost_map, overlap_map = self._resolve_with_ghosts_and_overlaps(entries)
+        self._replace_ghost_context(entries, ghost_map)
+        self._replace_overlap_context(entries, overlap_map)
+        return meetings
 
     def list_year_months_mine(self) -> list[str]:
         """Return sorted YYYY-MM strings for months containing meetings user organized."""
@@ -683,11 +850,24 @@ class MeetingStore:
         if not self.user_email:
             return {}
         with self._lock:
-            entries = [
+            dated_entries = [
+                e for e in self._entries.values()
+                if e.meeting.date_str == date_str
+            ]
+            mine_entries = [
                 e for e in self._entries.values()
                 if e.meeting.date_str == date_str and e.meeting.organizer_email == self.user_email
             ]
-        return self._resolve_collisions(entries)
+        _dated_meetings, ghost_map, overlap_map = self._resolve_with_ghosts_and_overlaps(dated_entries)
+        ghost_ids = set(ghost_map.values())
+        overlap_ids = {overlap_id for overlap_ids in overlap_map.values() for overlap_id in overlap_ids}
+        meetings = self._resolve_collisions([
+            entry for entry in mine_entries
+            if entry.meeting.id not in ghost_ids and entry.meeting.id not in overlap_ids
+        ])
+        self._replace_ghost_context(dated_entries, ghost_map)
+        self._replace_overlap_context(dated_entries, overlap_map)
+        return meetings
 
     def list_live_dirnames(self) -> list[str]:
         """Return collision-resolved slug dirnames of currently-live meetings.
@@ -962,10 +1142,17 @@ class MeetingStore:
                 for candidate in self._entries.values()
                 if candidate.meeting.date_str == date_str
             ]
+            (
+                dated_resolved,
+                dated_ghost_map,
+                dated_overlap_map,
+            ) = self._resolve_with_ghosts_and_overlaps(dated_entries)
+            self._replace_ghost_context_locked(dated_entries, dated_ghost_map)
+            self._replace_overlap_context_locked(dated_entries, dated_overlap_map)
             datedir = next(
                 (
                     dirname
-                    for dirname, candidate in self._resolve_collisions(dated_entries).items()
+                    for dirname, candidate in dated_resolved.items()
                     if candidate.meeting.id == meeting_id
                 ),
                 None,
@@ -998,10 +1185,21 @@ class MeetingStore:
                     if candidate.meeting.date_str == date_str
                     and candidate.meeting.organizer_email == self.user_email
                 ]
+                ghost_ids = set(dated_ghost_map.values())
+                overlap_ids = {
+                    overlap_id
+                    for overlap_ids in dated_overlap_map.values()
+                    for overlap_id in overlap_ids
+                }
+                mine_resolved = self._resolve_collisions([
+                    candidate for candidate in mine_entries
+                    if candidate.meeting.id not in ghost_ids
+                    and candidate.meeting.id not in overlap_ids
+                ])
                 mine_dirname = next(
                     (
                         dirname
-                        for dirname, candidate in self._resolve_collisions(mine_entries).items()
+                        for dirname, candidate in mine_resolved.items()
                         if candidate.meeting.id == meeting_id
                     ),
                     None,
@@ -1028,6 +1226,223 @@ class MeetingStore:
             if e.meeting.id == meeting_id:
                 return f"../{year_month}/{day}/{datedir}"
         return None
+
+    def get_ghost_id(self, real_meeting_id: str) -> str | None:
+        """Return the ghost meeting ID folded under this meeting, if any."""
+        with self._lock:
+            ghost_id = self._ghost_map.get(real_meeting_id)
+            if ghost_id is None or ghost_id not in self._entries:
+                return None
+            return ghost_id
+
+    def get_ghost_file(self, real_meeting_id: str, filename: str) -> bytes | None:
+        """Return content for a file in a folded ghost meeting without fetching."""
+        if filename not in MEETING_FILES:
+            return None
+        ghost_id = self.get_ghost_id(real_meeting_id)
+        if ghost_id is None:
+            return None
+        cached = self._load_detail_from_disk(ghost_id)
+        if cached is None:
+            return None
+        return cached.files.get(filename)
+
+    def get_ghost_file_size(self, real_meeting_id: str, filename: str) -> int:
+        """Return size for a file in a folded ghost meeting without fetching."""
+        content = self.get_ghost_file(real_meeting_id, filename)
+        return len(content) if content is not None else 0
+
+    @staticmethod
+    def _overlap_dirname(index: int) -> str:
+        return "overlap" if index == 0 else f"overlap-{index + 1}"
+
+    @staticmethod
+    def _overlap_index(dirname: str) -> int | None:
+        if dirname == "overlap":
+            return 0
+        prefix = "overlap-"
+        if not dirname.startswith(prefix):
+            return None
+        try:
+            parsed = int(dirname.removeprefix(prefix))
+        except ValueError:
+            return None
+        if parsed < 2:
+            return None
+        return parsed - 1
+
+    def get_overlap_ids(self, primary_id: str) -> list[str]:
+        """Return overlap meeting IDs folded under this primary, in order."""
+        with self._lock:
+            overlap_ids = self._overlap_map.get(primary_id, [])
+            return [
+                overlap_id for overlap_id in overlap_ids
+                if overlap_id in self._entries
+            ]
+
+    def get_overlap_dirnames(self, primary_id: str) -> list[str]:
+        """Return overlap subdirectory names for this primary."""
+        return [
+            self._overlap_dirname(index)
+            for index, _overlap_id in enumerate(self.get_overlap_ids(primary_id))
+        ]
+
+    def get_overlap_id_for_dirname(self, primary_id: str, dirname: str) -> str | None:
+        """Resolve an overlap dirname to the folded meeting ID."""
+        index = self._overlap_index(dirname)
+        if index is None:
+            return None
+        overlap_ids = self.get_overlap_ids(primary_id)
+        if index >= len(overlap_ids):
+            return None
+        return overlap_ids[index]
+
+    def get_overlap_file(self, primary_id: str, overlap_dirname: str, filename: str) -> bytes | None:
+        """Return content for a file in a folded overlap meeting without fetching."""
+        if filename not in MEETING_FILES:
+            return None
+        overlap_id = self.get_overlap_id_for_dirname(primary_id, overlap_dirname)
+        if overlap_id is None:
+            return None
+        cached = self._load_detail_from_disk(overlap_id)
+        if cached is None:
+            return None
+        return cached.files.get(filename)
+
+    def get_overlap_file_size(self, primary_id: str, overlap_dirname: str, filename: str) -> int:
+        """Return size for a file in a folded overlap meeting without fetching."""
+        if filename not in MEETING_FILES:
+            return 0
+        overlap_id = self.get_overlap_id_for_dirname(primary_id, overlap_dirname)
+        if overlap_id is None:
+            return 0
+        detail_dir = self._detail_cache_dir / overlap_id
+        if not (detail_dir / _COMPLETE_SENTINEL).exists():
+            return 0
+        try:
+            return (detail_dir / filename).stat().st_size
+        except OSError:
+            stub = _STUB_MISSING_FILE_CONTENT.get(filename)
+            return len(stub) if stub is not None else 0
+
+    def _load_cached_meeting_sentences(self, meeting_id: str) -> list[Sentence] | None:
+        detail_dir = self._detail_cache_dir / meeting_id
+        if not (detail_dir / _COMPLETE_SENTINEL).exists():
+            return None
+
+        try:
+            raw: object = json.loads((detail_dir / "meeting.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(raw, dict):
+            return None
+
+        raw_obj = cast("dict[str, object]", raw)
+        try:
+            Meeting.model_validate(raw_obj)
+        except ValidationError:
+            return None
+
+        transcript_raw = raw_obj.get("transcript")
+        if not isinstance(transcript_raw, list):
+            return []
+
+        sentences: list[Sentence] = []
+        for raw_sentence in cast("list[object]", transcript_raw):
+            if not isinstance(raw_sentence, dict):
+                return None
+            try:
+                sentences.append(Sentence.model_validate(cast("dict[str, object]", raw_sentence)))
+            except ValidationError:
+                return None
+        return sentences
+
+    @staticmethod
+    def _overlap_warning_unavailable(meeting_id: str) -> bytes:
+        return (
+            "---\n"
+            "warning: overlap-comparison-unavailable\n"
+            "---\n\n"
+            "# Overlap Warning\n\n"
+            "Comparison is not available yet because cached transcript data is "
+            f"missing for meeting `{meeting_id}`.\n"
+        ).encode()
+
+    def get_overlap_warning(self, primary_id: str) -> bytes:
+        """Compute the overlap superset warning from cached meeting.json files."""
+        overlap_ids = self.get_overlap_ids(primary_id)
+        if not overlap_ids:
+            return (
+                b"---\n"
+                b"warning: overlap-none\n"
+                b"---\n\n"
+                b"# Overlap Warning\n\n"
+                b"No overlap recordings are currently folded under this recording.\n"
+            )
+
+        primary_sentences = self._load_cached_meeting_sentences(primary_id)
+        if primary_sentences is None:
+            return self._overlap_warning_unavailable(primary_id)
+
+        primary_texts = {
+            normalized for sentence in primary_sentences
+            if (normalized := _normalize_sentence_text(sentence.text))
+        }
+        missing_by_overlap: list[tuple[str, str, list[Sentence]]] = []
+        dirnames = [
+            self._overlap_dirname(index)
+            for index in range(len(overlap_ids))
+        ]
+        for dirname, overlap_id in zip(dirnames, overlap_ids, strict=True):
+            overlap_sentences = self._load_cached_meeting_sentences(overlap_id)
+            if overlap_sentences is None:
+                return self._overlap_warning_unavailable(overlap_id)
+            missing = [
+                sentence for sentence in overlap_sentences
+                if (normalized := _normalize_sentence_text(sentence.text))
+                and normalized not in primary_texts
+            ]
+            if missing:
+                missing_by_overlap.append((dirname, overlap_id, missing))
+
+        if not missing_by_overlap:
+            return (
+                b"---\n"
+                b"warning: overlap-superset\n"
+                b"---\n\n"
+                b"# Overlap Warning\n\n"
+                b"No missing sentences were found. The primary recording appears "
+                b"to be a strict superset of all overlap recordings.\n"
+            )
+
+        parts = [
+            "---",
+            "warning: overlap-not-superset",
+            "---",
+            "",
+            "# Overlap Warning",
+            "",
+            "The primary recording is NOT a strict superset of all overlap recordings.",
+            "The following sentences appear in an overlap recording but not in this one:",
+            "",
+        ]
+        for dirname, overlap_id, missing_sentences in missing_by_overlap:
+            parts.extend([
+                f"## From `{dirname}/` (ID: {overlap_id})",
+                "",
+                "| Time | Speaker | Text |",
+                "|------|---------|------|",
+            ])
+            for sentence in missing_sentences:
+                parts.append(
+                    "| "
+                    f"{_format_sentence_time(sentence)} | "
+                    f"{_markdown_table_cell(sentence.speaker_name)} | "
+                    f"{_markdown_table_cell(sentence.text)} |"
+                )
+            parts.append("")
+
+        return "\n".join(parts).encode()
 
     def get_file(self, meeting_id: str, filename: str) -> tuple[bytes | None, bool]:
         """Return (file_bytes, is_completed) for a meeting.
