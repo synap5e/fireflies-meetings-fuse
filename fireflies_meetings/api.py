@@ -6,6 +6,7 @@ import json
 import logging
 import time
 from datetime import datetime
+from typing import NoReturn
 
 import httpx
 from pydantic import ValidationError
@@ -374,6 +375,21 @@ def _hive_meeting_to_dict(raw: JsonObject) -> JsonObject:
     }
 
 
+def _raise_auth_status(resp: httpx.Response) -> NoReturn:
+    """Map a 401/403 to either a fatal auth error or a transient edge-proxy
+    challenge. Cloudflare (and similar) returns an HTML challenge page with a
+    4xx code when it dislikes our TLS/UA fingerprint -- that's not an auth
+    problem, so we keep retrying instead of flipping the fatal flag.
+    """
+    body_preview = resp.text.lstrip()[:1]
+    if body_preview == "<":
+        raise TransientAPIError(
+            f"HTTP {resp.status_code} with HTML body -- likely edge-proxy challenge, "
+            f"not an auth failure. Content-Type={resp.headers.get('content-type')!r}",
+        )
+    raise FatalAPIError(f"Auth error: HTTP {resp.status_code}")
+
+
 class FirefliesClient:
     """HTTP client for the Fireflies.ai GraphQL API."""
 
@@ -595,17 +611,12 @@ class FirefliesClient:
             raise RateLimitedError(retry_after=reset_secs)
 
         if resp.status_code in (401, 403):
-            # Cloudflare (and other edge proxies) serve an HTML challenge page
-            # with 403 when they dislike our TLS/UA fingerprint. That's not an
-            # auth problem -- treat as transient so we keep retrying instead
-            # of flipping the fatal flag.
-            body_preview = resp.text.lstrip()[:1]
-            if body_preview == "<":
-                raise TransientAPIError(
-                    f"HTTP {resp.status_code} with HTML body -- likely edge-proxy challenge, "
-                    f"not an auth failure. Content-Type={resp.headers.get('content-type')!r}",
-                )
-            raise FatalAPIError(f"Auth error: HTTP {resp.status_code}")
+            _raise_auth_status(resp)
+
+        if resp.status_code >= 500:
+            raise TransientAPIError(
+                f"HTTP {resp.status_code} from upstream: {resp.reason_phrase}",
+            )
 
         resp.raise_for_status()
 
