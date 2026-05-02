@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 from typing import cast
 
@@ -30,6 +31,17 @@ class _FakeClient:
         return []
 
 
+class _ListClient:
+    def __init__(self, meetings: list[Meeting]) -> None:
+        self._meetings = meetings
+
+    def get_transcript(self, meeting_id: str) -> TranscriptDetail:
+        raise AssertionError(f"unexpected transcript fetch for {meeting_id}")
+
+    def list_transcripts(self, *, max_pages: int | None = None) -> list[Meeting]:
+        return self._meetings
+
+
 def _make_live_meeting() -> Meeting:
     return Meeting(
         id="MEET01",
@@ -42,6 +54,26 @@ def _make_live_meeting() -> Meeting:
         transcript_url="https://app.fireflies.ai/view/MEET01",
         meeting_info=MeetingInfo(summary_status=""),
         slug="live-standup",
+    )
+
+
+def _make_overlap_meeting(
+    meeting_id: str,
+    *,
+    duration_mins: float,
+    epoch_offset_ms: float = 0.0,
+) -> Meeting:
+    return Meeting(
+        id=meeting_id,
+        title="Simon Luke",
+        date_epoch_ms=1774891800000.0 + epoch_offset_ms,
+        is_live=False,
+        duration_mins=duration_mins,
+        organizer_email="alice@example.com",
+        participants=["alice@example.com"],
+        transcript_url=f"https://app.fireflies.ai/view/{meeting_id}",
+        meeting_info=MeetingInfo(summary_status="processed"),
+        slug="simon-luke",
     )
 
 
@@ -91,5 +123,40 @@ def test_dynamic_read_uses_cached_live_bytes(tmp_path: Path) -> None:
         assert len(second) >= len(first)
 
         await ops.release(fi.fh)
+
+    trio.run(_exercise)
+
+
+def test_overlap_warning_and_subdir_are_exposed_by_lookup(tmp_path: Path) -> None:
+    status_cache = StatusCache(cache_dir=tmp_path / "cache" / "completed")
+    primary = _make_overlap_meeting("PRIMARY01", duration_mins=60.0)
+    overlap = _make_overlap_meeting("OVERLAP01", duration_mins=10.0, epoch_offset_ms=5 * 60_000.0)
+    client = _ListClient([overlap, primary])
+    store = MeetingStore(cast(FirefliesClient, client), status_cache=status_cache)
+    ops = FirefliesMeetingOps(store)
+
+    async def _exercise() -> None:
+        inode = pyfuse3.ROOT_INODE
+        for segment in (primary.date_str[:7], primary.date_str[8:10], primary.slug):
+            attr = await ops.lookup(inode, segment.encode(), cast(pyfuse3.RequestContext, None))
+            inode = attr.st_ino
+
+        warning_attr = await ops.lookup(
+            inode,
+            b"_overlap_warning.md",
+            cast(pyfuse3.RequestContext, None),
+        )
+        assert stat.S_ISREG(warning_attr.st_mode)
+        assert warning_attr.st_size == 512
+
+        overlap_attr = await ops.lookup(inode, b"overlap", cast(pyfuse3.RequestContext, None))
+        assert stat.S_ISDIR(overlap_attr.st_mode)
+
+        summary_attr = await ops.lookup(
+            overlap_attr.st_ino,
+            b"summary.md",
+            cast(pyfuse3.RequestContext, None),
+        )
+        assert stat.S_ISREG(summary_attr.st_mode)
 
     trio.run(_exercise)

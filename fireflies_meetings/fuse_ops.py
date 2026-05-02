@@ -16,7 +16,7 @@ import pyfuse3
 import trio
 
 from .inode_map import InodeMap
-from .store import MeetingStore
+from .store import MEETING_FILES, MeetingEntry, MeetingStore
 
 log = logging.getLogger(__name__)
 
@@ -43,8 +43,26 @@ def _resolve_env_path() -> str:
     return str(candidate) if candidate.exists() else "~/agentic/fireflies-meetings-fuse/.env"
 
 
+def _resolve_chat_credentials_project_glob() -> str:
+    """Best-effort absolute glob for project-local Google OAuth secrets."""
+    return str(Path(__file__).resolve().parents[1] / "secrets" / "client_secret_*.json")
+
+
+def _resolve_chat_credentials_home_path() -> str:
+    """Absolute fallback path for Google OAuth client secrets."""
+    return str(Path.home() / ".config" / "fireflies-meetings" / "google_chat_credentials.json")
+
+
+def _resolve_chat_token_path() -> str:
+    """Absolute path for the persisted Google Chat OAuth token."""
+    return str(Path.home() / ".config" / "fireflies-meetings" / "google_chat_token.json")
+
+
 _CLI_PATH = _resolve_cli_path()
 _ENV_PATH = _resolve_env_path()
+_CHAT_CREDENTIALS_PROJECT_GLOB = _resolve_chat_credentials_project_glob()
+_CHAT_CREDENTIALS_HOME_PATH = _resolve_chat_credentials_home_path()
+_CHAT_TOKEN_PATH = _resolve_chat_token_path()
 
 # Path structure (non-mine):
 #   depth 0  /
@@ -52,6 +70,10 @@ _ENV_PATH = _resolve_env_path()
 #   depth 2  /2026-03/25/
 #   depth 3  /2026-03/25/backend-q1-retrospective/
 #   depth 4  /2026-03/25/backend-q1-retrospective/summary.md
+#   depth 4  /2026-03/25/backend-q1-retrospective/ghost/
+#   depth 5  /2026-03/25/backend-q1-retrospective/ghost/summary.md
+#   depth 4  /2026-03/25/backend-q1-retrospective/overlap/
+#   depth 5  /2026-03/25/backend-q1-retrospective/overlap/summary.md
 #
 # mine/ subtree adds one level at the front:
 #   depth 1  /mine/
@@ -103,23 +125,46 @@ AUTHENTICATION_EXPIRED if that file is also present.)
 
 To recover:
 
-    1. {_CLI_PATH} auth-chat
+    1. Put your Google OAuth client-secrets JSON at one of:
 
-       (runs the OAuth flow in a browser; refreshes the chat token file)
+           {_CHAT_CREDENTIALS_PROJECT_GLOB}
 
-    2. systemctl --user restart fireflies-meetings
+       or:
+
+           {_CHAT_CREDENTIALS_HOME_PATH}
+
+    2. Run:
+
+           {_CLI_PATH} auth-chat
+
+       or explicitly:
+
+           {_CLI_PATH} auth-chat --chat-credentials /absolute/path/to/client_secret_....json
+
+       The refreshed chat token will be written to:
+
+           {_CHAT_TOKEN_PATH}
+
+    3. systemctl --user restart fireflies-meetings
 """
 ).encode("ascii")
 
 # sub_depth = number of path components after stripping the optional "mine/" prefix.
-# Directories have sub_depth 0-3; files have sub_depth 4.
+# Directories have sub_depth 0-3, plus ghost/overlap directories at sub_depth 4.
+# Meeting files have sub_depth 4; ghost/overlap files have sub_depth 5.
 _SUB_DEPTH_MONTH = 1
 _SUB_DEPTH_DAY = 2
 _SUB_DEPTH_MEETING = 3
 _SUB_DEPTH_FILE = 4
+_SUB_DEPTH_GHOST_DIR = 4
+_SUB_DEPTH_GHOST_FILE = 5
+_SUB_DEPTH_OVERLAP_DIR = 4
+_SUB_DEPTH_OVERLAP_FILE = 5
 _DYNAMIC_TIMEOUT = 0.0
 _STATIC_TIMEOUT = 300.0
 _IN_PROGRESS_FILE = "_in_progress"
+_OVERLAP_WARNING_FILE = "_overlap_warning.md"
+_OVERLAP_WARNING_SIZE = 512
 
 
 def _now_ns() -> int:
@@ -195,6 +240,18 @@ def _parse_path(path: str) -> tuple[bool, list[str]]:
     return False, parts
 
 
+def _looks_like_overlap_name(name: str) -> bool:
+    if name == "overlap":
+        return True
+    prefix = "overlap-"
+    if not name.startswith(prefix):
+        return False
+    try:
+        return int(name.removeprefix(prefix)) >= 2
+    except ValueError:
+        return False
+
+
 class FirefliesMeetingOps(pyfuse3.Operations):
     """Read-only FUSE operations for Fireflies.ai meetings."""
 
@@ -262,6 +319,12 @@ class FirefliesMeetingOps(pyfuse3.Operations):
         is_mine, sub = _parse_path(path)
         if not is_mine and len(sub) == 2 and sub[0] == _LIVE_DIR:
             return True
+        if len(sub) >= _SUB_DEPTH_GHOST_DIR and sub[3] == "ghost":
+            return False
+        if len(sub) >= _SUB_DEPTH_OVERLAP_DIR and (
+            sub[3] == _OVERLAP_WARNING_FILE or _looks_like_overlap_name(sub[3])
+        ):
+            return False
         if len(sub) not in {_SUB_DEPTH_MEETING, _SUB_DEPTH_FILE}:
             return False
 
@@ -281,6 +344,13 @@ class FirefliesMeetingOps(pyfuse3.Operations):
         return self._store.is_meeting_dynamic(entry.meeting.id)
 
     def _timeout_for_path(self, path: str) -> float:
+        _is_mine, sub = _parse_path(path)
+        if len(sub) >= _SUB_DEPTH_GHOST_DIR and sub[3] == "ghost":
+            return _STATIC_TIMEOUT
+        if len(sub) >= _SUB_DEPTH_OVERLAP_DIR and (
+            sub[3] == _OVERLAP_WARNING_FILE or _looks_like_overlap_name(sub[3])
+        ):
+            return _STATIC_TIMEOUT
         return _DYNAMIC_TIMEOUT if self._is_dynamic_path(path) else _STATIC_TIMEOUT
 
     def _invalidate_meeting(self, meeting_id: str) -> None:
@@ -310,6 +380,71 @@ class FirefliesMeetingOps(pyfuse3.Operations):
             except OSError:
                 log.debug("Skipping inode invalidation for %s", path, exc_info=True)
 
+    def _resolve_meeting_entry(self, sub: list[str], is_mine: bool) -> MeetingEntry | None:
+        if len(sub) < _SUB_DEPTH_MEETING:
+            return None
+        year_month, day, slug = sub[:3]
+        date_str = f"{year_month}-{day}"
+        try:
+            meetings = (
+                self._store.list_meetings_mine(date_str) if is_mine
+                else self._store.list_meetings(date_str)
+            )
+        except Exception:
+            log.exception("Error listing meetings for %s", date_str)
+            return None
+        return meetings.get(slug)
+
+    def _resolve_ghost_parent_id(self, sub: list[str], is_mine: bool) -> str | None:
+        if len(sub) < _SUB_DEPTH_GHOST_DIR or sub[3] != "ghost":
+            return None
+        entry = self._resolve_meeting_entry(sub, is_mine)
+        if entry is None:
+            return None
+        meeting_id = entry.meeting.id
+        return meeting_id if self._store.get_ghost_id(meeting_id) is not None else None
+
+    def _resolve_ghost_file(self, path: str) -> tuple[str, str, str] | None:
+        is_mine, sub = _parse_path(path)
+        if len(sub) != _SUB_DEPTH_GHOST_FILE or sub[4] not in MEETING_FILES:
+            return None
+        meeting_id = self._resolve_ghost_parent_id(sub, is_mine)
+        if meeting_id is None:
+            return None
+        return meeting_id, sub[2], sub[4]
+
+    def _resolve_overlap_parent_id(self, sub: list[str], is_mine: bool) -> str | None:
+        if len(sub) < _SUB_DEPTH_OVERLAP_DIR:
+            return None
+        entry = self._resolve_meeting_entry(sub, is_mine)
+        if entry is None:
+            return None
+        meeting_id = entry.meeting.id
+        overlap_dirname = sub[3]
+        overlap_id = self._store.get_overlap_id_for_dirname(meeting_id, overlap_dirname)
+        return meeting_id if overlap_id is not None else None
+
+    def _resolve_overlap_file(self, path: str) -> tuple[str, str, str, str] | None:
+        is_mine, sub = _parse_path(path)
+        if len(sub) != _SUB_DEPTH_OVERLAP_FILE or sub[4] not in MEETING_FILES:
+            return None
+        meeting_id = self._resolve_overlap_parent_id(sub, is_mine)
+        if meeting_id is None:
+            return None
+        return meeting_id, sub[2], sub[3], sub[4]
+
+    def _resolve_overlap_warning_file(self, path: str) -> tuple[str, str] | None:
+        is_mine, sub = _parse_path(path)
+        if len(sub) != _SUB_DEPTH_FILE or sub[3] != _OVERLAP_WARNING_FILE:
+            return None
+        entry = self._resolve_meeting_entry(sub, is_mine)
+        if entry is None:
+            return None
+        meeting_id = entry.meeting.id
+        if not self._store.get_overlap_ids(meeting_id):
+            return None
+        return meeting_id, sub[2]
+
     def _resolve_meeting_file(self, path: str) -> tuple[str, str, str] | None:
         """Parse a path into (meeting_id, slug, filename) if it's a meeting file.
 
@@ -320,20 +455,12 @@ class FirefliesMeetingOps(pyfuse3.Operations):
         if len(sub) != _SUB_DEPTH_FILE:
             return None
 
-        year_month, day, slug, filename = sub
-        date_str = f"{year_month}-{day}"
-        try:
-            meetings = (
-                self._store.list_meetings_mine(date_str) if is_mine
-                else self._store.list_meetings(date_str)
-            )
-        except Exception:
-            log.exception("Error listing meetings for %s", date_str)
-            return None
-        entry = meetings.get(slug)
+        entry = self._resolve_meeting_entry(sub, is_mine)
         if entry is None:
             return None
-        return entry.meeting.id, slug, filename
+        if sub[3] not in self._store.list_files(entry.meeting.id):
+            return None
+        return entry.meeting.id, sub[2], sub[3]
 
     def _resolve_size(self, path: str) -> int | None:
         """Cheap size lookup for stat / readdir / lookup. Never blocks on the network.
@@ -347,6 +474,17 @@ class FirefliesMeetingOps(pyfuse3.Operations):
             return len(_AUTH_EXPIRED_CONTENT) if self._store.is_auth_fatal else None
         if path == f"/{_CHAT_AUTH_EXPIRED_NAME}":
             return len(_CHAT_AUTH_EXPIRED_CONTENT) if self._store.is_chat_auth_fatal else None
+        warning_parsed = self._resolve_overlap_warning_file(path)
+        if warning_parsed is not None:
+            return _OVERLAP_WARNING_SIZE
+        ghost_parsed = self._resolve_ghost_file(path)
+        if ghost_parsed is not None:
+            meeting_id, _slug, filename = ghost_parsed
+            return self._store.get_ghost_file_size(meeting_id, filename)
+        overlap_parsed = self._resolve_overlap_file(path)
+        if overlap_parsed is not None:
+            meeting_id, _slug, overlap_dirname, filename = overlap_parsed
+            return self._store.get_overlap_file_size(meeting_id, overlap_dirname, filename)
         parsed = self._resolve_meeting_file(path)
         if parsed is None:
             return None
@@ -369,6 +507,18 @@ class FirefliesMeetingOps(pyfuse3.Operations):
                 (_CHAT_AUTH_EXPIRED_CONTENT, True) if self._store.is_chat_auth_fatal
                 else (None, False)
             )
+        warning_parsed = self._resolve_overlap_warning_file(path)
+        if warning_parsed is not None:
+            meeting_id, _slug = warning_parsed
+            return self._store.get_overlap_warning(meeting_id), True
+        ghost_parsed = self._resolve_ghost_file(path)
+        if ghost_parsed is not None:
+            meeting_id, _slug, filename = ghost_parsed
+            return self._store.get_ghost_file(meeting_id, filename), True
+        overlap_parsed = self._resolve_overlap_file(path)
+        if overlap_parsed is not None:
+            meeting_id, _slug, overlap_dirname, filename = overlap_parsed
+            return self._store.get_overlap_file(meeting_id, overlap_dirname, filename), True
         parsed = self._resolve_meeting_file(path)
         if parsed is None:
             return None, False
@@ -378,6 +528,14 @@ class FirefliesMeetingOps(pyfuse3.Operations):
         except Exception:
             log.exception("Error getting file %s for %s", filename, slug)
             return None, False
+
+    def _get_marker_attr(self, inode: int, path: str) -> pyfuse3.EntryAttributes | None:
+        if path not in (f"/{_AUTH_EXPIRED_NAME}", f"/{_CHAT_AUTH_EXPIRED_NAME}"):
+            return None
+        size = self._resolve_size(path)
+        if size is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        return _make_file_attr(inode, size)
 
     def _list_date_subtree(self, sub: list[str], is_mine: bool) -> list[tuple[str, bool]]:
         """List entries for the shared month/day/meeting depth levels."""
@@ -395,14 +553,23 @@ class FirefliesMeetingOps(pyfuse3.Operations):
             )
             return [(slug, True) for slug in meetings]
         if len(sub) == _SUB_DEPTH_MEETING:
-            date_str = f"{sub[0]}-{sub[1]}"
-            entry = (
-                self._store.list_meetings_mine(date_str) if is_mine
-                else self._store.list_meetings(date_str)
-            ).get(sub[2])
+            entry = self._resolve_meeting_entry(sub, is_mine)
             if entry is None:
                 return []
-            return [(f, False) for f in self._store.list_files(entry.meeting.id)]
+            entries = [(f, False) for f in self._store.list_files(entry.meeting.id)]
+            if self._store.get_ghost_id(entry.meeting.id) is not None:
+                entries.append(("ghost", True))
+            if self._store.get_overlap_ids(entry.meeting.id):
+                entries.append((_OVERLAP_WARNING_FILE, False))
+                entries.extend(
+                    (dirname, True)
+                    for dirname in self._store.get_overlap_dirnames(entry.meeting.id)
+                )
+            return entries
+        if len(sub) == _SUB_DEPTH_GHOST_DIR and self._resolve_ghost_parent_id(sub, is_mine) is not None:
+            return [(f, False) for f in MEETING_FILES]
+        if len(sub) == _SUB_DEPTH_OVERLAP_DIR and self._resolve_overlap_parent_id(sub, is_mine) is not None:
+            return [(f, False) for f in MEETING_FILES]
         return []
 
     def _list_dir(self, path: str) -> list[tuple[str, bool]]:
@@ -430,6 +597,21 @@ class FirefliesMeetingOps(pyfuse3.Operations):
             log.exception("Error listing directory %s", path)
             return []
 
+    def _date_subdir_attr(
+        self,
+        inode: int,
+        path: str,
+        sub: list[str],
+        is_mine: bool,
+    ) -> pyfuse3.EntryAttributes | None:
+        if len(sub) < _SUB_DEPTH_FILE:
+            return _make_dir_attr(inode, timeout=self._timeout_for_path(path))
+        if len(sub) == _SUB_DEPTH_GHOST_DIR and self._resolve_ghost_parent_id(sub, is_mine) is not None:
+            return _make_dir_attr(inode, timeout=_STATIC_TIMEOUT)
+        if len(sub) == _SUB_DEPTH_OVERLAP_DIR and self._resolve_overlap_parent_id(sub, is_mine) is not None:
+            return _make_dir_attr(inode, timeout=_STATIC_TIMEOUT)
+        return None
+
     async def getattr(
         self,
         inode: int,
@@ -439,11 +621,9 @@ class FirefliesMeetingOps(pyfuse3.Operations):
         if path is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
 
-        if path in (f"/{_AUTH_EXPIRED_NAME}", f"/{_CHAT_AUTH_EXPIRED_NAME}"):
-            size = self._resolve_size(path)
-            if size is None:
-                raise pyfuse3.FUSEError(errno.ENOENT)
-            return _make_file_attr(inode, size)
+        marker_attr = self._get_marker_attr(inode, path)
+        if marker_attr is not None:
+            return marker_attr
 
         is_mine, sub = _parse_path(path)
 
@@ -461,11 +641,12 @@ class FirefliesMeetingOps(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.ENOENT)
 
         # Directories: root, live, mine root, month, day, meeting
-        if len(sub) < _SUB_DEPTH_FILE:
-            return _make_dir_attr(inode, timeout=self._timeout_for_path(path))
+        subdir_attr = self._date_subdir_attr(inode, path, sub, is_mine)
+        if subdir_attr is not None:
+            return subdir_attr
 
         # Files — cheap stat-only path (no API calls).
-        if len(sub) == _SUB_DEPTH_FILE:
+        if len(sub) in {_SUB_DEPTH_FILE, _SUB_DEPTH_GHOST_FILE, _SUB_DEPTH_OVERLAP_FILE}:
             size = self._resolve_size(path)
             if size is None:
                 raise pyfuse3.FUSEError(errno.ENOENT)
