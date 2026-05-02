@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 
 
 def _default_mountpoint() -> str:
-    return os.path.expanduser("~/views/fireflies-meetings")
+    return "/views/fireflies-meetings"
 
 
 def _default_api_key_path() -> str:
@@ -461,6 +461,7 @@ def cmd_mount(args: argparse.Namespace) -> None:
             "ro",
             "nosuid",
             "nodev",
+            "allow_root",
         }
         if args.debug:
             fuse_options.add("debug")

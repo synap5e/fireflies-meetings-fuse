@@ -3,7 +3,7 @@
 Read-only FUSE filesystem exposing your [Fireflies.ai](https://fireflies.ai/) meetings as a date-indexed, grep-able tree of markdown files.
 
 ```
-~/views/fireflies-meetings/
+/views/fireflies-meetings/
 ├── 2026-04/02/team-leads-intro-focus/
 │   ├── summary.md       # AI summary, action items, keywords
 │   ├── transcript.md    # full transcript with [MM:SS] timestamps
@@ -20,7 +20,7 @@ Once mounted, your entire meeting history is just files you can `rg`, `cat`, `ba
 
 The Fireflies web UI and the GraphQL API are great when you know what you're looking for, but they're a poor fit for "I remember someone mentioning X three weeks ago". A FUSE mount turns the whole archive into something you can pipe through `ripgrep` in 50ms.
 
-The tree is also a perfect substrate for AI agents — point Claude Code or Cursor at `~/views/fireflies-meetings/` and they can answer "find the meeting where we discussed the auth migration" without ever calling an API.
+The tree is also a perfect substrate for AI agents — point Claude Code or Cursor at `/views/fireflies-meetings/` and they can answer "find the meeting where we discussed the auth migration" without ever calling an API.
 
 ## Requirements
 
@@ -47,21 +47,21 @@ $EDITOR .env  # paste your key
 Try it out manually before installing as a service:
 
 ```bash
-mkdir -p ~/views/fireflies-meetings
-uv run fireflies-meetings mount ~/views/fireflies-meetings
+mkdir -p /views/fireflies-meetings
+uv run fireflies-meetings mount /views/fireflies-meetings
 ```
 
 In another terminal:
 
 ```bash
-ls ~/views/fireflies-meetings/
-rg "auth migration" ~/views/fireflies-meetings/
+ls /views/fireflies-meetings/
+rg "auth migration" /views/fireflies-meetings/
 ```
 
 `Ctrl-C` to unmount, or from another shell:
 
 ```bash
-uv run fireflies-meetings unmount ~/views/fireflies-meetings
+uv run fireflies-meetings unmount /views/fireflies-meetings
 ```
 
 ## Run as a systemd user service
@@ -75,7 +75,7 @@ systemctl --user enable --now fireflies-meetings
 systemctl --user status fireflies-meetings
 ```
 
-The service auto-mounts at `~/views/fireflies-meetings/`, restarts on failure, and pre-unmounts any stale mount before starting.
+The service auto-mounts at `/views/fireflies-meetings/`, restarts on failure, and pre-unmounts any stale mount before starting.
 
 ## Live Transcript Fallback Auth
 
@@ -98,7 +98,7 @@ The daemon also does a best-effort non-interactive refresh from your local brows
 ## Filesystem layout
 
 ```
-~/views/fireflies-meetings/
+/views/fireflies-meetings/
 ├── YYYY-MM/                   # one dir per month
 │   └── DD/                    # one dir per day
 │       └── <meeting-slug>/    # slug derived from the meeting title
@@ -123,16 +123,16 @@ If the API rejects your token (401/403), an `AUTHENTICATION_EXPIRED` file appear
 
 ```bash
 # Find any meeting that mentions "kubernetes"
-rg kubernetes ~/views/fireflies-meetings/
+rg kubernetes /views/fireflies-meetings/
 
 # Just my meetings
-rg kubernetes ~/views/fireflies-meetings/mine/
+rg kubernetes /views/fireflies-meetings/mine/
 
 # Just summaries (skip transcripts)
-rg kubernetes ~/views/fireflies-meetings/**/summary.md
+rg kubernetes /views/fireflies-meetings/**/summary.md
 
 # Meetings from last week
-ls ~/views/fireflies-meetings/2026-04/0{2..8}/
+ls /views/fireflies-meetings/2026-04/0{2..8}/
 ```
 
 ## Caching & backfill
@@ -172,7 +172,7 @@ journalctl --user -u fireflies-meetings -n 50 --no-pager
 kill -USR1 $(pgrep -f 'fireflies-meetings mount')
 
 # Stale-mount recovery
-fusermount3 -u ~/views/fireflies-meetings && systemctl --user restart fireflies-meetings
+fusermount3 -u /views/fireflies-meetings && systemctl --user restart fireflies-meetings
 
 # Manual debug mount
 uv run fireflies-meetings mount --debug

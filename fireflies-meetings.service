@@ -9,10 +9,10 @@ StartLimitBurst=5
 Type=simple
 WorkingDirectory=%h/agentic/fireflies-meetings-fuse
 EnvironmentFile=%h/agentic/fireflies-meetings-fuse/.env
-ExecStartPre=-/usr/bin/fusermount3 -uz %h/views/fireflies-meetings
+ExecStartPre=-/usr/bin/fusermount3 -uz /views/fireflies-meetings
 ExecStart=%h/agentic/fireflies-meetings-fuse/.venv/bin/fireflies-meetings mount
-ExecStop=/usr/bin/fusermount3 -u %h/views/fireflies-meetings
-ExecStopPost=-/usr/bin/fusermount3 -u %h/views/fireflies-meetings
+ExecStop=/usr/bin/fusermount3 -u /views/fireflies-meetings
+ExecStopPost=-/usr/bin/fusermount3 -u /views/fireflies-meetings
 Restart=on-failure
 RestartSec=10
 
