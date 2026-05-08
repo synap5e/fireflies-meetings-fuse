@@ -48,6 +48,32 @@ def _with_slug(meeting: Meeting) -> Meeting:
     return meeting.model_copy(update={"slug": _make_slug(meeting)})
 
 
+def _build_entries_from_lists(
+    *,
+    primary: list[Meeting],
+    supplemental: list[Meeting],
+) -> dict[str, MeetingEntry]:
+    """Merge primary + supplemental meeting lists, primary winning on ID collision.
+
+    Used by `_fetch_meetings` to fold the status-API supplement on top of the
+    public list. The supplement only contributes IDs the primary didn't return.
+    """
+    entries: dict[str, MeetingEntry] = {}
+    for meeting in primary:
+        slugged = _with_slug(meeting)
+        entries[slugged.id] = MeetingEntry(meeting=slugged, slug=slugged.slug)
+    added = 0
+    for meeting in supplemental:
+        if meeting.id in entries:
+            continue
+        slugged = _with_slug(meeting)
+        entries[slugged.id] = MeetingEntry(meeting=slugged, slug=slugged.slug)
+        added += 1
+    if added:
+        log.info("Status API contributed %d meetings missing from public list", added)
+    return entries
+
+
 def _render_files(meeting: Meeting, detail: TranscriptDetail) -> dict[str, bytes]:
     """Render the standard set of meeting files. Pure function — no I/O."""
     return {
@@ -408,11 +434,14 @@ class MeetingStore:
                 self._backoff.record_failure()
             return
 
-        # Build new entries outside the lock (pure computation)
-        new_entries: dict[str, MeetingEntry] = {}
-        for raw_meeting in meetings:
-            meeting = _with_slug(raw_meeting)
-            new_entries[meeting.id] = MeetingEntry(meeting=meeting, slug=meeting.slug)
+        # Build new entries outside the lock (pure computation). Public list
+        # is the baseline; the status-API supplement (best-effort, returns
+        # [] on missing session auth or any failure) fills in IDs the public
+        # list didn't return because no transcript object exists yet.
+        new_entries = _build_entries_from_lists(
+            primary=meetings,
+            supplemental=self._client.list_recent_status_meetings(),
+        )
 
         # Apply under the lock
         with self._lock:
@@ -874,16 +903,24 @@ class MeetingStore:
 
         Names are slug-based (e.g. ``backend-roundtable``) so ``/live/`` reads
         like a human-named directory. Collisions within the live subset get
-        ``-2``, ``-3`` suffixes via ``_resolve_collisions``.
+        ``-2``, ``-3`` suffixes via ``_resolve_collisions``. Entries with an
+        empty ``date_str`` are excluded since the live symlink target can't
+        be rendered without a date.
         """
         self._refresh_if_stale()
         with self._lock:
-            live = [e for e in self._entries.values() if e.meeting.is_live]
+            live = [
+                e for e in self._entries.values()
+                if e.meeting.is_live and e.meeting.date_str
+            ]
         return list(self._resolve_collisions(live).keys())
 
     def _live_entry_by_dirname(self, dirname: str) -> MeetingEntry | None:
         with self._lock:
-            live = [e for e in self._entries.values() if e.meeting.is_live]
+            live = [
+                e for e in self._entries.values()
+                if e.meeting.is_live and e.meeting.date_str
+            ]
         return self._resolve_collisions(live).get(dirname)
 
     def get_uncached_meeting_ids(self) -> list[str]:

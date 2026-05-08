@@ -30,6 +30,9 @@ class _FakeClient:
     def list_transcripts(self, *, max_pages: int | None = None) -> list[Meeting]:
         return []
 
+    def list_recent_status_meetings(self, *, limit: int = 100) -> list[Meeting]:
+        return []
+
 
 class _ListClient:
     def __init__(self, meetings: list[Meeting]) -> None:
@@ -40,6 +43,9 @@ class _ListClient:
 
     def list_transcripts(self, *, max_pages: int | None = None) -> list[Meeting]:
         return self._meetings
+
+    def list_recent_status_meetings(self, *, limit: int = 100) -> list[Meeting]:
+        return []
 
 
 def _make_live_meeting() -> Meeting:

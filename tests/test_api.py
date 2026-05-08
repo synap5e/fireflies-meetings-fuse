@@ -565,3 +565,95 @@ def test_list_active_meeting_ids_skips_malformed_records() -> None:
 
     client = _make_client(handler)
     assert client.list_active_meeting_ids() == ["MEET01", "MEET02"]
+
+
+def test_list_recent_status_meetings_returns_empty_without_session_auth() -> None:
+    """No session JWT -> no internal API access -> [] without crashing."""
+    client = _make_client(lambda _req: httpx.Response(500))
+    assert client.list_recent_status_meetings() == []
+
+
+def test_list_recent_status_meetings_parses_status_response() -> None:
+    """Status API response converts to Meeting objects with status fields populated."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url == httpx.URL("https://app.fireflies.ai/api/v4/hive"):
+            payload = json.loads(req.content)
+            assert payload["operationName"] == "getUserMeetingsForStatus"
+            assert payload["variables"]["start"] is None
+            assert payload["variables"]["end"].endswith("Z")
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "getUserMeetingsForStatus": {
+                            "meetings": [
+                                {
+                                    "objectId": "MEET01",
+                                    "title": "Backend Standup",
+                                    "startTime": "2026-05-08T18:30:00.000Z",
+                                    "endTime": "2026-05-08T19:00:00.000Z",
+                                    "hostEmail": "alice@example.com",
+                                    "processMeetingStatus": "completed",
+                                    "audioIsTooSmall": False,
+                                    "started": True,
+                                },
+                                {
+                                    "objectId": "MEET02",
+                                    "title": "Audio Failed",
+                                    "startTime": "2026-05-08T20:00:00.000Z",
+                                    "endTime": "2026-05-08T20:01:00.000Z",
+                                    "hostEmail": "bob@example.com",
+                                    "processMeetingStatus": "failed",
+                                    "audioIsTooSmall": True,
+                                    "started": True,
+                                },
+                            ],
+                            "totalCount": 2,
+                        },
+                    },
+                },
+            )
+        raise AssertionError(f"Unexpected request URL: {req.url}")
+
+    client = FirefliesClient(
+        "dummy-key",
+        session_auth=SessionAuth(access_token="Bearer access-token", refresh_token="refresh-token"),
+        transport=httpx.MockTransport(handler),
+    )
+    meetings = client.list_recent_status_meetings()
+    assert [m.id for m in meetings] == ["MEET01", "MEET02"]
+    # processMeetingStatus="completed" is normalized to "processed"
+    assert meetings[0].meeting_info.summary_status == "processed"
+    assert meetings[0].duration_mins == 30.0
+    assert meetings[0].organizer_email == "alice@example.com"
+    assert meetings[0].transcript_url == "https://app.fireflies.ai/view/MEET01"
+    # audioIsTooSmall maps to silent_meeting
+    assert meetings[1].meeting_info.silent_meeting is True
+    assert meetings[1].meeting_info.summary_status == "failed"
+
+
+def test_list_recent_status_meetings_skips_malformed() -> None:
+    def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "getUserMeetingsForStatus": {
+                        "meetings": [
+                            {"objectId": "MEET01", "title": "good", "startTime": "2026-05-08T18:30:00.000Z"},
+                            {"objectId": "../etc/passwd", "title": "bad", "startTime": "2026-05-08T18:30:00.000Z"},
+                            "not-a-dict",
+                            {"objectId": "MEET02", "title": "also good", "startTime": "2026-05-08T19:00:00.000Z"},
+                        ],
+                    },
+                },
+            },
+        )
+
+    client = FirefliesClient(
+        "dummy-key",
+        session_auth=SessionAuth(access_token="Bearer access-token", refresh_token="refresh-token"),
+        transport=httpx.MockTransport(handler),
+    )
+    assert [m.id for m in client.list_recent_status_meetings()] == ["MEET01", "MEET02"]

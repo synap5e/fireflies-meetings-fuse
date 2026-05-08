@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import NoReturn
 
 import httpx
@@ -370,6 +370,86 @@ def _hive_meeting_to_dict(raw: JsonObject) -> JsonObject:
         "meeting_info": {
             "fred_joined": False,
             "silent_meeting": silent,
+            "summary_status": summary_status,
+        },
+    }
+
+
+# Status-API query: surfaces meetings in any state (processing, errored,
+# audio-too-small) that the public `transcripts` query omits because no
+# transcript object exists yet. Same hive endpoint, same session JWT auth
+# as `_HIVE_LIST_QUERY`, but a different operation. Used as a supplemental
+# real-time source on top of the public list.
+_HIVE_STATUS_QUERY = """\
+query getUserMeetingsForStatus(
+  $start: String, $end: String, $batch: Int,
+  $limit: Int, $totalCount: Int, $status: String
+) {
+  getUserMeetingsForStatus(
+    start: $start
+    end: $end
+    batch: $batch
+    limit: $limit
+    totalCount: $totalCount
+    status: $status
+  ) {
+    meetings {
+      objectId
+      title
+      startTime
+      endTime
+      hostEmail
+      processMeetingStatus
+      audioIsTooSmall
+      started
+    }
+    totalCount
+  }
+}"""
+
+
+def _hive_status_to_dict(raw: JsonObject) -> JsonObject:
+    """Convert a getUserMeetingsForStatus record to a Meeting input dict.
+
+    The status API returns a different shape than `getChannelMeetings`:
+    `objectId` instead of `parseId`, `startTime`/`endTime` as ISO strings
+    instead of an epoch `date`, `audioIsTooSmall` instead of nested audio
+    metadata. This builds the Meeting input directly so we don't have to
+    relax `_internal_meeting_info`.
+    """
+    object_id = raw.get("objectId", "")
+    start = raw.get("startTime") if isinstance(raw.get("startTime"), str) else ""
+    end = raw.get("endTime") if isinstance(raw.get("endTime"), str) else ""
+
+    epoch_ms: float = 0.0
+    if isinstance(start, str) and start:
+        try:
+            epoch_ms = datetime.fromisoformat(start.replace("Z", "+00:00")).timestamp() * 1000
+        except ValueError:
+            epoch_ms = 0.0
+
+    duration_mins: float = 0.0
+    if isinstance(end, str) and end and epoch_ms:
+        try:
+            end_ms = datetime.fromisoformat(end.replace("Z", "+00:00")).timestamp() * 1000
+            duration_mins = max(0.0, (end_ms - epoch_ms) / 60000.0)
+        except ValueError:
+            duration_mins = 0.0
+
+    status = raw.get("processMeetingStatus", "")
+    summary_status = _HIVE_STATUS_MAP.get(status, status) if isinstance(status, str) else ""
+
+    return {
+        "id": object_id,
+        "title": raw.get("title", ""),
+        "date": epoch_ms,
+        "duration": duration_mins,
+        "is_live": False,
+        "organizer_email": raw.get("hostEmail", ""),
+        "transcript_url": f"https://app.fireflies.ai/view/{object_id}",
+        "meeting_info": {
+            "fred_joined": False,
+            "silent_meeting": bool(raw.get("audioIsTooSmall", False)),
             "summary_status": summary_status,
         },
     }
@@ -748,6 +828,63 @@ class FirefliesClient:
 
         if meetings:
             log.info("Hive API fallback returned %d meetings", len(meetings))
+        return meetings
+
+    def list_recent_status_meetings(self, *, limit: int = 100) -> list[Meeting]:
+        """Supplement: fetch recent meetings from the status API.
+
+        Returns meetings in any processing state (including ones the public
+        `transcripts` query hasn't surfaced yet because no transcript object
+        exists). Returns [] if no session auth is configured or the call
+        fails — never raises, since this is best-effort.
+        """
+        if self._hive_client is None:
+            return []
+
+        end_iso = datetime.now(UTC).replace(tzinfo=None).isoformat(timespec="milliseconds") + "Z"
+        variables: JsonObject = {
+            "start": None,
+            "end": end_iso,
+            "batch": 1,
+            "limit": limit,
+            "totalCount": 0,
+            "status": None,
+        }
+        try:
+            resp = self._hive_client.post(
+                _HIVE_ENDPOINT,
+                json={
+                    "operationName": "getUserMeetingsForStatus",
+                    "query": _HIVE_STATUS_QUERY,
+                    "variables": variables,
+                },
+            )
+            resp.raise_for_status()
+            body: JsonObject = resp.json()
+        except (httpx.HTTPError, json.JSONDecodeError, ValueError) as e:
+            log.warning("Status API supplemental list failed: %s", e)
+            return []
+
+        data = body.get("data")
+        outer = (
+            data.get("getUserMeetingsForStatus")
+            if isinstance(data, dict) else None
+        )
+        raw_list = outer.get("meetings") if isinstance(outer, dict) else None
+        if not isinstance(raw_list, list):
+            return []
+
+        meetings: list[Meeting] = []
+        for raw in raw_list:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                meetings.append(Meeting.model_validate(_hive_status_to_dict(raw)))
+            except (ValidationError, KeyError) as e:
+                log.warning("Skipping malformed status meeting: %s", e)
+
+        if meetings:
+            log.info("Status API returned %d recent meetings", len(meetings))
         return meetings
 
     def get_transcript(self, meeting_id: str) -> TranscriptDetail:
