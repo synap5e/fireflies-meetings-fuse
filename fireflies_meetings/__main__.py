@@ -7,6 +7,7 @@ import functools
 import json
 import logging
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -34,6 +35,27 @@ def _default_chat_token_path() -> str:
 
 def _default_session_auth_path() -> str:
     return os.path.expanduser("~/.config/fireflies-meetings/session.json")
+
+
+def _chat_reauth_command(token_path: Path) -> str:
+    """Build a copy-pasteable one-liner to re-auth Chat and restart the service.
+
+    Uses the actual binary path (`sys.argv[0]`) and resolved client-secret JSON
+    so the user can paste it without substitutions. Falls back to a placeholder
+    if no client-secret file is discoverable.
+    """
+    binary = sys.argv[0] or "fireflies-meetings"
+    creds = _resolve_chat_credentials(None)
+    creds_arg = (
+        f"--chat-credentials {creds.parent.resolve()}/*.json"
+        if creds is not None
+        else "--chat-credentials <PATH-TO-client_secret.json>"
+    )
+    return (
+        f"{shlex.quote(binary)} auth-chat {creds_arg} "
+        f"--chat-token {shlex.quote(str(token_path))} "
+        f"&& systemctl --user restart fireflies-meetings"
+    )
 
 
 def _resolve_chat_credentials(explicit: str | None) -> Path | None:
@@ -253,9 +275,9 @@ async def _chat_watch_loop(
     creds = load_credentials(token_path)
     if creds is None:
         _log.warning(
-            "Google Chat token at %s is missing or invalid; "
-            "live meeting discovery disabled. Run `fireflies-meetings auth-chat` to set it up.",
+            "Google Chat token at %s missing or invalid; live discovery disabled. Fix: %s",
             token_path,
+            _chat_reauth_command(token_path),
         )
         store.mark_chat_auth_fatal()
         return
@@ -270,10 +292,9 @@ async def _chat_watch_loop(
                 )
             except ChatAuthExpiredError as e:
                 _log.warning(
-                    "Google Chat credentials unusable: %s. "
-                    "Live meeting discovery disabled until `fireflies-meetings auth-chat` "
-                    "is re-run and the service is restarted.",
+                    "Google Chat credentials unusable: %s; live discovery disabled. Fix: %s",
                     e,
+                    _chat_reauth_command(token_path),
                 )
                 store.mark_chat_auth_fatal()
                 return
