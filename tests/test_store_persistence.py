@@ -21,7 +21,12 @@ from fireflies_meetings.api import FirefliesClient
 from fireflies_meetings.models import Meeting, MeetingInfo, Sentence, TranscriptDetail
 from fireflies_meetings.renderer import render_meeting_json
 from fireflies_meetings.status_cache import StatusCache
-from fireflies_meetings.store import MEETING_FILES, MeetingEntry, MeetingStore
+from fireflies_meetings.store import (
+    MEETING_FILES,
+    MeetingEntry,
+    MeetingStore,
+    _merge_refresh_entry,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -374,3 +379,68 @@ def test_overlap_warning_returns_clean_message_when_primary_is_superset(
     assert "warning: overlap-superset" in warning
     assert "No missing sentences were found" in warning
     assert "NOT a strict superset" not in warning
+
+
+def test_merge_refresh_entry_returns_new_when_no_existing() -> None:
+    new = _entry(_meeting("MEET01", duration_mins=30.0))
+    assert _merge_refresh_entry(None, new) is new
+
+
+def test_merge_refresh_entry_preserves_existing_date_when_new_has_zero() -> None:
+    """Status-API ghost without startTime must NOT overwrite a watch_meeting'd date."""
+    existing_meeting = Meeting(
+        id="MEET01",
+        title="All-Hands",
+        date_epoch_ms=1778196600000.0,  # 2026-05-08
+        is_live=True,
+        meeting_info=MeetingInfo(summary_status=""),
+        slug="all-hands",
+    )
+    existing = MeetingEntry(meeting=existing_meeting, slug="all-hands")
+
+    # New entry from a refresh source that lost the date (e.g. status-API ghost
+    # leaking through; defense-in-depth).
+    new_meeting = Meeting(
+        id="MEET01",
+        title="All-Hands",
+        date_epoch_ms=0.0,
+        is_live=False,
+        meeting_info=MeetingInfo(summary_status=""),
+        slug="all-hands",
+    )
+    new = MeetingEntry(meeting=new_meeting, slug="all-hands")
+
+    merged = _merge_refresh_entry(existing, new)
+    # Existing date preserved.
+    assert merged.meeting.date_epoch_ms == 1778196600000.0
+    assert merged.meeting.date_str == "2026-05-08"
+    # is_live preserved (existing was live, new is not, summary not terminal).
+    assert merged.meeting.is_live is True
+
+
+def test_merge_refresh_entry_takes_new_date_when_existing_was_zero() -> None:
+    """When existing has no date but new does, new wins (the normal upgrade path)."""
+    existing_meeting = Meeting(
+        id="MEET01",
+        title="All-Hands",
+        date_epoch_ms=0.0,
+        is_live=True,
+        meeting_info=MeetingInfo(summary_status=""),
+        slug="all-hands",
+    )
+    existing = MeetingEntry(meeting=existing_meeting, slug="all-hands")
+
+    new_meeting = Meeting(
+        id="MEET01",
+        title="All-Hands",
+        date_epoch_ms=1778196600000.0,
+        is_live=False,
+        meeting_info=MeetingInfo(summary_status=""),
+        slug="all-hands",
+    )
+    new = MeetingEntry(meeting=new_meeting, slug="all-hands")
+
+    merged = _merge_refresh_entry(existing, new)
+    assert merged.meeting.date_epoch_ms == 1778196600000.0
+    # is_live still preserved from the existing live flag.
+    assert merged.meeting.is_live is True

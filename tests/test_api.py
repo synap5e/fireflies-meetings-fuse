@@ -574,7 +574,13 @@ def test_list_recent_status_meetings_returns_empty_without_session_auth() -> Non
 
 
 def test_list_recent_status_meetings_parses_status_response() -> None:
-    """Status API response converts to Meeting objects with status fields populated."""
+    """Status API response converts to Meeting objects with status fields populated.
+
+    The status API returns `startTime`/`endTime` as **epoch milliseconds**
+    (numbers), not ISO strings -- field probed against the live endpoint
+    on 2026-05-09 returned `1778284800000` for `All-Hands`. Accept both
+    forms anyway so we don't rely on the wire shape.
+    """
 
     def handler(req: httpx.Request) -> httpx.Response:
         if req.url == httpx.URL("https://app.fireflies.ai/api/v4/hive"):
@@ -589,16 +595,18 @@ def test_list_recent_status_meetings_parses_status_response() -> None:
                         "getUserMeetingsForStatus": {
                             "meetings": [
                                 {
+                                    # Numeric epoch ms (real wire shape).
                                     "objectId": "MEET01",
                                     "title": "Backend Standup",
-                                    "startTime": "2026-05-08T18:30:00.000Z",
-                                    "endTime": "2026-05-08T19:00:00.000Z",
+                                    "startTime": 1778281200000,
+                                    "endTime": 1778283000000,
                                     "hostEmail": "alice@example.com",
                                     "processMeetingStatus": "completed",
                                     "audioIsTooSmall": False,
                                     "started": True,
                                 },
                                 {
+                                    # ISO string form (defensive: also accepted).
                                     "objectId": "MEET02",
                                     "title": "Audio Failed",
                                     "startTime": "2026-05-08T20:00:00.000Z",
@@ -631,6 +639,43 @@ def test_list_recent_status_meetings_parses_status_response() -> None:
     # audioIsTooSmall maps to silent_meeting
     assert meetings[1].meeting_info.silent_meeting is True
     assert meetings[1].meeting_info.summary_status == "failed"
+
+
+def test_list_recent_status_meetings_drops_dateless_ghosts() -> None:
+    """Records with no usable startTime (null, empty, zero) are dropped."""
+
+    def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "getUserMeetingsForStatus": {
+                        "meetings": [
+                            {
+                                "objectId": "MEET01",
+                                "title": "Good",
+                                "startTime": 1778281200000,
+                            },
+                            {"objectId": "GHOST_NULL", "title": "Null", "startTime": None},
+                            {"objectId": "GHOST_EMPTY", "title": "Empty", "startTime": ""},
+                            {"objectId": "GHOST_ZERO", "title": "Zero epoch", "startTime": 0},
+                            {
+                                "objectId": "MEET02",
+                                "title": "Also Good",
+                                "startTime": "2026-05-08T19:00:00.000Z",
+                            },
+                        ],
+                    },
+                },
+            },
+        )
+
+    client = FirefliesClient(
+        "dummy-key",
+        session_auth=SessionAuth(access_token="Bearer access-token", refresh_token="refresh-token"),
+        transport=httpx.MockTransport(handler),
+    )
+    assert [m.id for m in client.list_recent_status_meetings()] == ["MEET01", "MEET02"]
 
 
 def test_list_recent_status_meetings_skips_malformed() -> None:

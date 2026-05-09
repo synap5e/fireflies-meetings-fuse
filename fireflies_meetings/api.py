@@ -408,33 +408,43 @@ query getUserMeetingsForStatus(
 }"""
 
 
-def _hive_status_to_dict(raw: JsonObject) -> JsonObject:
+def _coerce_status_time(value: object) -> float | None:
+    """Coerce a status-API time field to epoch milliseconds.
+
+    The status API returns timestamps as either numeric epoch ms or ISO
+    strings depending on the record (the dashboard front-end accepts both
+    too). Returns None for missing/null/unparseable values.
+    """
+    if isinstance(value, (int, float)) and value > 0:
+        return float(value)
+    if isinstance(value, str) and value:
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000
+        except ValueError:
+            return None
+    return None
+
+
+def _hive_status_to_dict(raw: JsonObject) -> JsonObject | None:
     """Convert a getUserMeetingsForStatus record to a Meeting input dict.
 
+    Returns None for records with no usable `startTime` -- the status API
+    surfaces recurring-series-level IDs (without instance timestamps) that
+    can't be rendered into the date tree and would only do harm by
+    overwriting a watch_meeting-populated entry that already has a real date.
+
     The status API returns a different shape than `getChannelMeetings`:
-    `objectId` instead of `parseId`, `startTime`/`endTime` as ISO strings
-    instead of an epoch `date`, `audioIsTooSmall` instead of nested audio
-    metadata. This builds the Meeting input directly so we don't have to
-    relax `_internal_meeting_info`.
+    `objectId` instead of `parseId`, `startTime`/`endTime` as numeric
+    epoch milliseconds (or ISO strings -- accept both), `audioIsTooSmall`
+    instead of nested audio metadata. This builds the Meeting input
+    directly so we don't have to relax `_internal_meeting_info`.
     """
     object_id = raw.get("objectId", "")
-    start = raw.get("startTime") if isinstance(raw.get("startTime"), str) else ""
-    end = raw.get("endTime") if isinstance(raw.get("endTime"), str) else ""
-
-    epoch_ms: float = 0.0
-    if isinstance(start, str) and start:
-        try:
-            epoch_ms = datetime.fromisoformat(start.replace("Z", "+00:00")).timestamp() * 1000
-        except ValueError:
-            epoch_ms = 0.0
-
-    duration_mins: float = 0.0
-    if isinstance(end, str) and end and epoch_ms:
-        try:
-            end_ms = datetime.fromisoformat(end.replace("Z", "+00:00")).timestamp() * 1000
-            duration_mins = max(0.0, (end_ms - epoch_ms) / 60000.0)
-        except ValueError:
-            duration_mins = 0.0
+    epoch_ms = _coerce_status_time(raw.get("startTime"))
+    if epoch_ms is None:
+        return None
+    end_ms = _coerce_status_time(raw.get("endTime"))
+    duration_mins = max(0.0, (end_ms - epoch_ms) / 60000.0) if end_ms is not None else 0.0
 
     status = raw.get("processMeetingStatus", "")
     summary_status = _HIVE_STATUS_MAP.get(status, status) if isinstance(status, str) else ""
@@ -875,16 +885,25 @@ class FirefliesClient:
             return []
 
         meetings: list[Meeting] = []
+        skipped_dateless = 0
         for raw in raw_list:
             if not isinstance(raw, dict):
                 continue
+            converted = _hive_status_to_dict(raw)
+            if converted is None:
+                skipped_dateless += 1
+                continue
             try:
-                meetings.append(Meeting.model_validate(_hive_status_to_dict(raw)))
+                meetings.append(Meeting.model_validate(converted))
             except (ValidationError, KeyError) as e:
                 log.warning("Skipping malformed status meeting: %s", e)
 
-        if meetings:
-            log.info("Status API returned %d recent meetings", len(meetings))
+        if meetings or skipped_dateless:
+            log.info(
+                "Status API returned %d recent meetings (%d dateless ghosts dropped)",
+                len(meetings),
+                skipped_dateless,
+            )
         return meetings
 
     def get_transcript(self, meeting_id: str) -> TranscriptDetail:

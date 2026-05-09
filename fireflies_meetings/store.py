@@ -48,6 +48,44 @@ def _with_slug(meeting: Meeting) -> Meeting:
     return meeting.model_copy(update={"slug": _make_slug(meeting)})
 
 
+def _merge_refresh_entry(
+    existing: MeetingEntry | None,
+    new_entry: MeetingEntry,
+) -> MeetingEntry:
+    """Merge a refresh result against any existing entry, preserving fields a
+    new (potentially impoverished) source would clobber.
+
+    Two preservations apply:
+
+    - **is_live**: the list API reports `is_live=False` even for in-progress
+      meetings, so a list refresh shouldn't flip a watch_meeting-set live
+      flag back to False unless `summary_status` has gone terminal.
+    - **date_epoch_ms / date_str**: the status API surfaces some recurring
+      series-level IDs without `startTime`. The `_hive_status_to_dict` filter
+      drops most, but defense-in-depth: if `new_entry` has no date and
+      `existing` does, keep the existing date so the meeting stays
+      navigable in the date tree.
+    """
+    if existing is None:
+        return new_entry
+
+    overrides: dict[str, object] = {}
+    if (
+        existing.meeting.is_live
+        and not new_entry.meeting.is_live
+        and not new_entry.meeting.summary_is_terminal
+    ):
+        overrides["is_live"] = True
+    if new_entry.meeting.date_epoch_ms == 0 and existing.meeting.date_epoch_ms > 0:
+        overrides["date_epoch_ms"] = existing.meeting.date_epoch_ms
+        overrides["date_str"] = existing.meeting.date_str
+
+    if not overrides:
+        return new_entry
+    merged = new_entry.meeting.model_copy(update=overrides)
+    return MeetingEntry(meeting=merged, slug=new_entry.slug)
+
+
 def _build_entries_from_lists(
     *,
     primary: list[Meeting],
@@ -450,23 +488,7 @@ class MeetingStore:
             else:
                 for mid, new_entry in new_entries.items():
                     existing = self._entries.get(mid)
-                    if (
-                        existing is not None
-                        and existing.meeting.is_live
-                        and not new_entry.meeting.is_live
-                        and not new_entry.meeting.summary_is_terminal
-                    ):
-                        # List API doesn't reflect live state reliably (is_live
-                        # is False even for in-progress meetings). watch_meeting
-                        # and active_meetings poll are the positive sources;
-                        # list refresh only flips live→done when summary_status
-                        # goes terminal.
-                        preserved = new_entry.meeting.model_copy(update={"is_live": True})
-                        self._entries[mid] = MeetingEntry(
-                            meeting=preserved, slug=new_entry.slug,
-                        )
-                    else:
-                        self._entries[mid] = new_entry
+                    self._entries[mid] = _merge_refresh_entry(existing, new_entry)
 
             self._list_cache_time = time.time()
             jitter_factor = 0.7 + random.random() * 0.6  # [0.7, 1.3]
