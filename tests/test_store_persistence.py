@@ -14,11 +14,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
-from fireflies_meetings.api import FirefliesClient
+from fireflies_meetings.api import FirefliesClient, TranscriptNotFoundError
 from fireflies_meetings.models import Meeting, MeetingInfo, Sentence, TranscriptDetail
 from fireflies_meetings.renderer import render_meeting_json
 from fireflies_meetings.status_cache import StatusCache
@@ -519,3 +519,118 @@ def test_force_refresh_skips_missing_from_api_stubs(
     empty_store.force_refresh()
 
     assert (detail_dir / ".complete").exists()
+
+
+class _NotFoundClient:
+    """Fake client whose get_transcript always 404s."""
+
+    def get_transcript(self, meeting_id: str) -> TranscriptDetail:
+        raise TranscriptNotFoundError(f"Transcript {meeting_id} no longer exists")
+
+
+def test_fetch_detail_preserves_real_cache_when_api_404s(
+    cache_root: Path,
+) -> None:
+    """If the API forgets a meeting we have cached content for, we must NOT
+    overwrite the cache with a stub — Fireflies sometimes drops transcripts
+    and the cache may be the only remaining copy."""
+    detail_dir = _seed_disk_meeting(
+        cache_root, "MEET_KEEP",
+        access_logs=[],
+        summary_status="processed",
+    )
+    real_summary = b"# real meeting summary\nsome content"
+    (detail_dir / "summary.md").write_bytes(real_summary)
+    # No sentinel (mimics post-force-refresh state).
+    (detail_dir / ".complete").unlink()
+
+    status = StatusCache()
+    status.mark_completed("MEET_KEEP")
+    store = MeetingStore(
+        cast(FirefliesClient, _NotFoundClient()), status_cache=status,
+    )
+
+    meeting = Meeting(
+        id="MEET_KEEP",
+        title="MEET_KEEP",
+        date_epoch_ms=1774891800000.0,
+        meeting_info=MeetingInfo(summary_status="processed"),
+        slug="meet-keep",
+    )
+
+    cached, _changed = store._fetch_detail(meeting)  # noqa: SLF001
+
+    assert cached is not None, "should return preserved cache, not None"
+    # Cache files unchanged on disk.
+    assert (detail_dir / "summary.md").read_bytes() == real_summary
+    # Sentinel restored.
+    assert (detail_dir / ".complete").exists()
+    # meeting.json must still report the real status, not the stub.
+    raw = json.loads((detail_dir / "meeting.json").read_text())
+    assert raw["meeting_info"]["summary_status"] == "processed"
+
+
+def test_fetch_detail_writes_stub_when_no_real_cache_on_404(
+    cache_root: Path,
+) -> None:
+    """First-fetch 404 must still produce the stub (existing behavior).
+
+    Without prior cached content there's nothing to preserve."""
+    status = StatusCache()
+    store = MeetingStore(
+        cast(FirefliesClient, _NotFoundClient()), status_cache=status,
+    )
+
+    meeting = Meeting(
+        id="MEET_NEW",
+        title="MEET_NEW",
+        date_epoch_ms=1774891800000.0,
+        meeting_info=MeetingInfo(summary_status="processed"),
+        slug="meet-new",
+    )
+
+    cached, _changed = store._fetch_detail(meeting)  # noqa: SLF001
+
+    assert cached is not None
+    # Stub written.
+    detail_dir = cache_root / "detail" / "MEET_NEW"
+    assert (detail_dir / ".complete").exists()
+    raw = json.loads((detail_dir / "meeting.json").read_text())
+    assert raw["meeting_info"]["summary_status"] == "missing_from_api"
+
+
+def test_backfill_one_preserves_real_cache_when_api_404s(
+    cache_root: Path,
+) -> None:
+    """Same guarantee as _fetch_detail but for the background backfill path."""
+    detail_dir = _seed_disk_meeting(
+        cache_root, "MEET_BACKFILL",
+        access_logs=[],
+        summary_status="processed",
+    )
+    real_transcript = b"# real transcript\n* alice (00:00): hello"
+    (detail_dir / "transcript.md").write_bytes(real_transcript)
+    # No sentinel: backfill_one will treat it as uncached and re-fetch.
+    (detail_dir / ".complete").unlink()
+
+    status = StatusCache()
+    store = MeetingStore(
+        cast(FirefliesClient, _NotFoundClient()), status_cache=status,
+    )
+    meeting = Meeting(
+        id="MEET_BACKFILL",
+        title="MEET_BACKFILL",
+        date_epoch_ms=1774891800000.0,
+        meeting_info=MeetingInfo(summary_status="processed"),
+        slug="meet-backfill",
+    )
+    store._entries["MEET_BACKFILL"] = MeetingEntry(  # noqa: SLF001
+        meeting=meeting, slug=meeting.slug,
+    )
+
+    store.backfill_one("MEET_BACKFILL")
+
+    assert (detail_dir / "transcript.md").read_bytes() == real_transcript
+    assert (detail_dir / ".complete").exists()
+    raw = json.loads((detail_dir / "meeting.json").read_text())
+    assert raw["meeting_info"]["summary_status"] == "processed"

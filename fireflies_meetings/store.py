@@ -679,6 +679,14 @@ class MeetingStore:
         try:
             detail = self._client.get_transcript(meeting_id)
         except TranscriptNotFoundError:
+            preserved = self._preserve_cached_on_api_404(meeting_id)
+            if preserved is not None:
+                log.info(
+                    "Transcript %s 404'd from Fireflies; keeping existing cached content",
+                    meeting_id,
+                )
+                self._status_cache.mark_completed(meeting_id)
+                return preserved, False
             log.info(
                 "Transcript %s no longer available from Fireflies; writing stub",
                 meeting_id,
@@ -980,18 +988,7 @@ class MeetingStore:
         try:
             raw_detail = self._client.get_transcript(meeting_id)
         except TranscriptNotFoundError:
-            log.info(
-                "Transcript %s no longer available from Fireflies; writing stub",
-                meeting_id,
-            )
-            stub_meeting, stub_detail = _make_stub_detail(entry.meeting)
-            files = _render_files(stub_meeting, stub_detail)
-            self._save_detail_to_disk(meeting_id, files)
-            self._status_cache.mark_completed(meeting_id)
-            with self._lock:
-                self._backoff.record_success()
-                self._file_cache[meeting_id] = _CachedFiles(files=files, fetched_at=time.monotonic())
-            self._notify_live_change(meeting_id)
+            self._handle_backfill_not_found(meeting_id, entry.meeting)
             return
         except RateLimitedError as e:
             with self._lock:
@@ -1684,3 +1681,73 @@ class MeetingStore:
             sentinel.unlink(missing_ok=True)
         except OSError:
             log.debug("Failed to remove sentinel for %s", meeting_id, exc_info=True)
+
+    def _has_real_cached_transcript(self, meeting_id: str) -> bool:
+        """True if the on-disk meeting.json is non-stub.
+
+        Stubs (`summary_status == "missing_from_api"`) are written when a
+        meeting 404s before we ever cached real content. We never want to
+        overwrite real cached content with a stub — Fireflies sometimes
+        forgets about old meetings and the cache is the only copy we have.
+        """
+        meeting_json = self._detail_cache_dir / meeting_id / "meeting.json"
+        if not meeting_json.is_file():
+            return False
+        try:
+            raw = json.loads(meeting_json.read_text())
+        except (OSError, json.JSONDecodeError):
+            return False
+        if not isinstance(raw, dict):
+            return False
+        typed_raw = cast("dict[str, object]", raw)
+        info = typed_raw.get("meeting_info")
+        if not isinstance(info, dict):
+            return True
+        typed_info = cast("dict[str, object]", info)
+        return typed_info.get("summary_status") != "missing_from_api"
+
+    def _handle_backfill_not_found(self, meeting_id: str, meeting: Meeting) -> None:
+        """Backfill path's 404 handler: preserve real cache or write a stub."""
+        preserved = self._preserve_cached_on_api_404(meeting_id)
+        if preserved is not None:
+            log.info(
+                "Transcript %s 404'd from Fireflies; keeping existing cached content",
+                meeting_id,
+            )
+            self._status_cache.mark_completed(meeting_id)
+            with self._lock:
+                self._backoff.record_success()
+                self._file_cache[meeting_id] = preserved
+            self._notify_live_change(meeting_id)
+            return
+        log.info(
+            "Transcript %s no longer available from Fireflies; writing stub",
+            meeting_id,
+        )
+        stub_meeting, stub_detail = _make_stub_detail(meeting)
+        files = _render_files(stub_meeting, stub_detail)
+        self._save_detail_to_disk(meeting_id, files)
+        self._status_cache.mark_completed(meeting_id)
+        with self._lock:
+            self._backoff.record_success()
+            self._file_cache[meeting_id] = _CachedFiles(
+                files=files, fetched_at=time.monotonic(),
+            )
+        self._notify_live_change(meeting_id)
+
+    def _preserve_cached_on_api_404(self, meeting_id: str) -> _CachedFiles | None:
+        """Restore the .complete sentinel and return the cached files.
+
+        Called when the API 404s but we still have real cached content;
+        the API has likely forgotten an older transcript and we don't
+        want to overwrite our copy. Returns None when there's nothing
+        worth preserving (caller falls back to stub-writing).
+        """
+        if not self._has_real_cached_transcript(meeting_id):
+            return None
+        sentinel = self._detail_cache_dir / meeting_id / _COMPLETE_SENTINEL
+        try:
+            sentinel.touch()
+        except OSError:
+            log.warning("Failed to restore sentinel for %s", meeting_id, exc_info=True)
+        return self._load_detail_from_disk(meeting_id)
