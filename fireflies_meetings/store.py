@@ -1616,7 +1616,12 @@ class MeetingStore:
         self._chat_auth_fatal = True
 
     def force_refresh(self) -> None:
-        """Full cache invalidation: list, non-completed details, backoff."""
+        """Full cache invalidation: list, non-completed details, backoff,
+        and completed details whose access-log column is empty (so a SIGUSR1
+        after restoring session auth actually backfills `views.md` instead
+        of serving the frozen-empty cache).
+        """
+        empty_log_ids = self._scan_completed_meetings_with_empty_access_logs()
         with self._lock:
             self._list_cache_time = 0.0
             self._backoff = _BackoffState()
@@ -1627,7 +1632,55 @@ class MeetingStore:
             ]
             for mid in to_evict:
                 del self._file_cache[mid]
+            for mid in empty_log_ids:
+                self._file_cache.pop(mid, None)
+                self._invalidate_disk_cache_sentinel(mid)
         log.info(
-            "Force refresh: cleared list cache, backoff, and %d non-completed file caches",
+            "Force refresh: cleared list cache, backoff, %d non-completed file caches, "
+            "and %d completed meetings with empty access logs",
             len(to_evict),
+            len(empty_log_ids),
         )
+
+    def _scan_completed_meetings_with_empty_access_logs(self) -> list[str]:
+        """Return meeting ids whose on-disk meeting.json has empty access_logs
+        and is not a `missing_from_api` stub (those will never gain logs).
+        """
+        if not self._detail_cache_dir.is_dir():
+            return []
+        ids: list[str] = []
+        for meeting_dir in self._detail_cache_dir.iterdir():
+            if not meeting_dir.is_dir():
+                continue
+            meeting_json = meeting_dir / "meeting.json"
+            if not meeting_json.is_file():
+                continue
+            try:
+                raw = json.loads(meeting_json.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(raw, dict):
+                continue
+            typed_raw = cast("dict[str, object]", raw)
+            access_logs = typed_raw.get("access_logs")
+            if isinstance(access_logs, list) and access_logs:
+                continue  # already populated, nothing to refetch
+            meeting_info = typed_raw.get("meeting_info")
+            if isinstance(meeting_info, dict):
+                typed_info = cast("dict[str, object]", meeting_info)
+                if typed_info.get("summary_status") == "missing_from_api":
+                    continue  # stub for deleted transcript — won't gain logs
+            ids.append(meeting_dir.name)
+        return ids
+
+    def _invalidate_disk_cache_sentinel(self, meeting_id: str) -> None:
+        """Remove the .complete sentinel so the next read triggers a refetch.
+
+        Leaves the file bodies in place; they'll be overwritten by the refetch
+        and serve as a fallback if the refetch fails.
+        """
+        sentinel = self._detail_cache_dir / meeting_id / _COMPLETE_SENTINEL
+        try:
+            sentinel.unlink(missing_ok=True)
+        except OSError:
+            log.debug("Failed to remove sentinel for %s", meeting_id, exc_info=True)

@@ -12,6 +12,7 @@ Two failure modes to lock in:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -444,3 +445,77 @@ def test_merge_refresh_entry_takes_new_date_when_existing_was_zero() -> None:
     assert merged.meeting.date_epoch_ms == 1778196600000.0
     # is_live still preserved from the existing live flag.
     assert merged.meeting.is_live is True
+
+
+def _seed_disk_meeting(
+    cache_root: Path,
+    meeting_id: str,
+    *,
+    access_logs: list[dict[str, str]],
+    summary_status: str = "processed",
+) -> Path:
+    """Write a minimal meeting.json + sentinel under the detail cache."""
+    detail_dir = cache_root / "detail" / meeting_id
+    detail_dir.mkdir(parents=True)
+    for filename in MEETING_FILES:
+        (detail_dir / filename).write_bytes(b"x")
+    (detail_dir / "meeting.json").write_text(json.dumps({
+        "id": meeting_id,
+        "title": meeting_id,
+        "date": "2026-04-15",
+        "meeting_info": {"summary_status": summary_status},
+        "access_logs": access_logs,
+    }))
+    (detail_dir / ".complete").touch()
+    return detail_dir
+
+
+def test_force_refresh_evicts_completed_meetings_with_empty_access_logs(
+    empty_store: MeetingStore, cache_root: Path,
+) -> None:
+    """SIGUSR1 must trigger a refetch for completed meetings whose access_logs
+    are empty (the symptom of caching before session auth was configured)."""
+    detail_dir = _seed_disk_meeting(cache_root, "MEET_EMPTY", access_logs=[])
+    empty_store._status_cache.mark_completed("MEET_EMPTY")  # noqa: SLF001
+
+    empty_store.force_refresh()
+
+    # Sentinel must be gone so the next read forces a refetch.
+    assert not (detail_dir / ".complete").exists()
+    # Bodies stay in place as fallback if the refetch fails.
+    assert (detail_dir / "meeting.json").exists()
+
+
+def test_force_refresh_preserves_completed_meetings_with_populated_access_logs(
+    empty_store: MeetingStore, cache_root: Path,
+) -> None:
+    """Meetings with non-empty access_logs must NOT be re-fetched on SIGUSR1
+    — that would be a needless API storm across the whole cache."""
+    detail_dir = _seed_disk_meeting(
+        cache_root,
+        "MEET_LOGS",
+        access_logs=[{"timestamp": "2026-05-01T10:00:00Z", "user_name": "alice",
+                      "user_email": "a@b", "action": "viewed"}],
+    )
+    empty_store._status_cache.mark_completed("MEET_LOGS")  # noqa: SLF001
+
+    empty_store.force_refresh()
+
+    assert (detail_dir / ".complete").exists()
+
+
+def test_force_refresh_skips_missing_from_api_stubs(
+    empty_store: MeetingStore, cache_root: Path,
+) -> None:
+    """Stubs for transcripts deleted on Fireflies' side can never gain access
+    logs — refetching them just produces another stub."""
+    detail_dir = _seed_disk_meeting(
+        cache_root, "MEET_GHOST",
+        access_logs=[],
+        summary_status="missing_from_api",
+    )
+    empty_store._status_cache.mark_completed("MEET_GHOST")  # noqa: SLF001
+
+    empty_store.force_refresh()
+
+    assert (detail_dir / ".complete").exists()
