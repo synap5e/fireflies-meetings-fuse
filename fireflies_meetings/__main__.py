@@ -554,6 +554,7 @@ def cmd_auth_chat(args: argparse.Namespace) -> None:
     print("Opening a browser for OAuth authorization...")
     authorize(creds_path, token_path)
     print(f"Success. Token saved to {token_path}")
+    _restart_service_if_running()
 
 
 def cmd_unmount(args: argparse.Namespace) -> None:
