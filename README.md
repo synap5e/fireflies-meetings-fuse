@@ -18,7 +18,7 @@ Once mounted, your entire meeting history is just files you can `rg`, `cat`, `ba
 
 ## Why
 
-The Fireflies web UI and the GraphQL API are great when you know what you're looking for, but they're a poor fit for "I remember someone mentioning X three weeks ago". A FUSE mount turns the whole archive into something you can pipe through `ripgrep` in 50ms.
+The Fireflies web UI and the GraphQL API are great when you know what you're looking for, but they're a poor fit for "I remember someone mentioning X three weeks ago". A FUSE mount turns the whole archive into something you can pipe through `ripgrep`. Completed meetings are served from a local disk cache, so a full grep is bottlenecked by disk and rg rather than the network. Expect a few seconds for the full archive.
 
 The tree is also a perfect substrate for AI agents — point Claude Code or Cursor at `/views/fireflies-meetings/` and they can answer "find the meeting where we discussed the auth migration" without ever calling an API.
 
