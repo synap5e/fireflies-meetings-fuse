@@ -77,6 +77,44 @@ systemctl --user status fireflies-meetings
 
 The service auto-mounts at `/views/fireflies-meetings/`, restarts on failure, and pre-unmounts any stale mount before starting.
 
+## What each setup enables
+
+Three optional auth tiers, each unlocking more features at the cost of broader trust. Tier 1 is required; the rest are opt-in.
+
+### Tier 1 — Fireflies API key (required)
+
+`FIREFLIES_API_KEY` in `.env` or `~/.config/fireflies-meetings/api_key`.
+
+- **Talks to**: `api.fireflies.ai/graphql`. Public, documented Fireflies GraphQL API only.
+- **Enables**: the full filesystem of completed meetings — summaries, transcripts, participants, the `mine/` subtree, `ripgrep` search.
+- **Limits**: live meetings only appear once Fireflies has finished processing them. The public `transcript.sentences` field is unreliable while a meeting is still recording.
+
+### Tier 2 — Fireflies web session (optional)
+
+```bash
+uv run fireflies-meetings auth-session
+```
+
+Captures your Chrome/Chromium session cookies for `app.fireflies.ai` to `~/.config/fireflies-meetings/session.json`. The daemon also does a non-interactive cookie refresh at startup if the desktop keyring is available; override the browser/profile with `FIREFLIES_SESSION_BROWSER` / `FIREFLIES_SESSION_PROFILE`.
+
+- **Talks to**: Fireflies' **internal, undocumented** web-app endpoints — `app.fireflies.ai/api/v4/hive`, `app.fireflies.ai/api/v4/graphql`, `realtime.firefliesapp.com` — using your browser session cookies.
+- **Enables**: Socket.IO live caption streaming, the `getUserMeetingsForStatus` supplement (recent meetings the public list hasn't returned yet), `views.md` access logs (who viewed each meeting on the web app), and a fallback for when the public `transcripts` query is broken.
+- **Implications**: these endpoints are not public and can change without notice. The daemon reads your encrypted Chrome cookie store via the system keyring to keep the session fresh.
+
+### Tier 3 — Google Chat OAuth (optional)
+
+```bash
+uv run fireflies-meetings auth-chat
+```
+
+Requires your own Google Cloud OAuth client (Chat API enabled, scopes `chat.messages.readonly` + `chat.spaces.readonly`). Save the client-secret JSON to `./secrets/client_secret_*.json` or `~/.config/fireflies-meetings/google_chat_credentials.json`.
+
+- **Talks to**: Google Chat API on your behalf.
+- **Enables**: pre-ingest live-meeting discovery — polls your Chat spaces for the `app.fireflies.ai/live/<id>` URLs the Fireflies bot posts when it joins a Meet. The only working live-discovery path for non-admin Fireflies accounts.
+- **Implications**: the daemon reads (read-only) all messages in your Chat spaces every 30 s. Only the Fireflies URLs are extracted; nothing else is stored.
+
+See [Live meetings](#live-meetings) for how Tiers 2 and 3 interact to capture live transcripts.
+
 ## Live meetings
 
 Live meetings split into two independent problems: *discovery* (which meeting IDs are live right now) and *content* (fetch the partial transcript). Each needs its own auth.
@@ -96,27 +134,7 @@ Without (2) or (3), live meetings only appear once Fireflies has finished proces
 
 A session JSON also enables a `getUserMeetingsForStatus` supplement that fills in recent meetings the public list hasn't returned yet.
 
-### Setup: Google Chat OAuth
-
-Required only for non-admin accounts that want pre-ingest live discovery. Create an OAuth client in Google Cloud Console with the Chat API enabled and scopes `chat.messages.readonly` + `chat.spaces.readonly`. Save the downloaded JSON to `./secrets/client_secret_*.json` (or `~/.config/fireflies-meetings/google_chat_credentials.json`), then:
-
-```bash
-uv run fireflies-meetings auth-chat
-```
-
-Runs the OAuth flow, saves the token to `~/.config/fireflies-meetings/google_chat_token.json`, and restarts the user service if running. Without the token the daemon logs a warning and skips Chat discovery.
-
-### Setup: Fireflies web session
-
-```bash
-uv run fireflies-meetings auth-session
-```
-
-Reads the current Chrome session cookies for `app.fireflies.ai`, writes them to `~/.config/fireflies-meetings/session.json`, and restarts the user service if running. If the browser session is stale it opens Fireflies' login page and waits for sign-in.
-
-Tokens can also be set via env vars (see Configuration), but `auth-session` is the supported path.
-
-The daemon does a best-effort non-interactive refresh from local browser cookies at startup. If Chrome/Chromium already has a valid Fireflies session and the desktop keyring is available, the service refreshes `session.json` itself. Override the browser/profile with `FIREFLIES_SESSION_BROWSER` and `FIREFLIES_SESSION_PROFILE`.
+Setup for the session JSON and the Chat OAuth token is covered above under [What each setup enables](#what-each-setup-enables). Both `auth-session` and `auth-chat` restart the user service if it's running, and the daemon logs a copy-pasteable re-auth command when a token goes stale.
 
 ## Filesystem layout
 
@@ -234,4 +252,4 @@ All three should be clean before sending a PR. The codebase follows a Pydantic-a
 
 ## Status & disclaimer
 
-Unofficial. Not affiliated with or endorsed by Fireflies.ai. Built against the public Fireflies GraphQL API; if they break it, this will too.
+Unofficial. Not affiliated with or endorsed by Fireflies.ai. The baseline (Tier 1) is built against the public Fireflies GraphQL API; if they break it, this will too. The optional Tier 2 (`auth-session`) additionally calls Fireflies' internal web-app endpoints with your browser session cookies — those endpoints are undocumented and can change without notice. See [What each setup enables](#what-each-setup-enables) for the full picture.
