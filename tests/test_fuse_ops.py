@@ -84,7 +84,7 @@ def _make_overlap_meeting(
 
 
 def test_dynamic_read_uses_cached_live_bytes(tmp_path: Path) -> None:
-    status_cache = StatusCache(cache_dir=tmp_path / "cache" / "completed")
+    status_cache = StatusCache(cache_dir=tmp_path / "cache")
     meeting = _make_live_meeting()
     detail = TranscriptDetail(meeting=meeting)
     client = _FakeClient(detail)
@@ -134,7 +134,7 @@ def test_dynamic_read_uses_cached_live_bytes(tmp_path: Path) -> None:
 
 
 def test_overlap_warning_and_subdir_are_exposed_by_lookup(tmp_path: Path) -> None:
-    status_cache = StatusCache(cache_dir=tmp_path / "cache" / "completed")
+    status_cache = StatusCache(cache_dir=tmp_path / "cache")
     primary = _make_overlap_meeting("PRIMARY01", duration_mins=60.0)
     overlap = _make_overlap_meeting("OVERLAP01", duration_mins=10.0, epoch_offset_ms=5 * 60_000.0)
     client = _ListClient([overlap, primary])

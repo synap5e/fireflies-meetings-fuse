@@ -135,6 +135,31 @@ def test_save_detail_writes_sentinel_after_files(
     assert (detail_dir / ".complete").exists(), ".complete sentinel must be written"
 
 
+def test_is_completed_reads_sentinel(cache_root: Path) -> None:
+    """is_completed() now reads the .complete sentinel directly, not a separate
+    completed/<id> marker — that pre-consolidation source of truth is gone.
+    """
+    status = StatusCache(cache_dir=cache_root)
+    detail_dir = cache_root / "detail" / "MEET01"
+    detail_dir.mkdir(parents=True)
+
+    assert not status.is_completed("MEET01"), "no sentinel = not completed"
+    (detail_dir / ".complete").touch()
+    assert status.is_completed("MEET01"), "sentinel present = completed"
+
+
+def test_legacy_completed_dir_is_purged_on_init(cache_root: Path) -> None:
+    """A pre-consolidation `completed/` marker dir is deleted at construction."""
+    legacy = cache_root / "completed"
+    legacy.mkdir(parents=True)
+    (legacy / "MEET01").touch()
+    (legacy / "MEET02").touch()
+
+    StatusCache(cache_dir=cache_root)
+
+    assert not legacy.exists(), "legacy completed/ dir should have been purged"
+
+
 def _meeting(
     meeting_id: str,
     *,

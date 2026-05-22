@@ -58,7 +58,7 @@ def test_normalize_stream_sentence_parses_fireflies_event() -> None:
 
 
 def test_stream_update_replaces_same_row(tmp_path: Path) -> None:
-    status_cache = StatusCache(cache_dir=tmp_path / "cache" / "completed")
+    status_cache = StatusCache(cache_dir=tmp_path / "cache")
     meeting = _make_live_meeting()
     detail = TranscriptDetail(meeting=meeting)
     client = _FakeClient(detail)
@@ -99,7 +99,7 @@ def test_stream_update_replaces_same_row(tmp_path: Path) -> None:
 
 
 def test_stream_update_replaces_same_nonnumeric_row(tmp_path: Path) -> None:
-    status_cache = StatusCache(cache_dir=tmp_path / "cache" / "completed")
+    status_cache = StatusCache(cache_dir=tmp_path / "cache")
     meeting = _make_live_meeting()
     detail = TranscriptDetail(meeting=meeting)
     store = MeetingStore(
@@ -142,7 +142,7 @@ def test_stream_update_replaces_same_nonnumeric_row(tmp_path: Path) -> None:
 
 
 def test_stream_update_preserves_api_baseline(tmp_path: Path) -> None:
-    status_cache = StatusCache(cache_dir=tmp_path / "cache" / "completed")
+    status_cache = StatusCache(cache_dir=tmp_path / "cache")
     meeting = _make_live_meeting()
     detail = TranscriptDetail(
         meeting=meeting,
@@ -188,7 +188,7 @@ def test_live_cache_reused_until_detail_ttl_expires(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    status_cache = StatusCache(cache_dir=tmp_path / "cache" / "completed")
+    status_cache = StatusCache(cache_dir=tmp_path / "cache")
     meeting = _make_live_meeting()
     detail = TranscriptDetail(meeting=meeting)
     client = _FakeClient(detail)
