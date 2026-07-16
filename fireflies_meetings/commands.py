@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
+import gc
 from dataclasses import dataclass
 from typing import Literal
 
@@ -15,6 +18,22 @@ from .projection import (
     ProjectionBuildOptions,
     build_projection_from_captures,
 )
+
+_libc_name = ctypes.util.find_library("c")
+_libc = ctypes.CDLL(_libc_name) if _libc_name else None
+
+
+def _return_freed_arenas_to_os() -> None:
+    """Release glibc heap arenas back to the OS after a projection rebuild.
+
+    Each rebuild transiently allocates ~800 MB of Pydantic models; glibc
+    grows its per-thread arenas to fit the peak and does not shrink them
+    unless asked. Without this, RSS creeps up on every command even though
+    Python has already released the objects.
+    """
+    gc.collect()
+    if _libc is not None:
+        _libc.malloc_trim(0)
 
 
 @dataclass(frozen=True)
@@ -138,3 +157,4 @@ class CommandProcessor:
                 chat_auth_fatal=self._chat_auth_fatal,
             ),
         )
+        _return_freed_arenas_to_os()
