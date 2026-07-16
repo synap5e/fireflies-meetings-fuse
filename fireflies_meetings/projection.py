@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections import defaultdict
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Literal
 
@@ -66,10 +66,10 @@ class ProjectedNode:
 @dataclass(frozen=True)
 class ProjectedMeeting:
     meeting: Meeting
-    detail: TranscriptDetail
     files: MappingProxyType[str, bytes]
     capture_state: CaptureState
     primary_path: str | None
+    overlap_warning: bytes = b""
     live_path: str | None = None
     mine_path: str | None = None
     ghost_id: str | None = None
@@ -165,29 +165,20 @@ def build_projection_from_captures(
         for dirname, meeting in resolved.items():
             dirname_by_id[meeting.id] = dirname
 
+    sentences_by_id: dict[str, tuple[Sentence, ...]] = {}
+    ctx = _BuildContext(
+        snapshot=snapshot,
+        live_rows=live_rows,
+        hidden_ids=hidden_ids,
+        dirname_by_id=dirname_by_id,
+        folded_ghosts=folded_ghosts,
+        folded_overlaps=folded_overlaps,
+        diag=diag,
+        sentences_by_id=sentences_by_id,
+    )
     for meeting_id, meeting in meetings.items():
-        detail_capture = snapshot.details.get(meeting_id)
-        access_logs = list(snapshot.access_logs.get(meeting_id, ()))
-        has_access_log_capture = meeting_id in snapshot.access_logs
-        detail = _project_detail(meeting, detail_capture, access_logs, live_rows.get(meeting_id))
-        state = _capture_state(
-            meeting,
-            detail_capture,
-            has_access_log_capture,
-            live_rows.get(meeting_id),
-        )
-        files = MappingProxyType(_render_projected_files(meeting, detail, state, has_access_log_capture))
-        primary_path = _primary_path(meeting, dirname_by_id.get(meeting_id)) if meeting_id not in hidden_ids else None
-        projected_by_id[meeting_id] = ProjectedMeeting(
-            meeting=meeting,
-            detail=detail,
-            files=files,
-            capture_state=state,
-            primary_path=primary_path,
-            ghost_id=folded_ghosts.get(meeting_id),
-            overlap_ids=folded_overlaps.get(meeting_id, ()),
-            diagnostic=diag.get(meeting_id, BackfillDiagnostic()),
-        )
+        projected_by_id[meeting_id] = _build_projected_meeting(meeting_id, meeting, ctx)
+    _collect_overlap_sentences(folded_overlaps, projected_by_id, sentences_by_id, snapshot)
 
     live_dirnames = _live_dirnames([m for m in meetings.values() if m.is_live and m.date_str])
     projected_by_id = _attach_secondary_paths(
@@ -196,6 +187,7 @@ def build_projection_from_captures(
         live_dirnames=live_dirnames,
         user_email=opts.user_email,
     )
+    projected_by_id = _attach_overlap_warnings(projected_by_id, sentences_by_id)
     nodes = _build_nodes(projected_by_id, live_dirnames, user_email=opts.user_email)
     return Projection(
         nodes=MappingProxyType(nodes),
@@ -205,6 +197,61 @@ def build_projection_from_captures(
         auth_fatal=opts.auth_fatal,
         chat_auth_fatal=opts.chat_auth_fatal,
     )
+
+
+@dataclass(frozen=True)
+class _BuildContext:
+    snapshot: CaptureSnapshot
+    live_rows: dict[str, dict[str, Sentence]]
+    hidden_ids: set[str]
+    dirname_by_id: dict[str, str]
+    folded_ghosts: dict[str, str]
+    folded_overlaps: dict[str, tuple[str, ...]]
+    diag: dict[str, BackfillDiagnostic]
+    sentences_by_id: dict[str, tuple[Sentence, ...]]
+
+
+def _build_projected_meeting(
+    meeting_id: str,
+    meeting: Meeting,
+    ctx: _BuildContext,
+) -> ProjectedMeeting:
+    detail_capture = ctx.snapshot.details.get(meeting_id)
+    access_logs = list(ctx.snapshot.access_logs.get(meeting_id, ()))
+    has_access_log_capture = meeting_id in ctx.snapshot.access_logs
+    detail = _project_detail(meeting, detail_capture, access_logs, ctx.live_rows.get(meeting_id))
+    state = _capture_state(meeting, detail_capture, has_access_log_capture, ctx.live_rows.get(meeting_id))
+    files = MappingProxyType(_render_projected_files(meeting, detail, state, has_access_log_capture))
+    primary_path = (
+        None if meeting_id in ctx.hidden_ids
+        else _primary_path(meeting, ctx.dirname_by_id.get(meeting_id))
+    )
+    overlap_ids = ctx.folded_overlaps.get(meeting_id, ())
+    if overlap_ids:
+        ctx.sentences_by_id[meeting_id] = tuple(detail.sentences)
+    return ProjectedMeeting(
+        meeting=meeting,
+        files=files,
+        capture_state=state,
+        primary_path=primary_path,
+        ghost_id=ctx.folded_ghosts.get(meeting_id),
+        overlap_ids=overlap_ids,
+        diagnostic=ctx.diag.get(meeting_id, BackfillDiagnostic()),
+    )
+
+
+def _collect_overlap_sentences(
+    folded_overlaps: dict[str, tuple[str, ...]],
+    projected_by_id: dict[str, ProjectedMeeting],
+    sentences_by_id: dict[str, tuple[Sentence, ...]],
+    snapshot: CaptureSnapshot,
+) -> None:
+    for overlap_ids in folded_overlaps.values():
+        for overlap_id in overlap_ids:
+            if overlap_id in projected_by_id and overlap_id not in sentences_by_id:
+                overlap_detail_capture = snapshot.details.get(overlap_id)
+                if overlap_detail_capture is not None:
+                    sentences_by_id[overlap_id] = tuple(overlap_detail_capture.sentences)
 
 
 def _meeting_map(snapshot: CaptureSnapshot) -> dict[str, Meeting]:
@@ -389,10 +436,10 @@ def _attach_secondary_paths(
         primary_path = _primary_path(meeting, dirname_by_id.get(meeting_id))
         result[meeting_id] = ProjectedMeeting(
             meeting=item.meeting,
-            detail=item.detail,
             files=item.files,
             capture_state=item.capture_state,
             primary_path=primary_path,
+            overlap_warning=item.overlap_warning,
             live_path=live_path_by_id.get(meeting_id),
             mine_path=mine_path,
             ghost_id=item.ghost_id,
@@ -400,6 +447,26 @@ def _attach_secondary_paths(
             overlap_dirnames=overlap_dirnames,
             diagnostic=item.diagnostic,
         )
+    return result
+
+
+def _attach_overlap_warnings(
+    projected: dict[str, ProjectedMeeting],
+    sentences_by_id: dict[str, tuple[Sentence, ...]],
+) -> dict[str, ProjectedMeeting]:
+    result: dict[str, ProjectedMeeting] = {}
+    for meeting_id, item in projected.items():
+        if not item.overlap_dirnames:
+            result[meeting_id] = item
+            continue
+        primary_sentences = sentences_by_id.get(meeting_id, ())
+        overlaps = [
+            (dirname, overlap_id, sentences_by_id.get(overlap_id, ()))
+            for dirname, overlap_id in item.overlap_dirnames.items()
+            if overlap_id in projected
+        ]
+        warning = _render_overlap_warning(primary_sentences, overlaps)
+        result[meeting_id] = replace(item, overlap_warning=warning)
     return result
 
 
@@ -520,7 +587,7 @@ def _add_folded_meeting_files(
     if item.overlap_dirnames:
         add_file(
             f"{base_path}/_overlap_warning.md",
-            _render_overlap_warning(item, meetings),
+            item.overlap_warning,
             item.meeting.id,
             "_overlap_warning.md",
         )
@@ -582,22 +649,19 @@ def _render_backfill_summary(meetings: dict[str, ProjectedMeeting]) -> bytes:
 
 
 def _render_overlap_warning(
-    primary: ProjectedMeeting,
-    meetings: dict[str, ProjectedMeeting],
+    primary_sentences: tuple[Sentence, ...],
+    overlaps: list[tuple[str, str, tuple[Sentence, ...]]],
 ) -> bytes:
     primary_texts = {
         normalized
-        for sentence in primary.detail.sentences
+        for sentence in primary_sentences
         if (normalized := _normalize_sentence_text(sentence.text))
     }
     missing_by_overlap: list[tuple[str, str, list[Sentence]]] = []
-    for dirname, overlap_id in primary.overlap_dirnames.items():
-        overlap = meetings.get(overlap_id)
-        if overlap is None:
-            continue
+    for dirname, overlap_id, overlap_sentences in overlaps:
         missing = [
             sentence
-            for sentence in overlap.detail.sentences
+            for sentence in overlap_sentences
             if (normalized := _normalize_sentence_text(sentence.text))
             and normalized not in primary_texts
         ]
