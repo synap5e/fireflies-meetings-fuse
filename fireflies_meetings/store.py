@@ -230,7 +230,7 @@ class MeetingStore:
             return
         try:
             channels = self._client.list_channels()
-            memberships = self._client.list_channel_memberships()
+            memberships = self._client.list_channel_memberships([c.id for c in channels])
         except httpx.HTTPError as e:
             log.warning("Channels refresh failed: %s", e)
             return

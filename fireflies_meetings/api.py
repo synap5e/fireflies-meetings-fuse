@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import time
-from collections import defaultdict
 from datetime import UTC, datetime
 from typing import NoReturn
 
@@ -970,34 +969,52 @@ class FirefliesClient:
                 log.warning("Skipping malformed channel: %s", e)
         return channels
 
-    def list_channel_memberships(self) -> dict[str, list[str]] | None:
-        """Return channel_id -> [meeting_ids] mapping for all channels.
+    def list_channel_memberships(self, channel_ids: list[str]) -> dict[str, list[str]] | None:
+        """Return channel_id -> [meeting_ids] mapping for the given channels.
 
-        Uses the internal hive API `getChannelMeetings(channelId="all")`
-        with a lean per-meeting projection (`parseId + channelIds`) and
-        inverts client-side. Returns None if no session auth is configured
-        or the call fails (so callers can distinguish "no data" from
-        "empty map").
+        Calls `fetchChannelMeetings(channelId=<id>)` per channel, matching
+        what the Fireflies dashboard does. The alias `channelId="all"` on
+        the same endpoint appears to return only tagged meetings (or some
+        truncated set), which under-counts membership; per-channel is the
+        reliable path.
+
+        Returns None if no session auth is configured or any call fails
+        outright, so callers can distinguish "no data" from a valid but
+        empty mapping.
         """
         if self._hive_client is None:
             return None
-        memberships: dict[str, list[str]] = defaultdict(list)
+        memberships: dict[str, list[str]] = {}
+        for channel_id in channel_ids:
+            meeting_ids = self._fetch_channel_member_ids(channel_id)
+            if meeting_ids is None:
+                return None
+            if meeting_ids:
+                memberships[channel_id] = meeting_ids
+        return memberships
+
+    def _fetch_channel_member_ids(self, channel_id: str) -> list[str] | None:
+        assert self._hive_client is not None
+        ids: list[str] = []
         offset = 0
         while True:
-            page = self._fetch_memberships_page(offset)
+            page = self._fetch_memberships_page(channel_id, offset)
             if page is None:
                 return None
             if not page:
                 break
-            for parse_id, channel_ids in page:
-                for cid in channel_ids:
-                    memberships[cid].append(parse_id)
+            for parse_id, _channel_ids in page:
+                ids.append(parse_id)
             if len(page) < _PAGE_SIZE:
                 break
             offset += _PAGE_SIZE
-        return dict(memberships)
+        return ids
 
-    def _fetch_memberships_page(self, offset: int) -> list[tuple[str, list[str]]] | None:
+    def _fetch_memberships_page(
+        self,
+        channel_id: str,
+        offset: int,
+    ) -> list[tuple[str, list[str]]] | None:
         assert self._hive_client is not None
         try:
             resp = self._hive_client.post(
@@ -1005,13 +1022,13 @@ class FirefliesClient:
                 json={
                     "operationName": "fetchChannelMeetings",
                     "query": _HIVE_MEMBERSHIPS_QUERY,
-                    "variables": {"from": offset, "size": _PAGE_SIZE, "channelId": "all"},
+                    "variables": {"from": offset, "size": _PAGE_SIZE, "channelId": channel_id},
                 },
             )
             resp.raise_for_status()
             body: JsonObject = resp.json()
         except (httpx.HTTPError, json.JSONDecodeError, ValueError) as e:
-            log.warning("Channel memberships fetch failed at offset %d: %s", offset, e)
+            log.warning("Channel %s memberships fetch failed at offset %d: %s", channel_id, offset, e)
             return None
         data = body.get("data")
         outer = data.get("getChannelMeetings") if isinstance(data, dict) else None
@@ -1024,9 +1041,12 @@ class FirefliesClient:
                 continue
             parse_id = raw.get("parseId")
             channel_ids = raw.get("channelIds")
-            if not isinstance(parse_id, str) or not isinstance(channel_ids, list):
+            if not isinstance(parse_id, str):
                 continue
-            page.append((parse_id, [cid for cid in channel_ids if isinstance(cid, str)]))
+            channel_id_list: list[str] = []
+            if isinstance(channel_ids, list):
+                channel_id_list = [cid for cid in channel_ids if isinstance(cid, str)]
+            page.append((parse_id, channel_id_list))
         return page
 
     def get_transcript(self, meeting_id: str) -> TranscriptDetail:
