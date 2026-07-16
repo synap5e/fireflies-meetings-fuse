@@ -10,7 +10,7 @@ from types import MappingProxyType
 from typing import Literal
 
 from .capture import CaptureSnapshot
-from .models import AccessLogEntry, Meeting, Sentence, TranscriptDetail
+from .models import AccessLogEntry, Channel, Meeting, Sentence, TranscriptDetail
 from .renderer import (
     render_meeting_json,
     render_open_script,
@@ -188,7 +188,13 @@ def build_projection_from_captures(
         user_email=opts.user_email,
     )
     projected_by_id = _attach_overlap_warnings(projected_by_id, sentences_by_id)
-    nodes = _build_nodes(projected_by_id, live_dirnames, user_email=opts.user_email)
+    nodes = _build_nodes(
+        projected_by_id,
+        live_dirnames,
+        user_email=opts.user_email,
+        channels=snapshot.channels,
+        channel_memberships=snapshot.channel_memberships,
+    )
     return Projection(
         nodes=MappingProxyType(nodes),
         meetings=MappingProxyType(projected_by_id),
@@ -499,6 +505,8 @@ def _build_nodes(
     live_dirnames: dict[str, str],
     *,
     user_email: str | None,
+    channels: tuple[Channel, ...] = (),
+    channel_memberships: dict[str, tuple[str, ...]] | None = None,
 ) -> dict[str, ProjectedNode]:
     children: dict[str, dict[str, bool]] = defaultdict(dict)
     files: dict[str, ProjectedNode] = {}
@@ -547,6 +555,13 @@ def _build_nodes(
             dynamic=True,
             meeting_id=meeting_id,
         )
+
+    _add_channel_symlinks(
+        _NodeBuilders(add_dir=add_dir, symlinks=symlinks, children=children),
+        meetings,
+        channels,
+        channel_memberships or {},
+    )
 
     add_file("/BACKFILL_IN_PROGRESS", _render_backfill_summary(meetings))
 
@@ -604,6 +619,86 @@ def _add_files_under(
 ) -> None:
     for filename in MEETING_FILES:
         add_file(f"{base_path}/{filename}", item.files[filename], item.meeting.id, filename)
+
+
+@dataclass(frozen=True)
+class _NodeBuilders:
+    add_dir: Callable[[str], None]
+    symlinks: dict[str, ProjectedNode]
+    children: dict[str, dict[str, bool]]
+
+
+def _add_channel_symlinks(
+    builders: _NodeBuilders,
+    meetings: dict[str, ProjectedMeeting],
+    channels: tuple[Channel, ...],
+    memberships: dict[str, tuple[str, ...]],
+) -> None:
+    if not channels:
+        return
+    builders.add_dir("/channels")
+    channel_dirnames = _resolve_channel_dirnames(channels)
+    for channel in channels:
+        member_ids = memberships.get(channel.id, ())
+        if not member_ids:
+            continue
+        dirname = channel_dirnames.get(channel.id)
+        if dirname is None:
+            continue
+        channel_path = f"/channels/{dirname}"
+        member_pairs = [
+            (mid, meetings[mid]) for mid in member_ids
+            if mid in meetings and meetings[mid].primary_path is not None
+        ]
+        if not member_pairs:
+            continue
+        builders.add_dir(channel_path)
+        member_dirnames = _resolve_member_dirnames(member_pairs)
+        for mid, name in member_dirnames.items():
+            item = meetings[mid]
+            if item.primary_path is None:
+                continue
+            path = f"{channel_path}/{name}"
+            builders.children[channel_path][name] = False
+            builders.symlinks[path] = ProjectedNode(
+                kind="symlink",
+                target=f"../..{item.primary_path}".encode(),
+                meeting_id=mid,
+            )
+
+
+def _resolve_channel_dirnames(channels: tuple[Channel, ...]) -> dict[str, str]:
+    seen: dict[str, str] = {}
+    used: dict[str, int] = {}
+    for channel in channels:
+        base = slugify(channel.title) if channel.title else channel.id[:12]
+        if not base:
+            base = channel.id[:12]
+        if base not in used:
+            used[base] = 1
+            seen[channel.id] = base
+        else:
+            used[base] += 1
+            seen[channel.id] = f"{base}-{used[base]}"
+    return seen
+
+
+def _resolve_member_dirnames(
+    members: list[tuple[str, ProjectedMeeting]],
+) -> dict[str, str]:
+    result: dict[str, str] = {}
+    used: dict[str, int] = {}
+    for mid, item in members:
+        date_prefix = item.meeting.date_str or ""
+        slug = item.meeting.slug or mid[:12]
+        base = f"{date_prefix}-{slug}" if date_prefix else slug
+        if base not in used:
+            used[base] = 1
+            result[mid] = base
+        else:
+            used[base] += 1
+            result[mid] = f"{base}-{used[base]}"
+    return result
 
 
 def _add_meeting_tree(

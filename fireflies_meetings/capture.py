@@ -11,7 +11,7 @@ import logging
 import os
 import re
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
@@ -19,7 +19,7 @@ from typing import cast
 from pydantic import ValidationError
 
 from .api import JsonObject
-from .models import AccessLogEntry, Meeting, TranscriptDetail
+from .models import AccessLogEntry, Channel, Meeting, TranscriptDetail
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +47,8 @@ class CaptureSnapshot:
     meetings: tuple[Meeting, ...]
     details: dict[str, TranscriptDetail]
     access_logs: dict[str, tuple[AccessLogEntry, ...]]
+    channels: tuple[Channel, ...] = ()
+    channel_memberships: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 class CaptureStore:
@@ -62,6 +64,10 @@ class CaptureStore:
         return self.cache_dir / "list.json"
 
     @property
+    def channels_path(self) -> Path:
+        return self.cache_dir / "channels.json"
+
+    @property
     def meetings_dir(self) -> Path:
         return self.cache_dir / "meetings"
 
@@ -72,10 +78,57 @@ class CaptureStore:
         return self.meetings_dir / meeting_id / "access_logs.json"
 
     def read_snapshot(self) -> CaptureSnapshot:
+        channels, memberships = self.read_channels()
         return CaptureSnapshot(
             meetings=tuple(self.read_list()),
             details=self.read_details(),
             access_logs=self.read_access_logs(),
+            channels=channels,
+            channel_memberships=memberships,
+        )
+
+    def read_channels(self) -> tuple[tuple[Channel, ...], dict[str, tuple[str, ...]]]:
+        try:
+            raw: object = json.loads(self.channels_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return (), {}
+        if not isinstance(raw, dict):
+            return (), {}
+        typed = cast("JsonObject", raw)
+        raw_channels = typed.get("channels")
+        channels: list[Channel] = []
+        if isinstance(raw_channels, list):
+            for item in raw_channels:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    channels.append(Channel.model_validate(item))
+                except ValidationError as e:
+                    log.warning("Skipping malformed captured channel: %s", e)
+        memberships: dict[str, tuple[str, ...]] = {}
+        raw_memberships = typed.get("memberships")
+        if isinstance(raw_memberships, dict):
+            for channel_id, ids in raw_memberships.items():
+                if not isinstance(ids, list):
+                    continue
+                memberships[channel_id] = tuple(mid for mid in ids if isinstance(mid, str))
+        return tuple(channels), memberships
+
+    def write_channels(
+        self,
+        channels: list[Channel],
+        memberships: dict[str, list[str]],
+        *,
+        fetched_at: float,
+    ) -> None:
+        atomic_write_bytes(
+            self.channels_path,
+            _dump_json_bytes({
+                "v": 1,
+                "fetched_at": fetched_at,
+                "channels": [channel.model_dump() for channel in channels],
+                "memberships": {cid: list(ids) for cid, ids in memberships.items()},
+            }),
         )
 
     def read_list(self) -> list[Meeting]:

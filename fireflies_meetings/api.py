@@ -5,13 +5,14 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections import defaultdict
 from datetime import UTC, datetime
 from typing import NoReturn
 
 import httpx
 from pydantic import ValidationError
 
-from .models import AccessLogEntry, Meeting, Sentence, TranscriptDetail
+from .models import AccessLogEntry, Channel, Meeting, Sentence, TranscriptDetail
 from .session_auth import SessionAuth, internal_request_headers
 
 log = logging.getLogger(__name__)
@@ -380,6 +381,33 @@ def _hive_meeting_to_dict(raw: JsonObject) -> JsonObject:
 # transcript object exists yet. Same hive endpoint, same session JWT auth
 # as `_HIVE_LIST_QUERY`, but a different operation. Used as a supplemental
 # real-time source on top of the public list.
+_HIVE_CHANNELS_LIST_QUERY = """\
+query getChannelsList {
+  getChannelsList {
+    _id
+    title
+    createdBy
+    isPrivate
+    memberCount
+  }
+}"""
+
+# Same operation as _HIVE_LIST_QUERY but a lean projection: we only want
+# the meeting id and its channel membership. Runs against the "all"
+# channel so one paged call gives us memberships for every meeting the
+# user has access to.
+_HIVE_MEMBERSHIPS_QUERY = """\
+query fetchChannelMeetings($from: Int!, $size: Int!, $channelId: String!) {
+  getChannelMeetings(from: $from, size: $size, channelId: $channelId) {
+    total
+    meetings {
+      parseId
+      channelIds
+    }
+  }
+}"""
+
+
 _HIVE_STATUS_QUERY = """\
 query getUserMeetingsForStatus(
   $start: String, $end: String, $batch: Int,
@@ -905,6 +933,101 @@ class FirefliesClient:
                 skipped_dateless,
             )
         return meetings
+
+    def list_channels(self) -> list[Channel]:
+        """List all channels the session user has access to.
+
+        Uses the internal hive API; returns [] if no session auth is
+        configured or the call fails.
+        """
+        if self._hive_client is None:
+            return []
+        try:
+            resp = self._hive_client.post(
+                _HIVE_ENDPOINT,
+                json={
+                    "operationName": "getChannelsList",
+                    "query": _HIVE_CHANNELS_LIST_QUERY,
+                    "variables": {},
+                },
+            )
+            resp.raise_for_status()
+            body: JsonObject = resp.json()
+        except (httpx.HTTPError, json.JSONDecodeError, ValueError) as e:
+            log.warning("Channels list fetch failed: %s", e)
+            return []
+        data = body.get("data")
+        raw_list = data.get("getChannelsList") if isinstance(data, dict) else None
+        if not isinstance(raw_list, list):
+            return []
+        channels: list[Channel] = []
+        for raw in raw_list:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                channels.append(Channel.model_validate(raw))
+            except ValidationError as e:
+                log.warning("Skipping malformed channel: %s", e)
+        return channels
+
+    def list_channel_memberships(self) -> dict[str, list[str]] | None:
+        """Return channel_id -> [meeting_ids] mapping for all channels.
+
+        Uses the internal hive API `getChannelMeetings(channelId="all")`
+        with a lean per-meeting projection (`parseId + channelIds`) and
+        inverts client-side. Returns None if no session auth is configured
+        or the call fails (so callers can distinguish "no data" from
+        "empty map").
+        """
+        if self._hive_client is None:
+            return None
+        memberships: dict[str, list[str]] = defaultdict(list)
+        offset = 0
+        while True:
+            page = self._fetch_memberships_page(offset)
+            if page is None:
+                return None
+            if not page:
+                break
+            for parse_id, channel_ids in page:
+                for cid in channel_ids:
+                    memberships[cid].append(parse_id)
+            if len(page) < _PAGE_SIZE:
+                break
+            offset += _PAGE_SIZE
+        return dict(memberships)
+
+    def _fetch_memberships_page(self, offset: int) -> list[tuple[str, list[str]]] | None:
+        assert self._hive_client is not None
+        try:
+            resp = self._hive_client.post(
+                _HIVE_ENDPOINT,
+                json={
+                    "operationName": "fetchChannelMeetings",
+                    "query": _HIVE_MEMBERSHIPS_QUERY,
+                    "variables": {"from": offset, "size": _PAGE_SIZE, "channelId": "all"},
+                },
+            )
+            resp.raise_for_status()
+            body: JsonObject = resp.json()
+        except (httpx.HTTPError, json.JSONDecodeError, ValueError) as e:
+            log.warning("Channel memberships fetch failed at offset %d: %s", offset, e)
+            return None
+        data = body.get("data")
+        outer = data.get("getChannelMeetings") if isinstance(data, dict) else None
+        raw_list = outer.get("meetings") if isinstance(outer, dict) else None
+        if not isinstance(raw_list, list):
+            return []
+        page: list[tuple[str, list[str]]] = []
+        for raw in raw_list:
+            if not isinstance(raw, dict):
+                continue
+            parse_id = raw.get("parseId")
+            channel_ids = raw.get("channelIds")
+            if not isinstance(parse_id, str) or not isinstance(channel_ids, list):
+                continue
+            page.append((parse_id, [cid for cid in channel_ids if isinstance(cid, str)]))
+        return page
 
     def get_transcript(self, meeting_id: str) -> TranscriptDetail:
         """Fetch full transcript detail including sentences and summary."""

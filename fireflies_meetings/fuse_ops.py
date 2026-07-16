@@ -610,6 +610,11 @@ class FirefliesMeetingOps(pyfuse3.Operations):
         if is_dir:
             return _make_dir_attr(inode, timeout=self._timeout_for_path(child_path))
 
+        child_node = self._store.projection.node(child_path)
+        if child_node is not None and child_node.kind == "symlink":
+            self._remember_symlink(inode, child_node.target)
+            return _make_symlink_attr(inode, len(child_node.target), timeout=self._timeout_for_path(child_path))
+
         # /live/<meeting-id> entries are symlinks
         if parent_path == f"/{_LIVE_DIR}":
             target = self._store.get_live_symlink_target(child_name)
@@ -661,6 +666,13 @@ class FirefliesMeetingOps(pyfuse3.Operations):
 
             if is_dir:
                 attr = _make_dir_attr(child_inode, timeout=self._timeout_for_path(child_path))
+            elif (child_node := self._store.projection.node(child_path)) is not None and child_node.kind == "symlink":
+                self._remember_symlink(child_inode, child_node.target)
+                attr = _make_symlink_attr(
+                    child_inode,
+                    len(child_node.target),
+                    timeout=self._timeout_for_path(child_path),
+                )
             elif path == f"/{_LIVE_DIR}":
                 target = self._store.get_live_symlink_target(name)
                 if target is None:

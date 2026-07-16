@@ -246,6 +246,7 @@ async def _list_refresh_loop(store: MeetingStore) -> None:
 
     while True:
         await trio.to_thread.run_sync(store.refresh_list_if_needed)
+        await trio.to_thread.run_sync(store.refresh_channels_if_needed)
         await trio.sleep(30)
 
 

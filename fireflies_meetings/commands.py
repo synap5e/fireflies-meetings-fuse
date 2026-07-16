@@ -11,7 +11,7 @@ from typing import Literal
 import trio
 
 from .capture import CaptureStore
-from .models import AccessLogEntry, Meeting, Sentence, TranscriptDetail
+from .models import AccessLogEntry, Channel, Meeting, Sentence, TranscriptDetail
 from .projection import (
     BackfillDiagnostic,
     Projection,
@@ -69,7 +69,21 @@ class StatusSupplemented:
     meetings: list[Meeting]
 
 
-Command = ListRefreshed | DetailFetched | AccessLogsFetched | LiveCaptionArrived | StatusSupplemented
+@dataclass(frozen=True)
+class ChannelsRefreshed:
+    name: Literal["channels-refreshed"]
+    channels: list[Channel]
+    memberships: dict[str, list[str]]
+
+
+Command = (
+    ListRefreshed
+    | DetailFetched
+    | AccessLogsFetched
+    | LiveCaptionArrived
+    | StatusSupplemented
+    | ChannelsRefreshed
+)
 
 
 class CommandProcessor:
@@ -128,6 +142,8 @@ class CommandProcessor:
         elif isinstance(command, AccessLogsFetched):
             self._capture.write_access_logs(command.meeting_id, command.logs)
             invalidate_meeting_id = command.meeting_id
+        elif isinstance(command, ChannelsRefreshed):
+            self._capture.write_channels(command.channels, command.memberships, fetched_at=fetched_at)
         else:
             projected = self.projection.meetings.get(command.meeting_id)
             if projected is not None and projected.capture_state == "captured":

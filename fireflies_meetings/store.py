@@ -22,6 +22,7 @@ from .api import (
 from .capture import CaptureStore
 from .commands import (
     AccessLogsFetched,
+    ChannelsRefreshed,
     CommandProcessor,
     DetailFetched,
     ListRefreshed,
@@ -130,6 +131,8 @@ class MeetingStore:
         self._list_ttl = list_ttl
         self._list_cache_time = 0.0
         self._current_ttl = list_ttl
+        self._channels_ttl = list_ttl * 6  # channels move slowly; refresh 6x rarer
+        self._channels_cache_time = 0.0
         self._lock = threading.RLock()
         self._live_change_callback: Callable[[str], None] | None = None
         self._chat_auth_fatal = False
@@ -145,7 +148,14 @@ class MeetingStore:
         with self._lock:
             if isinstance(
                 command,
-                (ListRefreshed, StatusSupplemented, DetailFetched, AccessLogsFetched, LiveCaptionArrived),
+                (
+                    ListRefreshed,
+                    StatusSupplemented,
+                    DetailFetched,
+                    AccessLogsFetched,
+                    LiveCaptionArrived,
+                    ChannelsRefreshed,
+                ),
             ):
                 _projection, invalidated = self._processor.apply(command, fetched_at=time.time())
                 self._apply_projection()
@@ -206,6 +216,35 @@ class MeetingStore:
         if not is_initial and time.time() - self._list_cache_time < self._current_ttl:
             return
         self._fetch_meetings(is_initial=is_initial)
+
+    def refresh_channels_if_needed(self) -> None:
+        """Refresh channels + memberships if the TTL has expired.
+
+        Cheap in-memory guard first (TTL check), then two internal-API
+        calls: getChannelsList + paginated fetchChannelMeetings("all").
+        Silent on any failure — channels are decorative, not critical.
+        """
+        if self._backoff.is_backed_off:
+            return
+        if time.time() - self._channels_cache_time < self._channels_ttl:
+            return
+        try:
+            channels = self._client.list_channels()
+            memberships = self._client.list_channel_memberships()
+        except httpx.HTTPError as e:
+            log.warning("Channels refresh failed: %s", e)
+            return
+        if memberships is None:
+            return
+        self._apply_command(
+            ChannelsRefreshed(
+                name="channels-refreshed",
+                channels=channels,
+                memberships=memberships,
+            ),
+        )
+        self._channels_cache_time = time.time()
+        log.info("Refreshed %d channels (%d with members)", len(channels), len(memberships))
 
     def mark_list_cache_fresh(self) -> None:
         self._list_cache_time = time.time()

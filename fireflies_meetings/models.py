@@ -212,6 +212,29 @@ class MeetingAttendee(_FFBaseModel):
     email: str = ""
 
 
+class Channel(_FFBaseModel):
+    """A Fireflies channel (called "notebook" in the UI).
+
+    Sourced from the internal `getChannelsList` GraphQL op via the hive
+    endpoint; available only when session auth is configured.
+    """
+
+    id: str = Field(validation_alias=AliasChoices("id", "_id"))
+    title: str = ""
+    is_private: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("is_private", "isPrivate"),
+    )
+    member_count: int = Field(
+        default=0,
+        validation_alias=AliasChoices("member_count", "memberCount"),
+    )
+    created_by: str = Field(
+        default="",
+        validation_alias=AliasChoices("created_by", "createdBy"),
+    )
+
+
 class AccessLogEntry(_FFBaseModel):
     """One row from the Fireflies meeting access log.
 
