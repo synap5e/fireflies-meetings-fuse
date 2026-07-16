@@ -13,10 +13,10 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import pyfuse3
-import trio
 
 from .inode_map import InodeMap
-from .store import MEETING_FILES, MeetingEntry, MeetingStore
+from .projection import MEETING_FILES
+from .store import MeetingEntry, MeetingStore
 
 log = logging.getLogger(__name__)
 
@@ -162,7 +162,6 @@ _SUB_DEPTH_OVERLAP_DIR = 4
 _SUB_DEPTH_OVERLAP_FILE = 5
 _DYNAMIC_TIMEOUT = 0.0
 _STATIC_TIMEOUT = 300.0
-_IN_PROGRESS_FILE = "_in_progress"
 _OVERLAP_WARNING_FILE = "_overlap_warning.md"
 _OVERLAP_WARNING_SIZE = 512
 
@@ -313,35 +312,8 @@ class FirefliesMeetingOps(pyfuse3.Operations):
                 self._symlinks.pop(inode, None)
 
     def _is_dynamic_path(self, path: str) -> bool:
-        if path == f"/{_LIVE_DIR}":
-            return True
-
-        is_mine, sub = _parse_path(path)
-        if not is_mine and len(sub) == 2 and sub[0] == _LIVE_DIR:
-            return True
-        if len(sub) >= _SUB_DEPTH_GHOST_DIR and sub[3] == "ghost":
-            return False
-        if len(sub) >= _SUB_DEPTH_OVERLAP_DIR and (
-            sub[3] == _OVERLAP_WARNING_FILE or _looks_like_overlap_name(sub[3])
-        ):
-            return False
-        if len(sub) not in {_SUB_DEPTH_MEETING, _SUB_DEPTH_FILE}:
-            return False
-
-        year_month, day, slug = sub[:3]
-        date_str = f"{year_month}-{day}"
-        try:
-            meetings = (
-                self._store.list_meetings_mine(date_str) if is_mine
-                else self._store.list_meetings(date_str)
-            )
-            entry = meetings.get(slug)
-        except Exception:
-            log.exception("Error resolving dynamic path %s", path)
-            return False
-        if entry is None:
-            return False
-        return self._store.is_meeting_dynamic(entry.meeting.id)
+        node = self._store.projection.node(path)
+        return node.dynamic if node is not None else False
 
     def _timeout_for_path(self, path: str) -> float:
         _is_mine, sub = _parse_path(path)
@@ -364,7 +336,7 @@ class FirefliesMeetingOps(pyfuse3.Operations):
             if optional_path is not None:
                 candidate_paths.append(optional_path)
 
-        for filename in (*self._store.list_files(meeting_id), _IN_PROGRESS_FILE):
+        for filename in self._store.list_files(meeting_id):
             candidate_paths.append(f"{meeting_dir}/{filename}")
             if mine_path is not None:
                 candidate_paths.append(f"{mine_path}/{filename}")
@@ -463,33 +435,15 @@ class FirefliesMeetingOps(pyfuse3.Operations):
         return entry.meeting.id, sub[2], sub[3]
 
     def _resolve_size(self, path: str) -> int | None:
-        """Cheap size lookup for stat / readdir / lookup. Never blocks on the network.
-
-        Returns None if `path` is not a known file (caller raises ENOENT).
-        Returns 0 if the meeting exists but its content isn't on disk yet —
-        the file appears in directory listings but reads return empty until
-        the backfill task fetches it.
-        """
+        """Cheap size lookup from the in-memory projection."""
         if path == f"/{_AUTH_EXPIRED_NAME}":
             return len(_AUTH_EXPIRED_CONTENT) if self._store.is_auth_fatal else None
         if path == f"/{_CHAT_AUTH_EXPIRED_NAME}":
             return len(_CHAT_AUTH_EXPIRED_CONTENT) if self._store.is_chat_auth_fatal else None
-        warning_parsed = self._resolve_overlap_warning_file(path)
-        if warning_parsed is not None:
-            return _OVERLAP_WARNING_SIZE
-        ghost_parsed = self._resolve_ghost_file(path)
-        if ghost_parsed is not None:
-            meeting_id, _slug, filename = ghost_parsed
-            return self._store.get_ghost_file_size(meeting_id, filename)
-        overlap_parsed = self._resolve_overlap_file(path)
-        if overlap_parsed is not None:
-            meeting_id, _slug, overlap_dirname, filename = overlap_parsed
-            return self._store.get_overlap_file_size(meeting_id, overlap_dirname, filename)
-        parsed = self._resolve_meeting_file(path)
-        if parsed is None:
+        node = self._store.projection.node(path)
+        if node is None or node.kind == "dir":
             return None
-        meeting_id, _slug, filename = parsed
-        return self._store.get_file_size(meeting_id, filename)
+        return node.size
 
     def _resolve_content(self, path: str) -> tuple[bytes | None, bool]:
         """Resolve a file path to its rendered content bytes.
@@ -507,27 +461,10 @@ class FirefliesMeetingOps(pyfuse3.Operations):
                 (_CHAT_AUTH_EXPIRED_CONTENT, True) if self._store.is_chat_auth_fatal
                 else (None, False)
             )
-        warning_parsed = self._resolve_overlap_warning_file(path)
-        if warning_parsed is not None:
-            meeting_id, _slug = warning_parsed
-            return self._store.get_overlap_warning(meeting_id), True
-        ghost_parsed = self._resolve_ghost_file(path)
-        if ghost_parsed is not None:
-            meeting_id, _slug, filename = ghost_parsed
-            return self._store.get_ghost_file(meeting_id, filename), True
-        overlap_parsed = self._resolve_overlap_file(path)
-        if overlap_parsed is not None:
-            meeting_id, _slug, overlap_dirname, filename = overlap_parsed
-            return self._store.get_overlap_file(meeting_id, overlap_dirname, filename), True
-        parsed = self._resolve_meeting_file(path)
-        if parsed is None:
+        node = self._store.projection.node(path)
+        if node is None or node.kind != "file":
             return None, False
-        meeting_id, slug, filename = parsed
-        try:
-            return self._store.get_file(meeting_id, filename)
-        except Exception:
-            log.exception("Error getting file %s for %s", filename, slug)
-            return None, False
+        return node.content, not node.dynamic
 
     def _get_marker_attr(self, inode: int, path: str) -> pyfuse3.EntryAttributes | None:
         if path not in (f"/{_AUTH_EXPIRED_NAME}", f"/{_CHAT_AUTH_EXPIRED_NAME}"):
@@ -574,28 +511,13 @@ class FirefliesMeetingOps(pyfuse3.Operations):
 
     def _list_dir(self, path: str) -> list[tuple[str, bool]]:
         """List directory entries as (name, is_dir) tuples."""
-        is_mine, sub = _parse_path(path)
-        try:
-            if not is_mine and not sub:
-                entries: list[tuple[str, bool]] = [
-                    (m, True) for m in self._store.list_year_months()
-                ]
-                entries.append((_LIVE_DIR, True))
-                if self._store.user_email:
-                    entries.append((_MINE_DIR, True))
-                if self._store.is_chat_auth_fatal:
-                    entries.insert(0, (_CHAT_AUTH_EXPIRED_NAME, False))
-                if self._store.is_auth_fatal:
-                    entries.insert(0, (_AUTH_EXPIRED_NAME, False))
-                return entries
-            if not is_mine and len(sub) == 1 and sub[0] == _LIVE_DIR:
-                return [(name, False) for name in self._store.list_live_dirnames()]
-            if is_mine and not sub:
-                return [(m, True) for m in self._store.list_year_months_mine()]
-            return self._list_date_subtree(sub, is_mine)
-        except Exception:
-            log.exception("Error listing directory %s", path)
-            return []
+        entries = list(self._store.projection.list_dir(path))
+        if path == "/":
+            if self._store.is_chat_auth_fatal:
+                entries.insert(0, (_CHAT_AUTH_EXPIRED_NAME, False))
+            if self._store.is_auth_fatal:
+                entries.insert(0, (_AUTH_EXPIRED_NAME, False))
+        return entries
 
     def _date_subdir_attr(
         self,
@@ -628,22 +550,20 @@ class FirefliesMeetingOps(pyfuse3.Operations):
         is_mine, sub = _parse_path(path)
 
         # /live/<meeting-id> — symlink
-        if not is_mine and len(sub) == 2 and sub[0] == _LIVE_DIR:
-            target = self._store.get_live_symlink_target(sub[1])
-            if target is None:
-                raise pyfuse3.FUSEError(errno.ENOENT)
-            tgt = target.encode()
-            self._remember_symlink(inode, tgt)
-            return _make_symlink_attr(inode, len(tgt), timeout=self._timeout_for_path(path))
+        node = self._store.projection.node(path)
+        if node is not None and node.kind == "symlink":
+            self._remember_symlink(inode, node.target)
+            return _make_symlink_attr(inode, len(node.target), timeout=self._timeout_for_path(path))
+
+        if not is_mine and len(sub) == 2 and sub[0] == _LIVE_DIR and node is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
 
         # /mine/ requires user_email to be configured
         if is_mine and not sub and not self._store.user_email:
             raise pyfuse3.FUSEError(errno.ENOENT)
 
-        # Directories: root, live, mine root, month, day, meeting
-        subdir_attr = self._date_subdir_attr(inode, path, sub, is_mine)
-        if subdir_attr is not None:
-            return subdir_attr
+        if node is not None and node.kind == "dir":
+            return _make_dir_attr(inode, timeout=self._timeout_for_path(path))
 
         # Files — cheap stat-only path (no API calls).
         if len(sub) in {_SUB_DEPTH_FILE, _SUB_DEPTH_GHOST_FILE, _SUB_DEPTH_OVERLAP_FILE}:
@@ -780,9 +700,7 @@ class FirefliesMeetingOps(pyfuse3.Operations):
         if path is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
 
-        # Slow path: may trigger an API fetch. Wrapped in to_thread so the
-        # trio event loop isn't blocked during a 30s HTTP call.
-        content, is_completed = await trio.to_thread.run_sync(self._resolve_content, path)
+        content, is_completed = self._resolve_content(path)
         if content is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
         if is_completed:
@@ -828,15 +746,7 @@ class FirefliesMeetingOps(pyfuse3.Operations):
             path = self._get_path(fh)
             if path is None:
                 raise pyfuse3.FUSEError(errno.ENOENT)
-            parsed = self._resolve_meeting_file(path)
-            if parsed is None:
-                raise pyfuse3.FUSEError(errno.EIO)
-            meeting_id, _slug, filename = parsed
-            content = await trio.to_thread.run_sync(
-                self._store.get_cached_file_content,
-                meeting_id,
-                filename,
-            )
+            content = self._store.projection.file_content(path)
             if content is None:
                 raise pyfuse3.FUSEError(errno.EIO)
             return content[off : off + size]

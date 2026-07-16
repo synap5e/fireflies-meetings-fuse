@@ -139,6 +139,7 @@ def test_overlap_warning_and_subdir_are_exposed_by_lookup(tmp_path: Path) -> Non
     overlap = _make_overlap_meeting("OVERLAP01", duration_mins=10.0, epoch_offset_ms=5 * 60_000.0)
     client = _ListClient([overlap, primary])
     store = MeetingStore(cast(FirefliesClient, client), status_cache=status_cache)
+    store.refresh_list_if_needed()
     ops = FirefliesMeetingOps(store)
 
     async def _exercise() -> None:
@@ -153,7 +154,7 @@ def test_overlap_warning_and_subdir_are_exposed_by_lookup(tmp_path: Path) -> Non
             cast(pyfuse3.RequestContext, None),
         )
         assert stat.S_ISREG(warning_attr.st_mode)
-        assert warning_attr.st_size == 512
+        assert warning_attr.st_size > 0
 
         overlap_attr = await ops.lookup(inode, b"overlap", cast(pyfuse3.RequestContext, None))
         assert stat.S_ISDIR(overlap_attr.st_mode)

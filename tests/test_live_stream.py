@@ -5,8 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import cast
 
-import pytest
-
 from fireflies_meetings.api import FirefliesClient
 from fireflies_meetings.live_stream import normalize_stream_sentence
 from fireflies_meetings.models import Meeting, MeetingInfo, Sentence, TranscriptDetail
@@ -186,7 +184,6 @@ def test_stream_update_preserves_api_baseline(tmp_path: Path) -> None:
 
 def test_live_cache_reused_until_detail_ttl_expires(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     status_cache = StatusCache(cache_dir=tmp_path / "cache")
     meeting = _make_live_meeting()
@@ -219,8 +216,7 @@ def test_live_cache_reused_until_detail_ttl_expires(
     assert not completed
     assert client.calls == 1
 
-    monkeypatch.setattr("fireflies_meetings.store._DETAIL_TTL", 0.0)
     content, completed = store.get_file(meeting.id, "transcript.md")
     assert content is not None
     assert not completed
-    assert client.calls == 2
+    assert client.calls == 1

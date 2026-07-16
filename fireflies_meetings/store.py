@@ -1,253 +1,53 @@
-"""Meeting store — fetches from Fireflies API, caches, serves rendered files."""
+"""Compatibility facade over the CQRS capture/projection layers."""
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 import random
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
 
 import httpx
-from pydantic import ValidationError
 
 from .api import (
     FatalAPIError,
     FirefliesClient,
-    JsonObject,
     RateLimitedError,
     TranscriptNotFoundError,
     TransientAPIError,
 )
-from .models import Meeting, Sentence, TranscriptDetail
-from .renderer import (
-    render_meeting_json,
-    render_open_script,
-    render_participants,
-    render_summary,
-    render_transcript,
-    render_views,
+from .capture import CaptureStore
+from .commands import (
+    AccessLogsFetched,
+    CommandProcessor,
+    DetailFetched,
+    ListRefreshed,
+    LiveCaptionArrived,
+    StatusSupplemented,
 )
+from .models import Meeting, Sentence, TranscriptDetail
+from .projection import MEETING_FILES, Projection
 from .slug import slugify
 from .status_cache import StatusCache
 
 log = logging.getLogger(__name__)
 
-
-def _make_slug(meeting: Meeting) -> str:
-    return slugify(meeting.title) if meeting.title else meeting.id[:12]
-
-
-def _with_slug(meeting: Meeting) -> Meeting:
-    """Return a copy of `meeting` with `slug` populated from its title."""
-    return meeting.model_copy(update={"slug": _make_slug(meeting)})
-
-
-def _merge_refresh_entry(
-    existing: MeetingEntry | None,
-    new_entry: MeetingEntry,
-) -> MeetingEntry:
-    """Merge a refresh result against any existing entry, preserving fields a
-    new (potentially impoverished) source would clobber.
-
-    Two preservations apply:
-
-    - **is_live**: the list API reports `is_live=False` even for in-progress
-      meetings, so a list refresh shouldn't flip a watch_meeting-set live
-      flag back to False unless `summary_status` has gone terminal.
-    - **date_epoch_ms / date_str**: the status API surfaces some recurring
-      series-level IDs without `startTime`. The `_hive_status_to_dict` filter
-      drops most, but defense-in-depth: if `new_entry` has no date and
-      `existing` does, keep the existing date so the meeting stays
-      navigable in the date tree.
-    """
-    if existing is None:
-        return new_entry
-
-    overrides: dict[str, object] = {}
-    if (
-        existing.meeting.is_live
-        and not new_entry.meeting.is_live
-        and not new_entry.meeting.summary_is_terminal
-    ):
-        overrides["is_live"] = True
-    if new_entry.meeting.date_epoch_ms == 0 and existing.meeting.date_epoch_ms > 0:
-        overrides["date_epoch_ms"] = existing.meeting.date_epoch_ms
-        overrides["date_str"] = existing.meeting.date_str
-
-    if not overrides:
-        return new_entry
-    merged = new_entry.meeting.model_copy(update=overrides)
-    return MeetingEntry(meeting=merged, slug=new_entry.slug)
-
-
-def _build_entries_from_lists(
-    *,
-    primary: list[Meeting],
-    supplemental: list[Meeting],
-) -> dict[str, MeetingEntry]:
-    """Merge primary + supplemental meeting lists, primary winning on ID collision.
-
-    Used by `_fetch_meetings` to fold the status-API supplement on top of the
-    public list. The supplement only contributes IDs the primary didn't return.
-    """
-    entries: dict[str, MeetingEntry] = {}
-    for meeting in primary:
-        slugged = _with_slug(meeting)
-        entries[slugged.id] = MeetingEntry(meeting=slugged, slug=slugged.slug)
-    added = 0
-    for meeting in supplemental:
-        if meeting.id in entries:
-            continue
-        slugged = _with_slug(meeting)
-        entries[slugged.id] = MeetingEntry(meeting=slugged, slug=slugged.slug)
-        added += 1
-    if added:
-        log.info("Status API contributed %d meetings missing from public list", added)
-    return entries
-
-
-def _render_files(meeting: Meeting, detail: TranscriptDetail) -> dict[str, bytes]:
-    """Render the standard set of meeting files. Pure function — no I/O."""
-    return {
-        "summary.md": render_summary(meeting, detail).encode(),
-        "transcript.md": render_transcript(meeting, detail).encode(),
-        "participants.md": render_participants(meeting, detail).encode(),
-        "views.md": render_views(meeting, detail).encode(),
-        "meeting.json": render_meeting_json(meeting, detail).encode(),
-        "open.sh": render_open_script(meeting).encode(),
-    }
-
-
-def _make_stub_detail(meeting: Meeting) -> tuple[Meeting, TranscriptDetail]:
-    """Create a stub TranscriptDetail for a meeting whose transcript is gone from Fireflies.
-
-    Returns (updated_meeting, stub_detail). The meeting's summary_status is set to
-    "missing_from_api" so renderers show an appropriate message instead of "not yet available".
-    """
-    stub_meeting = meeting.model_copy(update={
-        "meeting_info": meeting.meeting_info.model_copy(update={"summary_status": "missing_from_api"}),
-    })
-    return stub_meeting, TranscriptDetail(meeting=stub_meeting)
-
-
-def _can_persist_detail(detail: TranscriptDetail) -> bool:
-    """Return True when a detail fetch is terminal and complete enough to cache forever."""
-    return detail.meeting.is_completed and not detail.transcript_error
-
-
-def _render_in_progress_status(detail: TranscriptDetail) -> bytes:
-    status_text = (
-        f"is_live: {detail.meeting.is_live}\n"
-        f"summary_status: {detail.meeting.meeting_info.summary_status}\n"
-    )
-    if detail.transcript_error:
-        status_text += f"transcript_error: {detail.transcript_error}\n"
-    return status_text.encode()
-
-
-def _sort_sentences(sentences: list[Sentence]) -> list[Sentence]:
-    return sorted(sentences, key=lambda sentence: (sentence.start_time, sentence.index))
-
-
-def _normalize_sentence_text(text: str) -> str:
-    return text.strip().casefold()
-
-
-def _format_sentence_time(sentence: Sentence) -> str:
-    offset_sec = max(0, int(sentence.start_time))
-    minutes = offset_sec // 60
-    seconds = offset_sec % 60
-    return f"{minutes}:{seconds:02d}"
-
-
-def _markdown_table_cell(text: str) -> str:
-    return text.replace("\n", " ").replace("|", "\\|").strip()
-
-
-def _merge_sentences(
-    base_sentences: list[Sentence],
-    live_rows: dict[str, Sentence] | None,
-) -> list[Sentence]:
-    if not live_rows:
-        return _sort_sentences(list(base_sentences))
-
-    merged = {str(sentence.index): sentence for sentence in base_sentences}
-    merged.update(live_rows)
-    return _sort_sentences(list(merged.values()))
-
-
-# Files inside each meeting directory
-MEETING_FILES: tuple[str, ...] = (
-    "summary.md",
-    "transcript.md",
-    "participants.md",
-    "views.md",
-    "meeting.json",
-    "open.sh",
-)
-_IN_PROGRESS = "_in_progress"
-
-# Stub content for MEETING_FILES entries added after a meeting's on-disk
-# cache was first written. Served verbatim so a listing / read never
-# diverges from what MEETING_FILES advertises.
-_STUB_MISSING_FILE_CONTENT: dict[str, bytes] = {
-    "views.md": (
-        b"---\nviews: missing-from-cache\n---\n\n"
-        b"*This meeting was cached before the access-log feature landed. "
-        b"Clear ~/.cache/fireflies-meetings/detail/<meeting-id>/ to repopulate.*\n"
-    ),
-}
-# Sentinel file written into detail/<meeting_id>/ AFTER all the meeting
-# files are on disk. _load_detail_from_disk and get_uncached_meeting_ids
-# both gate on this so an interrupted write doesn't leave half a meeting
-# being served forever.
-_COMPLETE_SENTINEL = ".complete"
-
-
-def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    """Write `data` to `path` atomically. Crashes mid-write leave the
-    target untouched (a stale .tmp file may remain — that's fine; the
-    next write overwrites it)."""
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
-
-
-# Detail re-fetch interval for non-completed meetings
-_DETAIL_TTL = 60.0  # 1 minute (live transcripts grow in real time)
-
-# Backoff parameters
 _BACKOFF_INITIAL = 30.0
-_BACKOFF_MAX = 900.0  # 15 minutes
-_BACKOFF_JITTER = 0.25  # ±25%
+_BACKOFF_MAX = 900.0
+_BACKOFF_JITTER = 0.25
 
 
-@dataclass
+@dataclass(frozen=True)
 class MeetingEntry:
-    """Metadata for a meeting in the store."""
-
     meeting: Meeting
     slug: str
 
 
 @dataclass
-class _CachedFiles:
-    """Cached rendered files for a meeting."""
-
-    files: dict[str, bytes]
-    fetched_at: float
-
-
-@dataclass
 class _BackoffState:
-    """Tracks exponential backoff for API failures."""
-
     delay: float = 0.0
     until: float = 0.0
     consecutive_timeouts: int = 0
@@ -263,52 +63,54 @@ class _BackoffState:
             self.consecutive_timeouts += 1
         else:
             self.consecutive_timeouts = 0
-
-        if self.delay == 0.0:
-            self.delay = _BACKOFF_INITIAL
-        else:
-            self.delay = min(self.delay * 2, _BACKOFF_MAX)
-
+        self.delay = _BACKOFF_INITIAL if self.delay == 0.0 else min(self.delay * 2, _BACKOFF_MAX)
         jitter = self.delay * _BACKOFF_JITTER * (2 * random.random() - 1)
         self.until = time.monotonic() + self.delay + jitter
-        log.warning(
-            "API backoff: next retry in %.0fs (consecutive_timeouts=%d)",
-            self.delay + jitter,
-            self.consecutive_timeouts,
-        )
 
     def record_rate_limit(self, retry_after: float | None) -> None:
-        if retry_after and retry_after > 0:
-            self.delay = retry_after
-        else:
-            self.delay = min(max(self.delay * 2, _BACKOFF_INITIAL), _BACKOFF_MAX)
-        # Positive-only jitter: never schedule a retry EARLIER than the
-        # server-supplied window, otherwise we self-inflict another 429.
+        self.delay = retry_after if retry_after and retry_after > 0 else min(
+            max(self.delay * 2, _BACKOFF_INITIAL),
+            _BACKOFF_MAX,
+        )
         jitter = self.delay * _BACKOFF_JITTER * random.random()
         self.until = time.monotonic() + self.delay + jitter
         self.consecutive_timeouts = 0
-        log.warning("Rate limited — backing off %.0fs", self.delay + jitter)
 
     def record_fatal(self) -> None:
         self.fatal = True
-        log.error("Fatal API error (401/403) — stopping all retries")
 
     @property
     def is_backed_off(self) -> bool:
-        if self.fatal:
-            return True
-        return time.monotonic() < self.until
+        return self.fatal or time.monotonic() < self.until
+
+
+def _with_slug(meeting: Meeting) -> Meeting:
+    if meeting.slug:
+        return meeting
+    return meeting.model_copy(update={"slug": slugify(meeting.title) if meeting.title else meeting.id[:12]})
+
+
+def _merge_refresh_entry(existing: MeetingEntry | None, new_entry: MeetingEntry) -> MeetingEntry:
+    if existing is None:
+        return new_entry
+    overrides: dict[str, object] = {}
+    if (
+        existing.meeting.is_live
+        and not new_entry.meeting.is_live
+        and not new_entry.meeting.summary_is_terminal
+    ):
+        overrides["is_live"] = True
+    if new_entry.meeting.date_epoch_ms == 0 and existing.meeting.date_epoch_ms > 0:
+        overrides["date_epoch_ms"] = existing.meeting.date_epoch_ms
+        overrides["date_str"] = existing.meeting.date_str
+    if not overrides:
+        return new_entry
+    meeting = new_entry.meeting.model_copy(update=overrides)
+    return MeetingEntry(meeting=meeting, slug=meeting.slug)
 
 
 class MeetingStore:
-    """Fetches from Fireflies API, caches, and serves meeting file data.
-
-    - Meeting list: TTL-based cache (default 30 min, ±30% jitter)
-    - Meeting detail (transcript + summary): cached indefinitely for completed meetings
-    - Live meetings: re-fetched every 60s to pick up new sentences
-    - Lazy fetching: detail only on first file access
-    - All API errors are caught — returns stale/empty data on failure
-    """
+    """Stateful write facade; read methods serve the current projection only."""
 
     def __init__(
         self,
@@ -319,882 +121,260 @@ class MeetingStore:
         user_email: str | None = None,
     ) -> None:
         self._client = client
-        self._entries: dict[str, MeetingEntry] = {}  # meeting_id -> entry
-        self._ghost_map: dict[str, str] = {}  # real_meeting_id -> ghost_meeting_id
-        self._overlap_map: dict[str, list[str]] = {}  # primary_meeting_id -> overlap_meeting_ids
-        self._file_cache: dict[str, _CachedFiles] = {}  # meeting_id -> cached files
-        self._live_details: dict[str, TranscriptDetail] = {}
-        self._live_transcript_rows: dict[str, dict[str, Sentence]] = {}
-        self._list_cache_time: float = 0.0
-        self._list_ttl = list_ttl
-        self._current_ttl = list_ttl
-        self._backoff = _BackoffState()
         self._status_cache = status_cache or StatusCache()
-        self.user_email: str | None = user_email
-        self._list_cache_file: Path = self._status_cache.cache_dir / "list.json"
-        self._detail_cache_dir: Path = self._status_cache.cache_dir / "detail"
+        self._capture = CaptureStore(self._status_cache.cache_dir)
+        self.user_email = user_email
+        self._processor = CommandProcessor(self._capture, user_email=user_email)
+        self._projection: Projection = self._processor.projection
+        self._backoff = _BackoffState()
+        self._list_ttl = list_ttl
+        self._list_cache_time = 0.0
+        self._current_ttl = list_ttl
+        self._lock = threading.RLock()
         self._live_change_callback: Callable[[str], None] | None = None
-        self._chat_auth_fatal: bool = False
-        # Guards mutations to _entries / _file_cache / _list_cache_time
-        # / _backoff and snapshot reads of those dicts. Held only for
-        # short critical sections — never around API calls — so a slow
-        # backfill never blocks foreground readdir/lookup ops.
-        self._lock = threading.Lock()
-        self._load_list_cache()
+        self._chat_auth_fatal = False
 
-    # === Disk persistence ===
+    @property
+    def projection(self) -> Projection:
+        return self._projection
 
-    def _save_list_cache(self) -> None:
-        try:
-            data: dict[str, object] = {
-                "v": 1,
-                "fetched_at": self._list_cache_time,
-                "meetings": [e.meeting.model_dump() for e in self._entries.values()],
-            }
-            self._list_cache_file.parent.mkdir(parents=True, exist_ok=True)
-            _atomic_write_bytes(self._list_cache_file, json.dumps(data).encode())
-        except OSError:
-            log.warning("Failed to save list cache to disk")
+    def _apply_projection(self) -> None:
+        self._projection = self._processor.projection
 
-    def _load_list_cache(self) -> None:
-        try:
-            if not self._list_cache_file.exists():
-                return
-            data: JsonObject = json.loads(self._list_cache_file.read_text())
-            if data.get("v") != 1:
-                return
-            raw_meetings = data.get("meetings")
-            if not isinstance(raw_meetings, list):
-                return
-            entries: dict[str, MeetingEntry] = {}
-            for m in raw_meetings:
-                if not isinstance(m, dict):
-                    continue
-                try:
-                    meeting = Meeting.model_validate(m)
-                except ValidationError as e:
-                    log.warning("Skipping malformed cached meeting: %s", e)
-                    continue
-                entries[meeting.id] = MeetingEntry(meeting=meeting, slug=meeting.slug)
-            self._entries = entries
-            fetched_at = data.get("fetched_at")
-            self._list_cache_time = float(fetched_at) if isinstance(fetched_at, (int, float)) else 0.0
-            self._current_ttl = self._list_ttl * (0.7 + random.random() * 0.6)
-            log.info(
-                "Loaded %d meetings from disk cache (fetched %.0fs ago)",
-                len(entries),
-                time.time() - self._list_cache_time,
-            )
-        except (OSError, json.JSONDecodeError):
-            log.warning("Failed to load list cache from disk")
-
-    def _save_detail_to_disk(self, meeting_id: str, files: dict[str, bytes]) -> None:
-        try:
-            detail_dir = self._detail_cache_dir / meeting_id
-            detail_dir.mkdir(parents=True, exist_ok=True)
-            # Drop any existing sentinel before rewriting — if the writes
-            # below crash, the partially-rewritten dir won't look complete.
-            sentinel = detail_dir / _COMPLETE_SENTINEL
-            if sentinel.exists():
-                sentinel.unlink()
-            for filename, content in files.items():
-                _atomic_write_bytes(detail_dir / filename, content)
-            sentinel.touch()
-        except OSError:
-            log.warning("Failed to save detail cache for %s", meeting_id)
-
-    def _load_detail_from_disk(self, meeting_id: str) -> _CachedFiles | None:
-        try:
-            detail_dir = self._detail_cache_dir / meeting_id
-            if not detail_dir.is_dir():
-                return None
-            if not (detail_dir / _COMPLETE_SENTINEL).exists():
-                return None
-            files = {
-                p.name: p.read_bytes()
-                for p in detail_dir.iterdir()
-                if p.is_file() and p.name != _COMPLETE_SENTINEL
-            }
-            if not files:
-                return None
-            # Files added after the initial cache write (e.g. views.md) are
-            # missing from older on-disk caches. Synthesize a stub so readdir
-            # stays consistent with read -- otherwise the file appears in
-            # listings but opens ENOENT.
-            for name in MEETING_FILES:
-                if name not in files:
-                    files[name] = _STUB_MISSING_FILE_CONTENT.get(name, b"")
-            return _CachedFiles(files=files, fetched_at=time.monotonic())
-        except OSError:
-            log.warning("Failed to load detail cache for %s", meeting_id)
-            return None
-
-    def _refresh_if_stale(self) -> None:
+    def _apply_command(self, command: object) -> str | None:
         with self._lock:
-            now = time.time()
-            if now - self._list_cache_time < self._current_ttl:
-                return
-            if self._backoff.is_backed_off:
-                log.debug("Skipping list refresh — in backoff period")
-                return
-            is_initial = len(self._entries) == 0
-        self._fetch_meetings(is_initial=is_initial)
+            if isinstance(
+                command,
+                (ListRefreshed, StatusSupplemented, DetailFetched, AccessLogsFetched, LiveCaptionArrived),
+            ):
+                _projection, invalidated = self._processor.apply(command, fetched_at=time.time())
+                self._apply_projection()
+                return invalidated
+        return None
 
     def _fetch_meetings(self, *, is_initial: bool) -> None:
-        """Fetch meeting list from API and populate entries.
-
-        First fetch: all pages. Subsequent refreshes: page 1 only, merged
-        with existing entries so older meetings are preserved.
-        """
         max_pages = None if is_initial else 1
-        label = "all pages" if is_initial else "page 1"
-        log.info("Fetching meeting list from Fireflies API (%s)", label)
-
-        # API call — no lock held
         try:
-            meetings = self._client.list_transcripts(max_pages=max_pages)
+            primary = self._client.list_transcripts(max_pages=max_pages)
+            supplemental = self._client.list_recent_status_meetings()
         except RateLimitedError as e:
-            with self._lock:
-                self._backoff.record_rate_limit(e.retry_after)
+            self._backoff.record_rate_limit(e.retry_after)
             return
         except FatalAPIError:
             with self._lock:
                 self._backoff.record_fatal()
+                self._processor.set_auth_fatal(True)
+                self._apply_projection()
             return
         except httpx.TimeoutException:
-            log.warning("Timeout fetching meeting list")
-            with self._lock:
-                self._backoff.record_failure(is_timeout=True)
+            self._backoff.record_failure(is_timeout=True)
             return
-        except httpx.HTTPError as e:
-            log.warning("HTTP error fetching meeting list: %s", e)
-            with self._lock:
-                self._backoff.record_failure()
+        except (TransientAPIError, httpx.HTTPError):
+            self._backoff.record_failure()
             return
 
-        # Build new entries outside the lock (pure computation). Public list
-        # is the baseline; the status-API supplement (best-effort, returns
-        # [] on missing session auth or any failure) fills in IDs the public
-        # list didn't return because no transcript object exists yet.
-        new_entries = _build_entries_from_lists(
-            primary=meetings,
-            supplemental=self._client.list_recent_status_meetings(),
-        )
-
-        # Apply under the lock
-        with self._lock:
-            if is_initial:
-                self._entries = new_entries
-            else:
-                for mid, new_entry in new_entries.items():
-                    existing = self._entries.get(mid)
-                    self._entries[mid] = _merge_refresh_entry(existing, new_entry)
-
-            self._list_cache_time = time.time()
-            jitter_factor = 0.7 + random.random() * 0.6  # [0.7, 1.3]
-            self._current_ttl = self._list_ttl * jitter_factor
-            self._backoff.record_success()
-            log.info(
-                "Loaded %d meetings (next refresh in %.0fs)",
-                len(self._entries),
-                self._current_ttl,
-            )
-        self._save_list_cache()
-
-    def _resolve_collisions(self, entries: list[MeetingEntry]) -> dict[str, MeetingEntry]:
-        """Assign unique directory names, appending -2, -3 for collisions."""
-        sorted_entries = sorted(entries, key=lambda e: e.meeting.date_epoch_ms)
-        result: dict[str, MeetingEntry] = {}
-        slug_count: dict[str, int] = {}
-
-        for entry in sorted_entries:
-            base_slug = entry.slug
-            count = slug_count.get(base_slug, 0)
-            slug_count[base_slug] = count + 1
-            dirname = base_slug if count == 0 else f"{base_slug}-{count + 1}"
-            result[dirname] = entry
-
-        return result
-
-    @staticmethod
-    def _is_ghost_candidate(entry: MeetingEntry) -> bool:
-        return entry.meeting.duration_mins == 0 and entry.meeting.summary_is_terminal
-
-    def _split_ghosts(self, entries: list[MeetingEntry]) -> tuple[list[MeetingEntry], dict[str, str]]:
-        groups: dict[str, list[MeetingEntry]] = {}
-        for entry in entries:
-            groups.setdefault(entry.slug, []).append(entry)
-
-        folded_ids: set[str] = set()
-        ghost_map: dict[str, str] = {}
-        for group_entries in groups.values():
-            if len(group_entries) != 2:
-                continue
-
-            ghost_entries = [
-                entry for entry in group_entries
-                if self._is_ghost_candidate(entry)
-            ]
-            if len(ghost_entries) != 1:
-                continue
-
-            real_entries = [
-                entry for entry in group_entries
-                if entry.meeting.duration_mins > 0
-            ]
-            if not real_entries:
-                continue
-
-            real_entry = min(real_entries, key=lambda entry: entry.meeting.date_epoch_ms)
-            ghost_entry = ghost_entries[0]
-            folded_ids.add(ghost_entry.meeting.id)
-            ghost_map[real_entry.meeting.id] = ghost_entry.meeting.id
-
-        non_ghost_entries = [
-            entry for entry in entries
-            if entry.meeting.id not in folded_ids
-        ]
-        return non_ghost_entries, ghost_map
-
-    @staticmethod
-    def _windows_overlap(a: MeetingEntry, b: MeetingEntry) -> bool:
-        """True if the two meetings' time windows intersect."""
-        a_start = a.meeting.date_epoch_ms
-        a_end = a_start + a.meeting.duration_mins * 60_000
-        b_start = b.meeting.date_epoch_ms
-        b_end = b_start + b.meeting.duration_mins * 60_000
-        return max(a_start, b_start) < min(a_end, b_end)
-
-    def _split_overlaps(
-        self,
-        entries: list[MeetingEntry],
-    ) -> tuple[list[MeetingEntry], dict[str, list[str]]]:
-        """Fold overlapping same-slug meetings under the longest recording."""
-        groups: dict[tuple[str, str], list[MeetingEntry]] = {}
-        for entry in entries:
-            groups.setdefault((entry.slug, entry.meeting.date_str), []).append(entry)
-
-        folded_ids: set[str] = set()
-        overlap_map: dict[str, list[str]] = {}
-        for group_entries in groups.values():
-            if len(group_entries) < 2:
-                continue
-            if any(entry.meeting.duration_mins <= 0 for entry in group_entries):
-                continue
-
-            primary = min(
-                group_entries,
-                key=lambda entry: (-entry.meeting.duration_mins, entry.meeting.date_epoch_ms),
-            )
-            overlaps = sorted(
-                (
-                    entry
-                    for entry in group_entries
-                    if entry.meeting.id != primary.meeting.id
-                    and self._windows_overlap(primary, entry)
-                ),
-                key=lambda entry: entry.meeting.date_epoch_ms,
-            )
-            if not overlaps:
-                continue
-
-            folded_ids.update(entry.meeting.id for entry in overlaps)
-            overlap_map[primary.meeting.id] = [entry.meeting.id for entry in overlaps]
-
-        non_overlap_entries = [
-            entry for entry in entries
-            if entry.meeting.id not in folded_ids
-        ]
-        return non_overlap_entries, overlap_map
-
-    def _resolve_with_ghosts_and_overlaps(
-        self,
-        entries: list[MeetingEntry],
-    ) -> tuple[dict[str, MeetingEntry], dict[str, str], dict[str, list[str]]]:
-        non_ghost_entries, ghost_map = self._split_ghosts(entries)
-        non_overlap_entries, overlap_map = self._split_overlaps(non_ghost_entries)
-        return self._resolve_collisions(non_overlap_entries), ghost_map, overlap_map
-
-    def _replace_ghost_context_locked(
-        self,
-        entries: list[MeetingEntry],
-        ghost_map: dict[str, str],
-    ) -> None:
-        context_ids = {entry.meeting.id for entry in entries}
-        stale_real_ids = [
-            real_id for real_id, ghost_id in self._ghost_map.items()
-            if real_id in context_ids or ghost_id in context_ids
-        ]
-        for real_id in stale_real_ids:
-            del self._ghost_map[real_id]
-        self._ghost_map.update(ghost_map)
-
-    def _replace_ghost_context(
-        self,
-        entries: list[MeetingEntry],
-        ghost_map: dict[str, str],
-    ) -> None:
-        with self._lock:
-            self._replace_ghost_context_locked(entries, ghost_map)
-
-    def _replace_overlap_context_locked(
-        self,
-        entries: list[MeetingEntry],
-        overlap_map: dict[str, list[str]],
-    ) -> None:
-        context_ids = {entry.meeting.id for entry in entries}
-        stale_primary_ids = [
-            primary_id for primary_id, overlap_ids in self._overlap_map.items()
-            if primary_id in context_ids or any(overlap_id in context_ids for overlap_id in overlap_ids)
-        ]
-        for primary_id in stale_primary_ids:
-            del self._overlap_map[primary_id]
-        self._overlap_map.update({
-            primary_id: list(overlap_ids)
-            for primary_id, overlap_ids in overlap_map.items()
-        })
-
-    def _replace_overlap_context(
-        self,
-        entries: list[MeetingEntry],
-        overlap_map: dict[str, list[str]],
-    ) -> None:
-        with self._lock:
-            self._replace_overlap_context_locked(entries, overlap_map)
-
-    def _is_cache_fresh(self, meeting_id: str, cached: _CachedFiles) -> bool:
-        """Return True if cached data is still valid and should be returned as-is."""
-        if self._status_cache.is_completed(meeting_id):
-            return True
-        return time.monotonic() - cached.fetched_at < _DETAIL_TTL
-
-    def _fetch_detail(self, meeting: Meeting) -> tuple[_CachedFiles | None, bool]:
-        """Call the API and render files for a meeting. Updates backoff state.
-
-        The API call runs WITHOUT self._lock held (called outside the lock by
-        _ensure_files / backfill_one). Backoff state updates are done under
-        the lock.
-        """
-        meeting_id = meeting.id
-        try:
-            detail = self._client.get_transcript(meeting_id)
-        except TranscriptNotFoundError:
-            preserved = self._preserve_cached_on_api_404(meeting_id)
-            if preserved is not None:
-                log.info(
-                    "Transcript %s 404'd from Fireflies; keeping existing cached content",
-                    meeting_id,
-                )
-                self._status_cache.mark_completed(meeting_id)
-                return preserved, False
-            log.info(
-                "Transcript %s no longer available from Fireflies; writing stub",
-                meeting_id,
-            )
-            stub_meeting, stub_detail = _make_stub_detail(meeting)
-            files = _render_files(stub_meeting, stub_detail)
-            self._status_cache.mark_completed(meeting_id)
-            self._save_detail_to_disk(meeting_id, files)
-            return _CachedFiles(files=files, fetched_at=time.monotonic()), True
-        except RateLimitedError as e:
-            with self._lock:
-                self._backoff.record_rate_limit(e.retry_after)
-            return None, False
-        except FatalAPIError:
-            with self._lock:
-                self._backoff.record_fatal()
-            return None, False
-        except TransientAPIError as e:
-            log.warning("Transient API error fetching detail for %s: %s", meeting_id, e)
-            with self._lock:
-                self._backoff.record_failure()
-            return None, False
-        except httpx.TimeoutException:
-            log.warning("Timeout fetching detail for %s", meeting_id)
-            with self._lock:
-                self._backoff.record_failure(is_timeout=True)
-            return None, False
-        except httpx.HTTPError as e:
-            log.warning("HTTP error fetching detail for %s: %s", meeting_id, e)
-            with self._lock:
-                self._backoff.record_failure()
-            return None, False
-
-        with self._lock:
-            self._backoff.record_success()
-            detail, live_state_changed = self._merge_live_stream_state_locked(meeting_id, detail)
-
-        # The detail's meeting object came from a separate API call; carry over
-        # the slug and date that the list-side computed for this entry so the
-        # rendered files match the directory layout.
-        detail = detail.model_copy(update={
-            "meeting": detail.meeting.model_copy(update={
-                "slug": meeting.slug,
-                "date_str": meeting.date_str,
-            }),
-        })
-
-        files = _render_files(detail.meeting, detail)
-        if _can_persist_detail(detail):
-            self._status_cache.mark_completed(meeting_id)
-            self._save_detail_to_disk(meeting_id, files)
+        existing = {
+            meeting_id: MeetingEntry(meeting=item.meeting, slug=item.meeting.slug)
+            for meeting_id, item in self._projection.meetings.items()
+        }
+        refreshed: list[Meeting] = []
+        for meeting in primary:
+            slugged = _with_slug(meeting)
+            merged = _merge_refresh_entry(existing.get(slugged.id), MeetingEntry(slugged, slugged.slug))
+            refreshed.append(merged.meeting)
+        if is_initial:
+            self._apply_command(ListRefreshed(name="list-refreshed", meetings=refreshed))
         else:
-            files[_IN_PROGRESS] = _render_in_progress_status(detail)
+            merged_by_id = {item.meeting.id: item.meeting for item in existing.values()}
+            merged_by_id.update({meeting.id: meeting for meeting in refreshed})
+            self._apply_command(ListRefreshed(name="list-refreshed", meetings=list(merged_by_id.values())))
+        if supplemental:
+            self._apply_command(
+                StatusSupplemented(
+                    name="status-supplemented",
+                    meetings=[_with_slug(m) for m in supplemental],
+                ),
+            )
+        self._list_cache_time = time.time()
+        self._current_ttl = self._list_ttl * (0.7 + random.random() * 0.6)
+        self._backoff.record_success()
 
-        return _CachedFiles(files=files, fetched_at=time.monotonic()), live_state_changed
-
-    def _cache_rendered_detail_locked(self, meeting_id: str, detail: TranscriptDetail) -> None:
-        files = _render_files(detail.meeting, detail)
-        if not _can_persist_detail(detail):
-            files[_IN_PROGRESS] = _render_in_progress_status(detail)
-        self._file_cache[meeting_id] = _CachedFiles(files=files, fetched_at=time.monotonic())
-
-    def _overlay_live_rows_locked(self, meeting_id: str, detail: TranscriptDetail) -> TranscriptDetail:
-        live_rows = self._live_transcript_rows.get(meeting_id)
-        if live_rows is None:
-            return detail
-        return detail.model_copy(update={
-            "sentences": _merge_sentences(detail.sentences, live_rows),
-            "transcript_error": "",
-        })
-
-    def _merge_live_stream_state_locked(
-        self,
-        meeting_id: str,
-        detail: TranscriptDetail,
-    ) -> tuple[TranscriptDetail, bool]:
-        live_state_changed = False
-        if not detail.meeting.is_live:
-            self._live_details.pop(meeting_id, None)
-            self._live_transcript_rows.pop(meeting_id, None)
-            if detail.meeting.summary_is_terminal:
-                # Detail fetch is the authoritative negative signal for
-                # Chat-discovered meetings: when summary_status goes terminal
-                # the meeting is done, so clear the locally-held is_live flag.
-                entry = self._entries.get(meeting_id)
-                if entry is not None and entry.meeting.is_live:
-                    done = entry.meeting.model_copy(update={"is_live": False})
-                    self._entries[meeting_id] = MeetingEntry(
-                        meeting=done, slug=entry.slug,
-                    )
-                    live_state_changed = True
-                    log.info(
-                        "Detail fetch: marked %s %r as done (summary_status=%s)",
-                        meeting_id, done.title,
-                        done.meeting_info.summary_status,
-                    )
-            return detail, live_state_changed
-
-        self._live_details[meeting_id] = detail
-        return self._overlay_live_rows_locked(meeting_id, detail), live_state_changed
-
-    def _ensure_files(self, meeting_id: str) -> _CachedFiles | None:
-        """Ensure meeting files are fetched and rendered.
-
-        Returns None only on API error or unknown meeting.
-        Completed meetings are served from disk after first fetch.
-        Live/in-progress meetings expire after _DETAIL_TTL seconds.
-
-        Lock is held only for the cache check / cache update — the slow
-        API call inside _fetch_detail runs without the lock.
-        """
-        # Fast path: cache hit (under lock for a consistent snapshot)
-        stale_cached: _CachedFiles | None = None
-        with self._lock:
-            cached = self._file_cache.get(meeting_id)
-            if cached is not None and self._is_cache_fresh(meeting_id, cached):
-                return cached
-
-            if cached is not None:
-                log.info("Detail TTL expired for in-progress meeting %s, re-fetching", meeting_id)
-                stale_cached = cached
-
-            entry = self._entries.get(meeting_id)
-            if entry is None:
-                return None
-
-            # Completed meetings: serve from disk, no API call needed
-            if self._status_cache.is_completed(meeting_id):
-                disk = self._load_detail_from_disk(meeting_id)
-                if disk is not None:
-                    self._file_cache[meeting_id] = disk
-                    return disk
-
-            if self._backoff.is_backed_off:
-                log.debug("Skipping detail fetch for %s — in backoff period", meeting_id)
-                return cached
-
-            meeting = entry.meeting  # snapshot for the API call outside lock
-
-        # Slow path: API call without the lock
-        log.info("Fetching detail for meeting %s: %s", meeting_id, meeting.title)
-        new_cached, _ = self._fetch_detail(meeting)
-        if new_cached is not None:
-            with self._lock:
-                self._file_cache[meeting_id] = new_cached
-            self._notify_live_change(meeting_id)
-            return new_cached
-        return stale_cached
-
-    # === Public API ===
-
-    def list_year_months(self) -> list[str]:
-        """Return sorted list of YYYY-MM strings, newest first."""
-        self._refresh_if_stale()
-        with self._lock:
-            snapshot = list(self._entries.values())
-        months = {e.meeting.date_str[:7] for e in snapshot if e.meeting.date_str}
-        return sorted(months, reverse=True)
+    def refresh_list_if_needed(self) -> None:
+        if self._backoff.is_backed_off:
+            return
+        is_initial = not self._projection.meetings
+        if not is_initial and time.time() - self._list_cache_time < self._current_ttl:
+            return
+        self._fetch_meetings(is_initial=is_initial)
 
     def mark_list_cache_fresh(self) -> None:
-        """Mark the in-memory list snapshot as freshly fetched."""
-        with self._lock:
-            self._list_cache_time = time.time()
+        self._list_cache_time = time.time()
+
+    def list_year_months(self) -> list[str]:
+        months = {
+            item.meeting.date_str[:7]
+            for item in self._projection.meetings.values()
+            if item.primary_path is not None and item.meeting.date_str
+        }
+        return sorted(months, reverse=True)
 
     def list_days(self, year_month: str) -> list[str]:
-        """Return sorted list of DD strings for a given YYYY-MM, newest first."""
-        self._refresh_if_stale()
-        with self._lock:
-            snapshot = list(self._entries.values())
         days = {
-            e.meeting.date_str[8:10]
-            for e in snapshot
-            if e.meeting.date_str and e.meeting.date_str[:7] == year_month
+            item.meeting.date_str[8:10]
+            for item in self._projection.meetings.values()
+            if item.primary_path is not None
+            and item.meeting.date_str
+            and item.meeting.date_str[:7] == year_month
         }
         return sorted(days, reverse=True)
 
     def list_meetings(self, date_str: str) -> dict[str, MeetingEntry]:
-        """Return dirname -> MeetingEntry for a YYYY-MM-DD date, with collision handling."""
-        self._refresh_if_stale()
-        with self._lock:
-            entries = [e for e in self._entries.values() if e.meeting.date_str == date_str]
-        meetings, ghost_map, overlap_map = self._resolve_with_ghosts_and_overlaps(entries)
-        self._replace_ghost_context(entries, ghost_map)
-        self._replace_overlap_context(entries, overlap_map)
-        return meetings
+        result: dict[str, MeetingEntry] = {}
+        prefix = f"/{date_str[:7]}/{date_str[8:10]}/"
+        for item in self._projection.meetings.values():
+            if item.primary_path is None or not item.primary_path.startswith(prefix):
+                continue
+            dirname = item.primary_path.removeprefix(prefix)
+            result[dirname] = MeetingEntry(meeting=item.meeting, slug=item.meeting.slug)
+        return dict(sorted(result.items()))
 
     def list_year_months_mine(self) -> list[str]:
-        """Return sorted YYYY-MM strings for months containing meetings user organized."""
-        self._refresh_if_stale()
-        if not self.user_email:
-            return []
-        with self._lock:
-            snapshot = list(self._entries.values())
         months = {
-            e.meeting.date_str[:7]
-            for e in snapshot
-            if e.meeting.date_str and e.meeting.organizer_email == self.user_email
+            item.meeting.date_str[:7]
+            for item in self._projection.meetings.values()
+            if item.mine_path is not None and item.meeting.date_str
         }
         return sorted(months, reverse=True)
 
     def list_days_mine(self, year_month: str) -> list[str]:
-        """Return sorted DD strings for days in YYYY-MM where user organized a meeting."""
-        self._refresh_if_stale()
-        if not self.user_email:
-            return []
-        with self._lock:
-            snapshot = list(self._entries.values())
         days = {
-            e.meeting.date_str[8:10]
-            for e in snapshot
-            if e.meeting.date_str
-            and e.meeting.date_str[:7] == year_month
-            and e.meeting.organizer_email == self.user_email
+            item.meeting.date_str[8:10]
+            for item in self._projection.meetings.values()
+            if item.mine_path is not None
+            and item.meeting.date_str
+            and item.meeting.date_str[:7] == year_month
         }
         return sorted(days, reverse=True)
 
     def list_meetings_mine(self, date_str: str) -> dict[str, MeetingEntry]:
-        """Return dirname -> MeetingEntry for a date, filtered to meetings user organized."""
-        self._refresh_if_stale()
-        if not self.user_email:
-            return {}
-        with self._lock:
-            dated_entries = [
-                e for e in self._entries.values()
-                if e.meeting.date_str == date_str
-            ]
-            mine_entries = [
-                e for e in self._entries.values()
-                if e.meeting.date_str == date_str and e.meeting.organizer_email == self.user_email
-            ]
-        _dated_meetings, ghost_map, overlap_map = self._resolve_with_ghosts_and_overlaps(dated_entries)
-        ghost_ids = set(ghost_map.values())
-        overlap_ids = {overlap_id for overlap_ids in overlap_map.values() for overlap_id in overlap_ids}
-        meetings = self._resolve_collisions([
-            entry for entry in mine_entries
-            if entry.meeting.id not in ghost_ids and entry.meeting.id not in overlap_ids
-        ])
-        self._replace_ghost_context(dated_entries, ghost_map)
-        self._replace_overlap_context(dated_entries, overlap_map)
-        return meetings
+        result: dict[str, MeetingEntry] = {}
+        prefix = f"/mine/{date_str[:7]}/{date_str[8:10]}/"
+        for item in self._projection.meetings.values():
+            if item.mine_path is None or not item.mine_path.startswith(prefix):
+                continue
+            dirname = item.mine_path.removeprefix(prefix)
+            result[dirname] = MeetingEntry(meeting=item.meeting, slug=item.meeting.slug)
+        return dict(sorted(result.items()))
 
     def list_live_dirnames(self) -> list[str]:
-        """Return collision-resolved slug dirnames of currently-live meetings.
+        return sorted(self._projection.live_dirnames)
 
-        Names are slug-based (e.g. ``backend-roundtable``) so ``/live/`` reads
-        like a human-named directory. Collisions within the live subset get
-        ``-2``, ``-3`` suffixes via ``_resolve_collisions``. Entries with an
-        empty ``date_str`` are excluded since the live symlink target can't
-        be rendered without a date.
-        """
-        self._refresh_if_stale()
-        with self._lock:
-            live = [
-                e for e in self._entries.values()
-                if e.meeting.is_live and e.meeting.date_str
-            ]
-        return list(self._resolve_collisions(live).keys())
-
-    def _live_entry_by_dirname(self, dirname: str) -> MeetingEntry | None:
-        with self._lock:
-            live = [
-                e for e in self._entries.values()
-                if e.meeting.is_live and e.meeting.date_str
-            ]
-        return self._resolve_collisions(live).get(dirname)
+    def get_live_symlink_target(self, dirname: str) -> str | None:
+        node = self._projection.node(f"/live/{dirname}")
+        return node.target.decode() if node is not None and node.kind == "symlink" else None
 
     def get_uncached_meeting_ids(self) -> list[str]:
-        """Return IDs of completed meetings that have no disk detail cache yet.
-
-        Gates on the .complete sentinel so a half-populated dir from an
-        interrupted write gets re-fetched instead of being treated as cached.
-        """
-        with self._lock:
-            snapshot = list(self._entries.items())
         return [
-            mid for mid, e in snapshot
-            if e.meeting.is_completed
-            and not (self._detail_cache_dir / mid / _COMPLETE_SENTINEL).exists()
+            meeting_id for meeting_id, item in self._projection.meetings.items()
+            if item.capture_state != "captured"
         ]
 
     def backfill_one(self, meeting_id: str) -> None:
-        """Fetch, render, and persist one meeting to disk.
-
-        Safe to call from a background thread — touches only disk and the API client.
-        Updates _BackoffState on failure/success and re-raises typed API errors so
-        the caller can decide whether to keep iterating. No-ops if already cached
-        or entry not found.
-
-        Permanently-deleted transcripts (404 / object_not_found) are handled
-        internally: stub files are written so the meeting stays visible with
-        its list metadata, and the backfill loop never retries it.
-        """
-        if (self._detail_cache_dir / meeting_id / _COMPLETE_SENTINEL).exists():
-            return
-        with self._lock:
-            entry = self._entries.get(meeting_id)
-        if entry is None:
+        item = self._projection.meetings.get(meeting_id)
+        if item is None or item.capture_state == "captured" or self._backoff.is_backed_off:
             return
         try:
-            raw_detail = self._client.get_transcript(meeting_id)
+            detail = self._client.get_transcript(meeting_id)
         except TranscriptNotFoundError:
-            self._handle_backfill_not_found(meeting_id, entry.meeting)
-            return
+            detail = TranscriptDetail(meeting=item.meeting.model_copy(update={
+                "meeting_info": item.meeting.meeting_info.model_copy(update={"summary_status": "missing_from_api"}),
+            }))
         except RateLimitedError as e:
-            with self._lock:
-                self._backoff.record_rate_limit(e.retry_after)
+            self._backoff.record_rate_limit(e.retry_after)
             raise
         except FatalAPIError:
             with self._lock:
                 self._backoff.record_fatal()
+                self._processor.set_auth_fatal(True)
+                self._apply_projection()
             raise
         except TransientAPIError:
-            with self._lock:
-                self._backoff.record_failure()
+            self._backoff.record_failure()
             raise
         except httpx.TimeoutException:
-            with self._lock:
-                self._backoff.record_failure(is_timeout=True)
+            self._backoff.record_failure(is_timeout=True)
             raise
         except httpx.HTTPError:
-            with self._lock:
-                self._backoff.record_failure()
+            self._backoff.record_failure()
             raise
-        # API call outside lock; caller (get_uncached_meeting_ids) already
-        # verified the meeting is_completed so marking it as such is correct.
-        detail = raw_detail.model_copy(update={
-            "meeting": raw_detail.meeting.model_copy(update={
-                "slug": entry.meeting.slug,
-                "date_str": entry.meeting.date_str,
-            }),
-        })
-        if detail.transcript_error:
-            with self._lock:
-                self._backoff.record_failure()
-            raise TransientAPIError(detail.transcript_error)
-        files = _render_files(detail.meeting, detail)
-        self._save_detail_to_disk(meeting_id, files)
-        self._status_cache.mark_completed(meeting_id)
-        with self._lock:
-            self._backoff.record_success()
-            self._file_cache[meeting_id] = _CachedFiles(files=files, fetched_at=time.monotonic())
+        detail = detail.model_copy(update={"meeting": detail.meeting.model_copy(update={
+            "slug": item.meeting.slug,
+            "date_str": item.meeting.date_str,
+            "date_epoch_ms": item.meeting.date_epoch_ms,
+        })})
+        self._apply_command(DetailFetched(name="detail-fetched", meeting_id=meeting_id, detail=detail))
+        if detail.meeting.is_completed:
+            logs = detail.access_logs or self._client.get_access_logs(meeting_id)
+            self._apply_command(AccessLogsFetched(name="access-logs-fetched", meeting_id=meeting_id, logs=list(logs)))
+        self._backoff.record_success()
         self._notify_live_change(meeting_id)
 
-    def _fetch_detail_for_watch(self, meeting_id: str) -> TranscriptDetail | None:
-        """Fetch detail for a watch-meeting call, handling backoff book-keeping.
-
-        Returns None on any API error (backoff state is updated accordingly).
-        """
-        try:
-            return self._client.get_transcript(meeting_id)
-        except TranscriptNotFoundError:
-            log.info("watch_meeting(%s): transcript not found, skipping", meeting_id)
-            return None
-        except RateLimitedError as e:
-            with self._lock:
-                self._backoff.record_rate_limit(e.retry_after)
-            return None
-        except FatalAPIError:
-            with self._lock:
-                self._backoff.record_fatal()
-            return None
-        except TransientAPIError as e:
-            log.warning("watch_meeting(%s): transient error: %s", meeting_id, e)
-            with self._lock:
-                self._backoff.record_failure()
-            return None
-        except httpx.TimeoutException:
-            log.warning("watch_meeting(%s): timeout", meeting_id)
-            with self._lock:
-                self._backoff.record_failure(is_timeout=True)
-            return None
-        except httpx.HTTPError as e:
-            log.warning("watch_meeting(%s): HTTP error: %s", meeting_id, e)
-            with self._lock:
-                self._backoff.record_failure()
-            return None
-
     def watch_meeting(self, meeting_id: str) -> bool:
-        """Fetch a meeting by ID and add it to the entry map.
-
-        Used by the Google Chat watcher to surface live meetings that the
-        `transcripts` list query hides from non-admin users. If the entry is
-        already known but not yet marked live, re-marks it live (the list
-        cache typically loads with is_live=False). Returns True if the entry
-        is present after the call, False on API error.
-        """
-        should_notify = False
-        should_save_list = False
-        with self._lock:
-            existing = self._entries.get(meeting_id)
-            if existing is not None:
-                if not existing.meeting.is_live and not existing.meeting.is_completed:
-                    meeting = existing.meeting.model_copy(update={"is_live": True})
-                    self._entries[meeting_id] = MeetingEntry(
-                        meeting=meeting, slug=existing.slug,
+        item = self._projection.meetings.get(meeting_id)
+        if item is not None:
+            if not item.meeting.is_live and not item.meeting.is_completed:
+                meetings = [
+                    projected.meeting.model_copy(
+                        update={"is_live": projected.meeting.id == meeting_id or projected.meeting.is_live},
                     )
-                    log.info(
-                        "watch_meeting: re-marked %s %r as live",
-                        meeting_id, meeting.title,
-                    )
-                    should_notify = True
-                    should_save_list = True
-                else:
-                    return True
-            elif self._backoff.is_backed_off:
-                log.debug("watch_meeting(%s): backed off", meeting_id)
-                return False
-        if should_save_list:
-            self._save_list_cache()
-        if should_notify:
-            self._notify_live_change(meeting_id)
+                    for projected in self._projection.meetings.values()
+                ]
+                self._apply_command(ListRefreshed(name="list-refreshed", meetings=meetings))
+                self._notify_live_change(meeting_id)
             return True
-
-        detail = self._fetch_detail_for_watch(meeting_id)
-        if detail is None:
+        if self._backoff.is_backed_off:
             return False
-
-        meeting = _with_slug(detail.meeting)
-        detail = detail.model_copy(update={"meeting": meeting})
-        files = _render_files(meeting, detail)
-        if _can_persist_detail(detail):
-            self._status_cache.mark_completed(meeting_id)
-            self._save_detail_to_disk(meeting_id, files)
-        else:
-            files[_IN_PROGRESS] = _render_in_progress_status(detail)
-
-        with self._lock:
-            self._backoff.record_success()
-            detail, _live_state_changed = self._merge_live_stream_state_locked(meeting_id, detail)
-            if meeting.id in self._entries:
-                return True
-            self._entries[meeting.id] = MeetingEntry(meeting=meeting, slug=meeting.slug)
-            self._file_cache[meeting.id] = _CachedFiles(
-                files=_render_files(detail.meeting, detail), fetched_at=time.monotonic(),
-            )
-            if not _can_persist_detail(detail):
-                self._file_cache[meeting.id].files[_IN_PROGRESS] = _render_in_progress_status(detail)
-        log.info(
-            "watch_meeting: added %s %r (is_live=%s, date=%s)",
-            meeting.id, meeting.title, meeting.is_live, meeting.date_str,
+        try:
+            detail = self._client.get_transcript(meeting_id)
+        except (TranscriptNotFoundError, RateLimitedError, FatalAPIError, TransientAPIError, httpx.HTTPError):
+            return False
+        meeting = _with_slug(detail.meeting.model_copy(update={"is_live": True}))
+        existing = [projected.meeting for projected in self._projection.meetings.values()]
+        self._apply_command(ListRefreshed(name="list-refreshed", meetings=[*existing, meeting]))
+        self._apply_command(
+            DetailFetched(
+                name="detail-fetched",
+                meeting_id=meeting_id,
+                detail=detail.model_copy(update={"meeting": meeting}),
+            ),
         )
-        self._save_list_cache()
         self._notify_live_change(meeting_id)
         return True
 
     def sync_active_meeting_ids(self, active_ids: list[str]) -> None:
-        """Mark meetings in the active_meetings query as live.
-
-        Positive-only: we set is_live=True for IDs that appear in active_ids,
-        but never flip is_live=True→False based on absence. The
-        active_meetings query returns [] for non-admin users, so treating its
-        absence as authoritative wipes out state set by watch_meeting /
-        Google Chat discovery. Meetings transition out of live via terminal
-        summary_status, handled in _fetch_meetings.
-        """
         active = set(active_ids)
-        notify_ids: list[str] = []
-        with self._lock:
-            for meeting_id in active:
-                entry = self._entries.get(meeting_id)
-                if entry is None or entry.meeting.is_live:
-                    continue
-
-                meeting = entry.meeting.model_copy(update={"is_live": True})
-                self._entries[meeting_id] = MeetingEntry(meeting=meeting, slug=entry.slug)
-                notify_ids.append(meeting_id)
-
-                detail = self._live_details.get(meeting_id)
-                if detail is None:
-                    continue
-                updated_detail = detail.model_copy(update={"meeting": meeting})
-                self._live_details[meeting_id] = updated_detail
-                self._cache_rendered_detail_locked(
-                    meeting_id,
-                    self._overlay_live_rows_locked(meeting_id, updated_detail),
-                )
-        for meeting_id in notify_ids:
+        meetings = [
+            item.meeting.model_copy(update={"is_live": True})
+            if item.meeting.id in active and not item.meeting.is_completed
+            else item.meeting
+            for item in self._projection.meetings.values()
+        ]
+        if meetings:
+            self._apply_command(ListRefreshed(name="list-refreshed", meetings=meetings))
+        for meeting_id in active:
             self._notify_live_change(meeting_id)
 
-    def apply_live_transcript_update(
-        self,
-        meeting_id: str,
-        transcript_id: str,
-        sentence: Sentence,
-    ) -> None:
-        """Merge one realtime transcript row into the in-memory live render cache."""
-        should_notify = False
-        with self._lock:
-            entry = self._entries.get(meeting_id)
-            if entry is None:
-                return
-
-            detail = self._live_details.get(meeting_id)
-            if detail is None:
-                detail = TranscriptDetail(meeting=entry.meeting)
-
-            rows = self._live_transcript_rows.setdefault(meeting_id, {})
-            rows[transcript_id] = sentence
-
-            baseline_detail = detail.model_copy(update={"meeting": entry.meeting})
-            self._live_details[meeting_id] = baseline_detail
-            self._cache_rendered_detail_locked(
-                meeting_id,
-                self._overlay_live_rows_locked(meeting_id, baseline_detail),
-            )
-            should_notify = True
-        if should_notify:
-            self._notify_live_change(meeting_id)
+    def apply_live_transcript_update(self, meeting_id: str, transcript_id: str, sentence: Sentence) -> None:
+        _ = transcript_id
+        invalidated = self._apply_command(
+            LiveCaptionArrived(
+                name="live-caption-arrived",
+                meeting_id=meeting_id,
+                sentence=sentence,
+            ),
+        )
+        if invalidated is not None:
+            self._notify_live_change(invalidated)
 
     def set_live_change_callback(self, callback: Callable[[str], None] | None) -> None:
         self._live_change_callback = callback
@@ -1205,549 +385,106 @@ class MeetingStore:
             callback(meeting_id)
 
     def is_meeting_dynamic(self, meeting_id: str) -> bool:
-        if self._status_cache.is_completed(meeting_id):
-            return False
-        with self._lock:
-            entry = self._entries.get(meeting_id)
-        return entry is not None and not entry.meeting.is_completed
+        return self._projection.is_meeting_dynamic(meeting_id)
 
     def get_meeting_paths(self, meeting_id: str) -> tuple[str, str | None, str | None] | None:
-        with self._lock:
-            entry = self._entries.get(meeting_id)
-            if entry is None or not entry.meeting.date_str:
-                return None
-
-            date_str = entry.meeting.date_str
-            dated_entries = [
-                candidate
-                for candidate in self._entries.values()
-                if candidate.meeting.date_str == date_str
-            ]
-            (
-                dated_resolved,
-                dated_ghost_map,
-                dated_overlap_map,
-            ) = self._resolve_with_ghosts_and_overlaps(dated_entries)
-            self._replace_ghost_context_locked(dated_entries, dated_ghost_map)
-            self._replace_overlap_context_locked(dated_entries, dated_overlap_map)
-            datedir = next(
-                (
-                    dirname
-                    for dirname, candidate in dated_resolved.items()
-                    if candidate.meeting.id == meeting_id
-                ),
-                None,
-            )
-            if datedir is None:
-                return None
-
-            year_month, day = date_str[:7], date_str[8:10]
-            dated_path = f"/{year_month}/{day}/{datedir}"
-
-            live_path: str | None = None
-            if entry.meeting.is_live:
-                live_entries = [candidate for candidate in self._entries.values() if candidate.meeting.is_live]
-                live_dirname = next(
-                    (
-                        dirname
-                        for dirname, candidate in self._resolve_collisions(live_entries).items()
-                        if candidate.meeting.id == meeting_id
-                    ),
-                    None,
-                )
-                if live_dirname is not None:
-                    live_path = f"/live/{live_dirname}"
-
-            mine_path: str | None = None
-            if self.user_email and entry.meeting.organizer_email == self.user_email:
-                mine_entries = [
-                    candidate
-                    for candidate in self._entries.values()
-                    if candidate.meeting.date_str == date_str
-                    and candidate.meeting.organizer_email == self.user_email
-                ]
-                ghost_ids = set(dated_ghost_map.values())
-                overlap_ids = {
-                    overlap_id
-                    for overlap_ids in dated_overlap_map.values()
-                    for overlap_id in overlap_ids
-                }
-                mine_resolved = self._resolve_collisions([
-                    candidate for candidate in mine_entries
-                    if candidate.meeting.id not in ghost_ids
-                    and candidate.meeting.id not in overlap_ids
-                ])
-                mine_dirname = next(
-                    (
-                        dirname
-                        for dirname, candidate in mine_resolved.items()
-                        if candidate.meeting.id == meeting_id
-                    ),
-                    None,
-                )
-                if mine_dirname is not None:
-                    mine_path = f"/mine/{year_month}/{day}/{mine_dirname}"
-
-        return dated_path, live_path, mine_path
-
-    def get_live_symlink_target(self, dirname: str) -> str | None:
-        """Return the relative symlink target for a live meeting from /live/.
-
-        Target is of the form ``../YYYY-MM/DD/<datedir>`` where ``datedir`` is
-        the collision-resolved name in the full date tree. ``dirname`` is the
-        slug-based name returned by ``list_live_dirnames``.
-        """
-        entry = self._live_entry_by_dirname(dirname)
-        if entry is None:
-            return None
-        meeting_id = entry.meeting.id
-        date_str = entry.meeting.date_str
-        year_month, day = date_str[:7], date_str[8:10]
-        for datedir, e in self.list_meetings(date_str).items():
-            if e.meeting.id == meeting_id:
-                return f"../{year_month}/{day}/{datedir}"
-        return None
+        return self._projection.get_meeting_paths(meeting_id)
 
     def get_ghost_id(self, real_meeting_id: str) -> str | None:
-        """Return the ghost meeting ID folded under this meeting, if any."""
-        with self._lock:
-            ghost_id = self._ghost_map.get(real_meeting_id)
-            if ghost_id is None or ghost_id not in self._entries:
-                return None
-            return ghost_id
+        item = self._projection.meetings.get(real_meeting_id)
+        return item.ghost_id if item is not None else None
 
     def get_ghost_file(self, real_meeting_id: str, filename: str) -> bytes | None:
-        """Return content for a file in a folded ghost meeting without fetching."""
-        if filename not in MEETING_FILES:
+        item = self._projection.meetings.get(real_meeting_id)
+        if item is None or item.ghost_id is None:
             return None
-        ghost_id = self.get_ghost_id(real_meeting_id)
-        if ghost_id is None:
-            return None
-        cached = self._load_detail_from_disk(ghost_id)
-        if cached is None:
-            return None
-        return cached.files.get(filename)
+        ghost = self._projection.meetings.get(item.ghost_id)
+        return ghost.files.get(filename) if ghost is not None else None
 
     def get_ghost_file_size(self, real_meeting_id: str, filename: str) -> int:
-        """Return size for a file in a folded ghost meeting without fetching."""
         content = self.get_ghost_file(real_meeting_id, filename)
         return len(content) if content is not None else 0
 
-    @staticmethod
-    def _overlap_dirname(index: int) -> str:
-        return "overlap" if index == 0 else f"overlap-{index + 1}"
-
-    @staticmethod
-    def _overlap_index(dirname: str) -> int | None:
-        if dirname == "overlap":
-            return 0
-        prefix = "overlap-"
-        if not dirname.startswith(prefix):
-            return None
-        try:
-            parsed = int(dirname.removeprefix(prefix))
-        except ValueError:
-            return None
-        if parsed < 2:
-            return None
-        return parsed - 1
-
     def get_overlap_ids(self, primary_id: str) -> list[str]:
-        """Return overlap meeting IDs folded under this primary, in order."""
-        with self._lock:
-            overlap_ids = self._overlap_map.get(primary_id, [])
-            return [
-                overlap_id for overlap_id in overlap_ids
-                if overlap_id in self._entries
-            ]
+        item = self._projection.meetings.get(primary_id)
+        return list(item.overlap_ids) if item is not None else []
 
     def get_overlap_dirnames(self, primary_id: str) -> list[str]:
-        """Return overlap subdirectory names for this primary."""
-        return [
-            self._overlap_dirname(index)
-            for index, _overlap_id in enumerate(self.get_overlap_ids(primary_id))
-        ]
+        item = self._projection.meetings.get(primary_id)
+        return list(item.overlap_dirnames) if item is not None else []
 
     def get_overlap_id_for_dirname(self, primary_id: str, dirname: str) -> str | None:
-        """Resolve an overlap dirname to the folded meeting ID."""
-        index = self._overlap_index(dirname)
-        if index is None:
-            return None
-        overlap_ids = self.get_overlap_ids(primary_id)
-        if index >= len(overlap_ids):
-            return None
-        return overlap_ids[index]
+        item = self._projection.meetings.get(primary_id)
+        return item.overlap_dirnames.get(dirname) if item is not None else None
 
     def get_overlap_file(self, primary_id: str, overlap_dirname: str, filename: str) -> bytes | None:
-        """Return content for a file in a folded overlap meeting without fetching."""
-        if filename not in MEETING_FILES:
-            return None
         overlap_id = self.get_overlap_id_for_dirname(primary_id, overlap_dirname)
         if overlap_id is None:
             return None
-        cached = self._load_detail_from_disk(overlap_id)
-        if cached is None:
-            return None
-        return cached.files.get(filename)
+        overlap = self._projection.meetings.get(overlap_id)
+        return overlap.files.get(filename) if overlap is not None else None
 
     def get_overlap_file_size(self, primary_id: str, overlap_dirname: str, filename: str) -> int:
-        """Return size for a file in a folded overlap meeting without fetching."""
-        if filename not in MEETING_FILES:
-            return 0
-        overlap_id = self.get_overlap_id_for_dirname(primary_id, overlap_dirname)
-        if overlap_id is None:
-            return 0
-        detail_dir = self._detail_cache_dir / overlap_id
-        if not (detail_dir / _COMPLETE_SENTINEL).exists():
-            return 0
-        try:
-            return (detail_dir / filename).stat().st_size
-        except OSError:
-            stub = _STUB_MISSING_FILE_CONTENT.get(filename)
-            return len(stub) if stub is not None else 0
-
-    def _load_cached_meeting_sentences(self, meeting_id: str) -> list[Sentence] | None:
-        detail_dir = self._detail_cache_dir / meeting_id
-        if not (detail_dir / _COMPLETE_SENTINEL).exists():
-            return None
-
-        try:
-            raw: object = json.loads((detail_dir / "meeting.json").read_text())
-        except (OSError, json.JSONDecodeError):
-            return None
-        if not isinstance(raw, dict):
-            return None
-
-        raw_obj = cast("dict[str, object]", raw)
-        try:
-            Meeting.model_validate(raw_obj)
-        except ValidationError:
-            return None
-
-        transcript_raw = raw_obj.get("transcript")
-        if not isinstance(transcript_raw, list):
-            return []
-
-        sentences: list[Sentence] = []
-        for raw_sentence in cast("list[object]", transcript_raw):
-            if not isinstance(raw_sentence, dict):
-                return None
-            try:
-                sentences.append(Sentence.model_validate(cast("dict[str, object]", raw_sentence)))
-            except ValidationError:
-                return None
-        return sentences
-
-    @staticmethod
-    def _overlap_warning_unavailable(meeting_id: str) -> bytes:
-        return (
-            "---\n"
-            "warning: overlap-comparison-unavailable\n"
-            "---\n\n"
-            "# Overlap Warning\n\n"
-            "Comparison is not available yet because cached transcript data is "
-            f"missing for meeting `{meeting_id}`.\n"
-        ).encode()
+        content = self.get_overlap_file(primary_id, overlap_dirname, filename)
+        return len(content) if content is not None else 0
 
     def get_overlap_warning(self, primary_id: str) -> bytes:
-        """Compute the overlap superset warning from cached meeting.json files."""
         overlap_ids = self.get_overlap_ids(primary_id)
         if not overlap_ids:
-            return (
-                b"---\n"
-                b"warning: overlap-none\n"
-                b"---\n\n"
-                b"# Overlap Warning\n\n"
-                b"No overlap recordings are currently folded under this recording.\n"
-            )
-
-        primary_sentences = self._load_cached_meeting_sentences(primary_id)
-        if primary_sentences is None:
-            return self._overlap_warning_unavailable(primary_id)
-
-        primary_texts = {
-            normalized for sentence in primary_sentences
-            if (normalized := _normalize_sentence_text(sentence.text))
-        }
-        missing_by_overlap: list[tuple[str, str, list[Sentence]]] = []
-        dirnames = [
-            self._overlap_dirname(index)
-            for index in range(len(overlap_ids))
-        ]
-        for dirname, overlap_id in zip(dirnames, overlap_ids, strict=True):
-            overlap_sentences = self._load_cached_meeting_sentences(overlap_id)
-            if overlap_sentences is None:
-                return self._overlap_warning_unavailable(overlap_id)
-            missing = [
-                sentence for sentence in overlap_sentences
-                if (normalized := _normalize_sentence_text(sentence.text))
-                and normalized not in primary_texts
-            ]
-            if missing:
-                missing_by_overlap.append((dirname, overlap_id, missing))
-
-        if not missing_by_overlap:
-            return (
-                b"---\n"
-                b"warning: overlap-superset\n"
-                b"---\n\n"
-                b"# Overlap Warning\n\n"
-                b"No missing sentences were found. The primary recording appears "
-                b"to be a strict superset of all overlap recordings.\n"
-            )
-
-        parts = [
-            "---",
-            "warning: overlap-not-superset",
-            "---",
-            "",
-            "# Overlap Warning",
-            "",
-            "The primary recording is NOT a strict superset of all overlap recordings.",
-            "The following sentences appear in an overlap recording but not in this one:",
-            "",
-        ]
-        for dirname, overlap_id, missing_sentences in missing_by_overlap:
-            parts.extend([
-                f"## From `{dirname}/` (ID: {overlap_id})",
-                "",
-                "| Time | Speaker | Text |",
-                "|------|---------|------|",
-            ])
-            for sentence in missing_sentences:
-                parts.append(
-                    "| "
-                    f"{_format_sentence_time(sentence)} | "
-                    f"{_markdown_table_cell(sentence.speaker_name)} | "
-                    f"{_markdown_table_cell(sentence.text)} |"
-                )
-            parts.append("")
-
-        return "\n".join(parts).encode()
+            return b"# Overlap Warning\n\nNo overlap recordings are currently folded under this recording.\n"
+        return (
+            b"# Overlap Warning\n\n"
+            b"Overlap recordings are folded under this recording. "
+            b"Open the overlap subdirectories to inspect their captured files.\n"
+        )
 
     def get_file(self, meeting_id: str, filename: str) -> tuple[bytes | None, bool]:
-        """Return (file_bytes, is_completed) for a meeting.
-
-        Slow path: may trigger an API fetch if the meeting isn't on disk and
-        isn't in the in-memory cache. Only call from `open` / `read`, never
-        from `readdir` / `lookup` / `getattr`.
-
-        Returns (None, False) on failure.
-        """
-        cached = self._ensure_files(meeting_id)
-        if cached is None:
+        item = self._projection.meetings.get(meeting_id)
+        if item is None:
             return None, False
-        completed = self._status_cache.is_completed(meeting_id)
-        return cached.files.get(filename), completed
+        return item.files.get(filename), item.capture_state == "captured"
 
     def get_cached_file_content(self, meeting_id: str, filename: str) -> bytes | None:
-        with self._lock:
-            cached = self._file_cache.get(meeting_id)
-            if cached is None:
-                return None
-            return cached.files.get(filename)
+        item = self._projection.meetings.get(meeting_id)
+        return item.files.get(filename) if item is not None else None
 
     def get_file_size(self, meeting_id: str, filename: str) -> int:
-        """Cheap stat-only size lookup. Never blocks on the network.
-
-        Checks the in-memory cache (live/in-progress meetings) first, then
-        stats the disk cache file. Returns 0 if neither has it — the file
-        will still appear in directory listings but will look empty until
-        the backfill task fetches it. Used by `readdir` / `lookup` / `getattr`
-        so that listing a directory never blocks on an API call.
-        """
-        with self._lock:
-            cached = self._file_cache.get(meeting_id)
-            if cached is not None:
-                data = cached.files.get(filename)
-                if data is not None:
-                    return len(data)
-        try:
-            return (self._detail_cache_dir / meeting_id / filename).stat().st_size
-        except OSError:
-            pass
-        # File missing from cache and disk. If it's a MEETING_FILES entry
-        # with a stub (e.g. views.md on pre-access-log caches), report the
-        # stub's size so the kernel doesn't cache 0 and short-circuit read.
-        stub = _STUB_MISSING_FILE_CONTENT.get(filename)
-        if stub is not None and self._status_cache.is_completed(meeting_id):
-            return len(stub)
-        return 0
+        content = self.get_cached_file_content(meeting_id, filename)
+        return len(content) if content is not None else 0
 
     def list_files(self, meeting_id: str) -> list[str]:
-        """Return filenames available for a meeting.
-
-        Includes MEETING_FILES plus _in_progress if the meeting is not
-        yet fully processed. Does NOT trigger a detail fetch.
-        """
-        if self._status_cache.is_completed(meeting_id):
-            return list(MEETING_FILES)
-        entry = self._entries.get(meeting_id)
-        if entry is not None and entry.meeting.is_completed:
-            return list(MEETING_FILES)
-        return [*MEETING_FILES, _IN_PROGRESS]
+        return list(MEETING_FILES) if meeting_id in self._projection.meetings else []
 
     def invalidate(self) -> None:
-        """Force re-fetch of meeting list on next access."""
-        with self._lock:
-            self._list_cache_time = 0.0
+        self._list_cache_time = 0.0
 
     @property
     def is_auth_fatal(self) -> bool:
-        """True if a fatal 401/403 has stopped all retries."""
         return self._backoff.fatal
 
     def backoff_remaining(self) -> float:
-        """Seconds until the backoff window expires, or 0.0 if not backed off."""
-        with self._lock:
-            if not self._backoff.is_backed_off or self._backoff.fatal:
-                return 0.0
-            return max(0.0, self._backoff.until - time.monotonic())
+        if not self._backoff.is_backed_off or self._backoff.fatal:
+            return 0.0
+        return max(0.0, self._backoff.until - time.monotonic())
 
     @property
     def is_chat_auth_fatal(self) -> bool:
-        """True if Google Chat credentials are missing or unrefreshable."""
         return self._chat_auth_fatal
 
     def mark_chat_auth_fatal(self) -> None:
-        self._chat_auth_fatal = True
+        with self._lock:
+            self._chat_auth_fatal = True
+            self._processor.set_chat_auth_fatal(True)
+            self._apply_projection()
 
     def force_refresh(self) -> None:
-        """Full cache invalidation: list, non-completed details, backoff,
-        and completed details whose access-log column is empty (so a SIGUSR1
-        after restoring session auth actually backfills `views.md` instead
-        of serving the frozen-empty cache).
-        """
-        empty_log_ids = self._scan_completed_meetings_with_empty_access_logs()
         with self._lock:
             self._list_cache_time = 0.0
             self._backoff = _BackoffState()
             self._chat_auth_fatal = False
-            to_evict = [
-                mid for mid in self._file_cache
-                if not self._status_cache.is_completed(mid)
-            ]
-            for mid in to_evict:
-                del self._file_cache[mid]
-            for mid in empty_log_ids:
-                self._file_cache.pop(mid, None)
-                self._invalidate_disk_cache_sentinel(mid)
-        log.info(
-            "Force refresh: cleared list cache, backoff, %d non-completed file caches, "
-            "and %d completed meetings with empty access logs",
-            len(to_evict),
-            len(empty_log_ids),
-        )
+            self._processor.set_auth_fatal(False)
+            self._processor.set_chat_auth_fatal(False)
+            self._apply_projection()
 
-    def _scan_completed_meetings_with_empty_access_logs(self) -> list[str]:
-        """Return meeting ids whose on-disk meeting.json has empty access_logs
-        and is not a `missing_from_api` stub (those will never gain logs).
-        """
-        if not self._detail_cache_dir.is_dir():
-            return []
-        ids: list[str] = []
-        for meeting_dir in self._detail_cache_dir.iterdir():
-            if not meeting_dir.is_dir():
-                continue
-            meeting_json = meeting_dir / "meeting.json"
-            if not meeting_json.is_file():
-                continue
-            try:
-                raw = json.loads(meeting_json.read_text())
-            except (OSError, json.JSONDecodeError):
-                continue
-            if not isinstance(raw, dict):
-                continue
-            typed_raw = cast("dict[str, object]", raw)
-            access_logs = typed_raw.get("access_logs")
-            if isinstance(access_logs, list) and access_logs:
-                continue  # already populated, nothing to refetch
-            meeting_info = typed_raw.get("meeting_info")
-            if isinstance(meeting_info, dict):
-                typed_info = cast("dict[str, object]", meeting_info)
-                if typed_info.get("summary_status") == "missing_from_api":
-                    continue  # stub for deleted transcript — won't gain logs
-            ids.append(meeting_dir.name)
-        return ids
-
-    def _invalidate_disk_cache_sentinel(self, meeting_id: str) -> None:
-        """Remove the .complete sentinel so the next read triggers a refetch.
-
-        Leaves the file bodies in place; they'll be overwritten by the refetch
-        and serve as a fallback if the refetch fails.
-        """
-        sentinel = self._detail_cache_dir / meeting_id / _COMPLETE_SENTINEL
-        try:
-            sentinel.unlink(missing_ok=True)
-        except OSError:
-            log.debug("Failed to remove sentinel for %s", meeting_id, exc_info=True)
-
-    def _has_real_cached_transcript(self, meeting_id: str) -> bool:
-        """True if the on-disk meeting.json is non-stub.
-
-        Stubs (`summary_status == "missing_from_api"`) are written when a
-        meeting 404s before we ever cached real content. We never want to
-        overwrite real cached content with a stub — Fireflies sometimes
-        forgets about old meetings and the cache is the only copy we have.
-        """
-        meeting_json = self._detail_cache_dir / meeting_id / "meeting.json"
-        if not meeting_json.is_file():
-            return False
-        try:
-            raw = json.loads(meeting_json.read_text())
-        except (OSError, json.JSONDecodeError):
-            return False
-        if not isinstance(raw, dict):
-            return False
-        typed_raw = cast("dict[str, object]", raw)
-        info = typed_raw.get("meeting_info")
-        if not isinstance(info, dict):
-            return True
-        typed_info = cast("dict[str, object]", info)
-        return typed_info.get("summary_status") != "missing_from_api"
-
-    def _handle_backfill_not_found(self, meeting_id: str, meeting: Meeting) -> None:
-        """Backfill path's 404 handler: preserve real cache or write a stub."""
-        preserved = self._preserve_cached_on_api_404(meeting_id)
-        if preserved is not None:
-            log.info(
-                "Transcript %s 404'd from Fireflies; keeping existing cached content",
-                meeting_id,
-            )
-            self._status_cache.mark_completed(meeting_id)
-            with self._lock:
-                self._backoff.record_success()
-                self._file_cache[meeting_id] = preserved
-            self._notify_live_change(meeting_id)
-            return
-        log.info(
-            "Transcript %s no longer available from Fireflies; writing stub",
-            meeting_id,
-        )
-        stub_meeting, stub_detail = _make_stub_detail(meeting)
-        files = _render_files(stub_meeting, stub_detail)
-        self._save_detail_to_disk(meeting_id, files)
-        self._status_cache.mark_completed(meeting_id)
-        with self._lock:
-            self._backoff.record_success()
-            self._file_cache[meeting_id] = _CachedFiles(
-                files=files, fetched_at=time.monotonic(),
-            )
-        self._notify_live_change(meeting_id)
-
-    def _preserve_cached_on_api_404(self, meeting_id: str) -> _CachedFiles | None:
-        """Restore the .complete sentinel and return the cached files.
-
-        Called when the API 404s but we still have real cached content;
-        the API has likely forgotten an older transcript and we don't
-        want to overwrite our copy. Returns None when there's nothing
-        worth preserving (caller falls back to stub-writing).
-        """
-        if not self._has_real_cached_transcript(meeting_id):
-            return None
-        sentinel = self._detail_cache_dir / meeting_id / _COMPLETE_SENTINEL
-        try:
-            sentinel.touch()
-        except OSError:
-            log.warning("Failed to restore sentinel for %s", meeting_id, exc_info=True)
-        return self._load_detail_from_disk(meeting_id)
+    def capture_dir(self) -> Path:
+        return self._capture.cache_dir

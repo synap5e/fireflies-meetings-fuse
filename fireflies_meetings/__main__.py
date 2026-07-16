@@ -241,6 +241,14 @@ async def _backfill_cache(store: MeetingStore) -> None:
             await trio.sleep(3)  # ~20 fetches/min, well under 60/min rate limit
 
 
+async def _list_refresh_loop(store: MeetingStore) -> None:
+    import trio
+
+    while True:
+        await trio.to_thread.run_sync(store.refresh_list_if_needed)
+        await trio.sleep(30)
+
+
 async def _signal_listener(store: MeetingStore) -> None:
     """Trio-native SIGUSR1 handler. Replaces signal.signal so the refresh
     is dispatched cleanly through the trio loop instead of from arbitrary
@@ -440,6 +448,7 @@ async def _run_mount(
 
     async with trio.open_nursery() as nursery:
         nursery.start_soon(pyfuse3.main)
+        nursery.start_soon(_list_refresh_loop, store)
         nursery.start_soon(_backfill_cache, store)
         nursery.start_soon(_signal_listener, store)
         nursery.start_soon(_active_meetings_watch_loop, store, client)
