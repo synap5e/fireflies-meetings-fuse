@@ -310,7 +310,8 @@ def _capture_state(
     has_access_log_capture: bool,
     live_rows: dict[str, Sentence] | None,
 ) -> CaptureState:
-    if (meeting.is_live or live_rows) and not meeting.summary_is_terminal:
+    detail_terminal = detail_capture is not None and detail_capture.meeting.summary_is_terminal
+    if (meeting.is_live or live_rows) and not meeting.summary_is_terminal and not detail_terminal:
         return "live"
     if detail_capture is None or detail_capture.transcript_error:
         return "partial"

@@ -185,6 +185,36 @@ def test_live_caption_command_renders_partial_transcript(tmp_path: Path) -> None
     assert b"Live caption" in projected.files["transcript.md"]
 
 
+def test_stale_is_live_transitions_out_when_detail_summary_terminal(tmp_path: Path) -> None:
+    """List meetings can carry a stale is_live=True (the list API never returns
+    a terminal summary_status to clear it). A subsequently-fetched detail with
+    a terminal status must promote the meeting past capture_state="live" so
+    summary.md renders instead of staying stuck on "Summary pending"."""
+    capture = CaptureStore(tmp_path)
+    processor = CommandProcessor(capture)
+    list_meeting = _meeting("STALE01", summary_status="", is_live=True)
+    processor.apply(ListRefreshed(name="list-refreshed", meetings=[list_meeting]), fetched_at=1.0)
+    assert processor.projection.meetings[list_meeting.id].capture_state == "live"
+
+    completed = list_meeting.model_copy(update={
+        "is_live": False,
+        "meeting_info": MeetingInfo(summary_status="processed"),
+    })
+    processor.apply(
+        DetailFetched(name="detail-fetched", meeting_id=list_meeting.id, detail=_detail(completed)),
+        fetched_at=2.0,
+    )
+    processor.apply(
+        AccessLogsFetched(name="access-logs-fetched", meeting_id=list_meeting.id, logs=[_access_log()]),
+        fetched_at=3.0,
+    )
+
+    projected = processor.projection.meetings[list_meeting.id]
+    assert projected.capture_state == "captured"
+    assert projected.files["summary.md"] != b"_Summary pending_\n"
+    assert b"A concise summary." in projected.files["summary.md"]
+
+
 def test_store_serializes_concurrent_live_caption_commands(tmp_path: Path) -> None:
     live = _meeting("LIVE99", summary_status="processing", is_live=True)
     client = _DetailClient(TranscriptDetail(meeting=live))
