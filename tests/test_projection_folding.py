@@ -87,15 +87,44 @@ def test_zero_duration_completed_collision_folds_to_ghost(tmp_path: Path) -> Non
     assert projection.node("/2026-03/31/simon-luke-2") is None
 
 
-def test_non_terminal_zero_duration_collision_does_not_fold(tmp_path: Path) -> None:
-    real = _meeting("REAL01", duration_mins=30.0, epoch_offset_ms=1000.0)
-    candidate = _meeting("GHOST01", duration_mins=0.0, summary_status="")
+def test_empty_status_placeholder_folds_into_processed_sibling(tmp_path: Path) -> None:
+    """Fireflies keeps calendar-scheduled placeholders around forever with the
+    scheduled duration and an empty summary_status. When a same-slug processed
+    real meeting exists, the placeholder is not "the meeting still processing"
+    — it's an abandoned calendar entry that never recorded. Fold it under the
+    real one so the bare slug goes to the meeting with real content."""
+    placeholder = _meeting("PLACEHOLDER01", duration_mins=30.0, summary_status="")
+    real = _meeting("REAL01", duration_mins=30.0, epoch_offset_ms=6 * 3600 * 1000.0)
 
-    projection = _build_projection(tmp_path, [candidate, real])
+    projection = _build_projection(tmp_path, [placeholder, real])
 
-    assert projection.meetings["REAL01"].ghost_id is None
-    assert projection.meetings["GHOST01"].primary_path == "/2026-03/31/simon-luke"
-    assert projection.meetings["REAL01"].primary_path == "/2026-03/31/simon-luke-2"
+    assert projection.meetings["REAL01"].ghost_id == "PLACEHOLDER01"
+    assert projection.meetings["REAL01"].primary_path == "/2026-03/31/simon-luke"
+    assert projection.meetings["PLACEHOLDER01"].primary_path is None
+    assert projection.node("/2026-03/31/simon-luke/ghost/meeting.json") is not None
+    assert projection.node("/2026-03/31/simon-luke-2") is None
+
+
+def test_placeholder_overlap_and_ghost_coexist(tmp_path: Path) -> None:
+    """Real Fireflies emits both patterns on the same day for a standup that
+    ran once: a same-time empty placeholder (folded via overlap) AND a
+    different-time empty placeholder (folded via ghost). The real recording
+    must end up at the bare slug with both hidden under it."""
+    early_placeholder = _meeting(
+        "EARLY01", duration_mins=30.0, summary_status="", epoch_offset_ms=-6 * 3600 * 1000.0,
+    )
+    real = _meeting("REAL01", duration_mins=30.9)
+    same_time_placeholder = _meeting("SAMETIME01", duration_mins=30.0, summary_status="")
+
+    projection = _build_projection(tmp_path, [early_placeholder, real, same_time_placeholder])
+
+    assert projection.meetings["REAL01"].primary_path == "/2026-03/31/simon-luke"
+    assert projection.meetings["REAL01"].ghost_id == "EARLY01"
+    assert projection.meetings["REAL01"].overlap_ids == ("SAMETIME01",)
+    assert projection.meetings["EARLY01"].primary_path is None
+    assert projection.meetings["SAMETIME01"].primary_path is None
+    assert projection.node("/2026-03/31/simon-luke/ghost/meeting.json") is not None
+    assert projection.node("/2026-03/31/simon-luke/overlap/meeting.json") is not None
 
 
 def test_three_way_collision_does_not_fold_ghost(tmp_path: Path) -> None:

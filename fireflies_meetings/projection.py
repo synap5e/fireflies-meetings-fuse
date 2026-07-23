@@ -371,15 +371,43 @@ def _split_ghosts(meetings: list[Meeting]) -> tuple[list[Meeting], dict[str, str
     folded: set[str] = set()
     ghost_map: dict[str, str] = {}
     for group in groups.values():
-        if len(group) != 2:
+        if len(group) < 2:
             continue
-        ghosts = [m for m in group if m.duration_mins == 0 and m.summary_is_terminal]
-        real = [m for m in group if m.duration_mins > 0]
-        if len(ghosts) == 1 and real:
-            primary = min(real, key=lambda item: item.date_epoch_ms)
-            folded.add(ghosts[0].id)
-            ghost_map[primary.id] = ghosts[0].id
+        ghost, primary = _pick_ghost(group)
+        if ghost is not None and primary is not None:
+            folded.add(ghost.id)
+            ghost_map[primary.id] = ghost.id
     return [meeting for meeting in meetings if meeting.id not in folded], ghost_map
+
+
+def _pick_ghost(group: list[Meeting]) -> tuple[Meeting | None, Meeting | None]:
+    """Choose one ghost + primary from a slug group, or (None, None) if no fold applies.
+
+    Two patterns Fireflies emits as duplicates of the same real meeting:
+
+    - **Zero-duration terminal**: the meeting was scheduled and Fireflies
+      reached a terminal state without recording anything (dur=0, status
+      in TERMINAL_STATUSES). Only matches when the group is exactly (ghost,
+      real) — larger groups skip this branch so a stray zero-dur entry can't
+      swallow a real meeting.
+
+    - **Empty-status placeholder**: a calendar-scheduled entry that never
+      got processed. Fireflies keeps it in the list forever with dur=30 (from
+      the calendar) and empty summary_status. Fold when exactly one sibling
+      is `processed`. If several placeholders remain, pick the earliest —
+      any others fall through to overlap detection or get -N suffixes.
+    """
+    if len(group) == 2:
+        zero_dur = [m for m in group if m.duration_mins == 0 and m.summary_is_terminal]
+        real = [m for m in group if m.duration_mins > 0]
+        if len(zero_dur) == 1 and real:
+            return zero_dur[0], min(real, key=lambda item: item.date_epoch_ms)
+
+    processed = [m for m in group if m.meeting_info.summary_status == "processed"]
+    placeholders = [m for m in group if not m.meeting_info.summary_status]
+    if len(processed) == 1 and placeholders:
+        return min(placeholders, key=lambda item: item.date_epoch_ms), processed[0]
+    return None, None
 
 
 def _split_overlaps(meetings: list[Meeting]) -> tuple[list[Meeting], dict[str, list[str]]]:
