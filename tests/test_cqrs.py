@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import cast
 
+from fireflies_meetings import store as store_module
 from fireflies_meetings.api import FirefliesClient
 from fireflies_meetings.capture import CaptureStore, migrate_legacy_cache
 from fireflies_meetings.commands import (
@@ -239,6 +240,42 @@ def test_store_serializes_concurrent_live_caption_commands(tmp_path: Path) -> No
     assert projected.capture_state == "live"
     for index in range(50):
         assert f"Concurrent row {index}." in transcript
+
+
+def test_backfill_ages_out_empty_placeholder_after_threshold(tmp_path: Path, monkeypatch: object) -> None:
+    """Fireflies leaves calendar entries in the list forever with dur=0,
+    status='' when the bot never joined. Backfill fetches return 200 with
+    nothing; _capture_state stays 'partial' → infinite re-poll. After the
+    age threshold we promote the cached status to 'missing_from_api' so
+    the meeting reaches 'captured' and drops out of the backfill queue."""
+    placeholder_epoch = 1774891800000.0  # matches _meeting default
+    fresh_now = placeholder_epoch / 1000.0 + 3600.0  # 1h after meeting — under threshold
+    aged_now = placeholder_epoch / 1000.0 + 13 * 3600.0  # 13h after — over threshold
+
+    placeholder = _meeting("PH01", summary_status="", duration_mins=0.0)
+    empty_detail = TranscriptDetail(meeting=placeholder)
+
+    class _SeedingClient(_DetailClient):
+        def list_transcripts(self, *, max_pages: int | None = None) -> list[Meeting]:
+            return [placeholder]
+
+    client = _SeedingClient(empty_detail)
+    store = MeetingStore(
+        cast(FirefliesClient, client),
+        status_cache=StatusCache(cache_dir=tmp_path / "cache"),
+    )
+    store.refresh_list_if_needed()
+    assert store.projection.meetings["PH01"].capture_state == "partial"
+
+    monkeypatch.setattr(store_module.time, "time", lambda: fresh_now)  # type: ignore[attr-defined]
+    store.backfill_one("PH01")
+    assert store.projection.meetings["PH01"].capture_state == "partial", "fresh placeholder should still retry"
+
+    monkeypatch.setattr(store_module.time, "time", lambda: aged_now)  # type: ignore[attr-defined]
+    store.backfill_one("PH01")
+    projected = store.projection.meetings["PH01"]
+    assert projected.capture_state == "captured", "aged placeholder should drop out of the backfill queue"
+    assert "PH01" not in store.get_uncached_meeting_ids()
 
 
 def test_inode_map_survives_projection_swap_until_forget() -> None:

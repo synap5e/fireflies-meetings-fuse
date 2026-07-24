@@ -39,6 +39,7 @@ log = logging.getLogger(__name__)
 _BACKOFF_INITIAL = 30.0
 _BACKOFF_MAX = 900.0
 _BACKOFF_JITTER = 0.25
+_ABANDON_AFTER_MS = 12 * 3600 * 1000  # placeholder meetings older than this age out
 
 
 @dataclass(frozen=True)
@@ -83,6 +84,23 @@ class _BackoffState:
     @property
     def is_backed_off(self) -> bool:
         return self.fatal or time.monotonic() < self.until
+
+
+def _looks_abandoned(detail: TranscriptDetail, date_epoch_ms: float, *, now_ms: float) -> bool:
+    """Fireflies leaves calendar entries in the transcripts list forever with
+    dur=<scheduled>, status='' when the bot never joined or the recording
+    failed. A fetch of these returns 200 with no sentences/duration/status —
+    _capture_state stays 'partial' → the backfill loop re-polls them forever.
+
+    After the age threshold we promote the cached summary_status to
+    'missing_from_api' so the projection reaches 'captured' and the meeting
+    drops out of the backfill queue."""
+    m = detail.meeting
+    if m.meeting_info.summary_status or m.duration_mins > 0 or detail.sentences:
+        return False
+    if date_epoch_ms <= 0:
+        return False
+    return (now_ms - date_epoch_ms) > _ABANDON_AFTER_MS
 
 
 def _with_slug(meeting: Meeting) -> Meeting:
@@ -346,11 +364,17 @@ class MeetingStore:
         except httpx.HTTPError:
             self._backoff.record_failure()
             raise
-        detail = detail.model_copy(update={"meeting": detail.meeting.model_copy(update={
+        meeting_update: dict[str, object] = {
             "slug": item.meeting.slug,
             "date_str": item.meeting.date_str,
             "date_epoch_ms": item.meeting.date_epoch_ms,
-        })})
+        }
+        if _looks_abandoned(detail, item.meeting.date_epoch_ms, now_ms=time.time() * 1000):
+            log.info("Ageing out empty placeholder %s (%s)", meeting_id, item.meeting.title)
+            meeting_update["meeting_info"] = detail.meeting.meeting_info.model_copy(
+                update={"summary_status": "missing_from_api"},
+            )
+        detail = detail.model_copy(update={"meeting": detail.meeting.model_copy(update=meeting_update)})
         self._apply_command(DetailFetched(name="detail-fetched", meeting_id=meeting_id, detail=detail))
         if detail.meeting.is_completed:
             logs = detail.access_logs or self._client.get_access_logs(meeting_id)
