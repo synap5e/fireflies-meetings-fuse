@@ -186,6 +186,28 @@ def test_live_caption_command_renders_partial_transcript(tmp_path: Path) -> None
     assert b"Live caption" in projected.files["transcript.md"]
 
 
+def test_detail_terminal_still_is_live_captures_with_logs(tmp_path: Path) -> None:
+    """Even when the detail keeps is_live=True (a bug on Fireflies' side we've
+    observed on old meetings), a terminal summary_status + access logs is
+    enough evidence to promote past 'partial'. Previously _capture_state
+    required Meeting.is_completed, which is False whenever is_live=True — so
+    such meetings sat in the backfill queue forever."""
+    capture = CaptureStore(tmp_path)
+    processor = CommandProcessor(capture)
+    stuck_live = _meeting("STUCKLIVE01", summary_status="processed", is_live=True)
+    processor.apply(ListRefreshed(name="list-refreshed", meetings=[stuck_live]), fetched_at=1.0)
+    processor.apply(
+        DetailFetched(name="detail-fetched", meeting_id=stuck_live.id, detail=_detail(stuck_live)),
+        fetched_at=2.0,
+    )
+    processor.apply(
+        AccessLogsFetched(name="access-logs-fetched", meeting_id=stuck_live.id, logs=[_access_log()]),
+        fetched_at=3.0,
+    )
+    projected = processor.projection.meetings[stuck_live.id]
+    assert projected.capture_state == "captured"
+
+
 def test_stale_is_live_transitions_out_when_detail_summary_terminal(tmp_path: Path) -> None:
     """List meetings can carry a stale is_live=True (the list API never returns
     a terminal summary_status to clear it). A subsequently-fetched detail with

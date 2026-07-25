@@ -318,7 +318,7 @@ def _capture_state(
     status = detail_capture.meeting.meeting_info.summary_status or meeting.meeting_info.summary_status
     if status == "missing_from_api":
         return "captured"
-    if detail_capture.meeting.is_completed and has_access_log_capture:
+    if detail_capture.meeting.summary_is_terminal and has_access_log_capture:
         return "captured"
     return "partial"
 

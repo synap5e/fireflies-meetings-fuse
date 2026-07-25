@@ -376,7 +376,7 @@ class MeetingStore:
             )
         detail = detail.model_copy(update={"meeting": detail.meeting.model_copy(update=meeting_update)})
         self._apply_command(DetailFetched(name="detail-fetched", meeting_id=meeting_id, detail=detail))
-        if detail.meeting.is_completed:
+        if detail.meeting.summary_is_terminal:
             logs = detail.access_logs or self._client.get_access_logs(meeting_id)
             self._apply_command(AccessLogsFetched(name="access-logs-fetched", meeting_id=meeting_id, logs=list(logs)))
         self._backoff.record_success()
