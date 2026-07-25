@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import queue
 import threading
 from collections.abc import Callable
 from typing import cast
@@ -18,6 +19,15 @@ log = logging.getLogger(__name__)
 _LIVE_STREAM_URL = "https://realtime.firefliesapp.com"
 _LIVE_STREAM_NAMESPACE = "/transcription"
 _LIVE_STREAM_PATH = "/socket.io"
+
+# Cap the in-flight caption buffer. python-engineio spawns one background
+# thread per incoming message and calls our handler in it. If we call
+# on_update inline, that thread blocks on the store's projection-rebuild
+# lock while every subsequent caption spawns another thread that piles up
+# behind it (7k+ zombie threads observed in ~24h of a single live meeting).
+# Bounding the queue + dropping oldest keeps engineio's threads short-lived
+# and gives the drainer room to coalesce.
+_CAPTION_QUEUE_MAX = 1024
 
 
 class LiveTranscriptStreamError(Exception):
@@ -53,6 +63,63 @@ def normalize_stream_sentence(raw: object) -> tuple[str, Sentence] | None:
     return transcript_key, sentence
 
 
+def spawn_caption_drainer(
+    meeting_id: str,
+    caption_queue: queue.Queue[tuple[str, Sentence] | None],
+    on_update: Callable[[str, Sentence], None],
+) -> threading.Thread:
+    def drain_captions() -> None:
+        while True:
+            item = caption_queue.get()
+            if item is None:
+                return
+            transcript_id, sentence = item
+            try:
+                on_update(transcript_id, sentence)
+            except Exception:
+                log.exception("Live caption apply failed for %s", meeting_id)
+
+    drainer = threading.Thread(
+        target=drain_captions,
+        name=f"live-caption-drainer-{meeting_id}",
+        daemon=True,
+    )
+    drainer.start()
+    return drainer
+
+
+def make_broadcast_handler(
+    meeting_id: str,
+    caption_queue: queue.Queue[tuple[str, Sentence] | None],
+) -> Callable[[object], None]:
+    dropped = 0
+
+    def on_transcription_broadcast(raw: object) -> None:
+        nonlocal dropped
+        normalized = normalize_stream_sentence(raw)
+        if normalized is None:
+            return
+        try:
+            caption_queue.put_nowait(normalized)
+        except queue.Full:
+            dropped += 1
+            if dropped % 100 == 1:
+                log.warning(
+                    "Live caption drainer for %s falling behind; dropped %d captions",
+                    meeting_id, dropped,
+                )
+
+    return on_transcription_broadcast
+
+
+def shutdown_drainer(
+    caption_queue: queue.Queue[tuple[str, Sentence] | None],
+    drainer: threading.Thread,
+) -> None:
+    caption_queue.put(None)
+    drainer.join(timeout=5.0)
+
+
 def stream_live_transcript(
     client: FirefliesClient,
     meeting_id: str,
@@ -66,17 +133,12 @@ def stream_live_transcript(
         return
 
     sio = socketio.Client(reconnection=False, logger=False, engineio_logger=False, request_timeout=10)
-
-    def on_transcription_broadcast(raw: object) -> None:
-        normalized = normalize_stream_sentence(raw)
-        if normalized is None:
-            return
-        transcript_id, sentence = normalized
-        on_update(transcript_id, sentence)
+    caption_queue: queue.Queue[tuple[str, Sentence] | None] = queue.Queue(maxsize=_CAPTION_QUEUE_MAX)
+    drainer = spawn_caption_drainer(meeting_id, caption_queue, on_update)
 
     sio.on(
         "transcription.broadcast.event",
-        handler=on_transcription_broadcast,
+        handler=make_broadcast_handler(meeting_id, caption_queue),
         namespace=_LIVE_STREAM_NAMESPACE,
     )
 
@@ -100,9 +162,11 @@ def stream_live_transcript(
             auth={"token": token, "meetingId": meeting_id},
         )
     except (OSError, ValueError, socketio.exceptions.ConnectionError) as e:
+        shutdown_drainer(caption_queue, drainer)
         raise LiveTranscriptStreamError(str(e)) from e
     try:
         while not stop_event.wait(1.0):
             pass
     finally:
         sio.disconnect()
+        shutdown_drainer(caption_queue, drainer)

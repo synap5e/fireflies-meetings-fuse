@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+import queue
+import threading
+import time
 from pathlib import Path
 from typing import cast
 
 from fireflies_meetings.api import FirefliesClient
-from fireflies_meetings.live_stream import normalize_stream_sentence
+from fireflies_meetings.live_stream import (
+    make_broadcast_handler,
+    normalize_stream_sentence,
+    shutdown_drainer,
+    spawn_caption_drainer,
+)
 from fireflies_meetings.models import Meeting, MeetingInfo, Sentence, TranscriptDetail
 from fireflies_meetings.status_cache import StatusCache
 from fireflies_meetings.store import MeetingStore
@@ -53,6 +61,66 @@ def test_normalize_stream_sentence_parses_fireflies_event() -> None:
     assert sentence.index == 65156
     assert sentence.text == "Did you want some more events to be sent?"
     assert sentence.speaker_name == "Simon Pinfold"
+
+
+def test_broadcast_handler_returns_immediately_when_drainer_is_slow() -> None:
+    """The socketio handler runs in an engineio-spawned thread — if it blocks
+    on on_update, that thread lives until on_update returns, and further
+    incoming messages spawn more threads that pile up (7k+ zombie threads
+    observed in production). Handler must enqueue and return under a
+    millisecond even if the drainer is stuck."""
+    caption_queue: queue.Queue[tuple[str, Sentence] | None] = queue.Queue(maxsize=8)
+    handler = make_broadcast_handler("MEET01", caption_queue)
+
+    raw = {
+        "transcript_id": "1",
+        "sentence": "hello",
+        "speaker_name": "A",
+        "time": 1.0,
+        "endTime": 2.0,
+    }
+    start = time.perf_counter()
+    for _ in range(100):
+        handler(raw)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 0.5, f"handler blocked for {elapsed:.3f}s across 100 calls"
+
+
+def test_broadcast_handler_drops_when_queue_full_without_blocking() -> None:
+    """When the drainer can't keep up, over-cap captions must be dropped, not
+    block the handler — otherwise the leak this refactor prevents comes back."""
+    caption_queue: queue.Queue[tuple[str, Sentence] | None] = queue.Queue(maxsize=2)
+    handler = make_broadcast_handler("MEET01", caption_queue)
+
+    raw = {
+        "transcript_id": "1",
+        "sentence": "hello",
+        "speaker_name": "A",
+        "time": 1.0,
+        "endTime": 2.0,
+    }
+    for _ in range(10):
+        handler(raw)  # fills 2, drops 8; must not block
+    assert caption_queue.qsize() == 2
+
+
+def test_caption_drainer_delivers_and_shuts_down_cleanly() -> None:
+    caption_queue: queue.Queue[tuple[str, Sentence] | None] = queue.Queue(maxsize=8)
+    received: list[tuple[str, Sentence]] = []
+    lock = threading.Lock()
+
+    def on_update(transcript_id: str, sentence: Sentence) -> None:
+        with lock:
+            received.append((transcript_id, sentence))
+
+    drainer = spawn_caption_drainer("MEET01", caption_queue, on_update)
+    for i in range(5):
+        sentence = Sentence(index=i, text=f"t{i}", start_time=float(i), end_time=float(i + 1))
+        caption_queue.put((f"row-{i}", sentence))
+    shutdown_drainer(caption_queue, drainer)
+
+    assert not drainer.is_alive()
+    assert [tid for tid, _ in received] == [f"row-{i}" for i in range(5)]
 
 
 def test_stream_update_replaces_same_row(tmp_path: Path) -> None:
