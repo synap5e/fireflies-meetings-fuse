@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import queue
 import threading
 from collections.abc import Callable
 from typing import cast
@@ -19,15 +18,6 @@ log = logging.getLogger(__name__)
 _LIVE_STREAM_URL = "https://realtime.firefliesapp.com"
 _LIVE_STREAM_NAMESPACE = "/transcription"
 _LIVE_STREAM_PATH = "/socket.io"
-
-# Cap the in-flight caption buffer. python-engineio spawns one background
-# thread per incoming message and calls our handler in it. If we call
-# on_update inline, that thread blocks on the store's projection-rebuild
-# lock while every subsequent caption spawns another thread that piles up
-# behind it (7k+ zombie threads observed in ~24h of a single live meeting).
-# Bounding the queue + dropping oldest keeps engineio's threads short-lived
-# and gives the drainer room to coalesce.
-_CAPTION_QUEUE_MAX = 1024
 
 
 class LiveTranscriptStreamError(Exception):
@@ -63,17 +53,69 @@ def normalize_stream_sentence(raw: object) -> tuple[str, Sentence] | None:
     return transcript_key, sentence
 
 
+class CaptionCoalescer:
+    """Latest-per-transcript_id inbox for live captions.
+
+    python-engineio dispatches each incoming socketio message in its own
+    daemon thread. If our handler blocks (e.g. on the store's rebuild
+    lock), engineio spawns more threads that pile up — 7591 zombie threads
+    observed in 24h of one live meeting before the drainer split.
+
+    Fireflies also sends *progressive corrections* to the same
+    transcript_id (final revisions of a partial sentence). A FIFO queue
+    with drop-on-full preserves stale drafts and loses finals; instead we
+    coalesce by transcript_id — a newer caption for the same row replaces
+    the pending one. Bounded by the number of unique in-flight rows, not
+    by arrival rate.
+    """
+
+    def __init__(self) -> None:
+        self._pending: dict[str, tuple[str, Sentence]] = {}
+        self._lock = threading.Lock()
+        self._wakeup = threading.Event()
+        self._stopping = threading.Event()
+
+    def submit(self, transcript_id: str, sentence: Sentence) -> None:
+        with self._lock:
+            self._pending[transcript_id] = (transcript_id, sentence)
+        self._wakeup.set()
+
+    def drain_batch(self) -> list[tuple[str, Sentence]]:
+        with self._lock:
+            batch = list(self._pending.values())
+            self._pending.clear()
+        return batch
+
+    def wait_for_work(self, timeout: float | None = None) -> bool:
+        signalled = self._wakeup.wait(timeout=timeout)
+        self._wakeup.clear()
+        return signalled and not self._stopping.is_set()
+
+    def stop(self) -> None:
+        self._stopping.set()
+        self._wakeup.set()
+
+    @property
+    def stopping(self) -> bool:
+        return self._stopping.is_set()
+
+
 def spawn_caption_drainer(
     meeting_id: str,
-    caption_queue: queue.Queue[tuple[str, Sentence] | None],
+    coalescer: CaptionCoalescer,
     on_update: Callable[[str, Sentence], None],
 ) -> threading.Thread:
     def drain_captions() -> None:
-        while True:
-            item = caption_queue.get()
-            if item is None:
-                return
-            transcript_id, sentence = item
+        while not coalescer.stopping:
+            coalescer.wait_for_work()
+            for transcript_id, sentence in coalescer.drain_batch():
+                try:
+                    on_update(transcript_id, sentence)
+                except Exception:
+                    log.exception("Live caption apply failed for %s", meeting_id)
+        # Final drain — apply anything the coalescer accumulated between
+        # the last wait and stop() so we don't lose the meeting's last words.
+        for transcript_id, sentence in coalescer.drain_batch():
             try:
                 on_update(transcript_id, sentence)
             except Exception:
@@ -89,34 +131,20 @@ def spawn_caption_drainer(
 
 
 def make_broadcast_handler(
-    meeting_id: str,
-    caption_queue: queue.Queue[tuple[str, Sentence] | None],
+    coalescer: CaptionCoalescer,
 ) -> Callable[[object], None]:
-    dropped = 0
-
     def on_transcription_broadcast(raw: object) -> None:
-        nonlocal dropped
         normalized = normalize_stream_sentence(raw)
         if normalized is None:
             return
-        try:
-            caption_queue.put_nowait(normalized)
-        except queue.Full:
-            dropped += 1
-            if dropped % 100 == 1:
-                log.warning(
-                    "Live caption drainer for %s falling behind; dropped %d captions",
-                    meeting_id, dropped,
-                )
+        transcript_id, sentence = normalized
+        coalescer.submit(transcript_id, sentence)
 
     return on_transcription_broadcast
 
 
-def shutdown_drainer(
-    caption_queue: queue.Queue[tuple[str, Sentence] | None],
-    drainer: threading.Thread,
-) -> None:
-    caption_queue.put(None)
+def shutdown_drainer(coalescer: CaptionCoalescer, drainer: threading.Thread) -> None:
+    coalescer.stop()
     drainer.join(timeout=5.0)
 
 
@@ -133,12 +161,12 @@ def stream_live_transcript(
         return
 
     sio = socketio.Client(reconnection=False, logger=False, engineio_logger=False, request_timeout=10)
-    caption_queue: queue.Queue[tuple[str, Sentence] | None] = queue.Queue(maxsize=_CAPTION_QUEUE_MAX)
-    drainer = spawn_caption_drainer(meeting_id, caption_queue, on_update)
+    coalescer = CaptionCoalescer()
+    drainer = spawn_caption_drainer(meeting_id, coalescer, on_update)
 
     sio.on(
         "transcription.broadcast.event",
-        handler=make_broadcast_handler(meeting_id, caption_queue),
+        handler=make_broadcast_handler(coalescer),
         namespace=_LIVE_STREAM_NAMESPACE,
     )
 
@@ -162,11 +190,11 @@ def stream_live_transcript(
             auth={"token": token, "meetingId": meeting_id},
         )
     except (OSError, ValueError, socketio.exceptions.ConnectionError) as e:
-        shutdown_drainer(caption_queue, drainer)
+        shutdown_drainer(coalescer, drainer)
         raise LiveTranscriptStreamError(str(e)) from e
     try:
         while not stop_event.wait(1.0):
             pass
     finally:
         sio.disconnect()
-        shutdown_drainer(caption_queue, drainer)
+        shutdown_drainer(coalescer, drainer)

@@ -107,8 +107,17 @@ class CommandProcessor:
         self._diagnostics: dict[str, BackfillDiagnostic] = {}
         self._auth_fatal = False
         self._chat_auth_fatal = False
+        snapshot = capture.read_snapshot()
+        # Ids whose detail is terminal — captions arriving after we've locked
+        # in a final transcript must not re-taint it. Populated at boot from
+        # the on-disk snapshot; DetailFetched grows it live.
+        self._terminal_meeting_ids: set[str] = {
+            meeting_id
+            for meeting_id, detail in snapshot.details.items()
+            if detail.meeting.summary_is_terminal
+        }
         self.projection = projection or build_projection_from_captures(
-            capture.read_snapshot(),
+            snapshot,
             ProjectionBuildOptions(user_email=user_email),
         )
         self._send, self._receive = trio.open_memory_channel[Command](100)
@@ -138,6 +147,7 @@ class CommandProcessor:
             self._capture.write_detail(command.meeting_id, command.detail)
             if command.detail.meeting.summary_is_terminal:
                 self._live_captions.pop(command.meeting_id, None)
+                self._terminal_meeting_ids.add(command.meeting_id)
             invalidate_meeting_id = command.meeting_id
         elif isinstance(command, AccessLogsFetched):
             self._capture.write_access_logs(command.meeting_id, command.logs)
@@ -145,6 +155,12 @@ class CommandProcessor:
         elif isinstance(command, ChannelsRefreshed):
             self._capture.write_channels(command.channels, command.memberships, fetched_at=fetched_at)
         else:
+            # A late caption for a meeting whose detail is already terminal
+            # must not re-taint it. capture_state stays 'partial' between
+            # DetailFetched(terminal) and AccessLogsFetched, so the state
+            # check alone isn't a tight enough guard.
+            if command.meeting_id in self._terminal_meeting_ids:
+                return self.projection, None
             projected = self.projection.meetings.get(command.meeting_id)
             if projected is not None and projected.capture_state == "captured":
                 return self.projection, None

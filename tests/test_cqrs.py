@@ -186,6 +186,75 @@ def test_live_caption_command_renders_partial_transcript(tmp_path: Path) -> None
     assert b"Live caption" in projected.files["transcript.md"]
 
 
+def test_late_caption_cannot_taint_terminal_meeting(tmp_path: Path) -> None:
+    """DetailFetched(terminal) clears the meeting's captions and marks it
+    off-limits. AccessLogsFetched arrives later. In the window between them
+    the projection state is still 'partial' — a queued caption that arrives
+    there was silently re-injected into _live_captions (only 'captured' was
+    rejected) and merged into the terminal transcript by _project_detail.
+    The guard now keys off the terminal-detail set so late captions are
+    dropped regardless of arrival order."""
+    capture = CaptureStore(tmp_path)
+    processor = CommandProcessor(capture)
+    live = _meeting("MEET01", summary_status="processing", is_live=True)
+    processor.apply(ListRefreshed(name="list-refreshed", meetings=[live]), fetched_at=1.0)
+    processor.apply(
+        LiveCaptionArrived(name="live-caption-arrived", meeting_id=live.id, sentence=_sentence(1, "Real caption")),
+        fetched_at=2.0,
+    )
+
+    terminal = live.model_copy(update={
+        "is_live": False,
+        "meeting_info": MeetingInfo(summary_status="processed"),
+    })
+    processor.apply(
+        DetailFetched(name="detail-fetched", meeting_id=live.id, detail=_detail(terminal)),
+        fetched_at=3.0,
+    )
+    # Terminal detail is written; access logs haven't arrived yet, so state
+    # is 'partial'. A late caption sneaks in here — must be rejected.
+    assert processor.projection.meetings[live.id].capture_state == "partial"
+    processor.apply(
+        LiveCaptionArrived(name="live-caption-arrived", meeting_id=live.id, sentence=_sentence(99, "LATE STALE ROW")),
+        fetched_at=4.0,
+    )
+    processor.apply(
+        AccessLogsFetched(name="access-logs-fetched", meeting_id=live.id, logs=[_access_log()]),
+        fetched_at=5.0,
+    )
+
+    projected = processor.projection.meetings[live.id]
+    assert projected.capture_state == "captured"
+    assert b"LATE STALE ROW" not in projected.files["transcript.md"]
+
+
+def test_terminal_meeting_ids_survive_processor_reboot(tmp_path: Path) -> None:
+    """After restart, the in-memory terminal-ids set is empty. It must be
+    seeded from on-disk terminal details so the late-caption guard still
+    holds across the process boundary."""
+    capture = CaptureStore(tmp_path)
+    processor = CommandProcessor(capture)
+    live = _meeting("REBOOT01", summary_status="processed", is_live=False)
+    processor.apply(ListRefreshed(name="list-refreshed", meetings=[live]), fetched_at=1.0)
+    processor.apply(
+        DetailFetched(name="detail-fetched", meeting_id=live.id, detail=_detail(live)),
+        fetched_at=2.0,
+    )
+
+    reborn = CommandProcessor(capture)
+    reborn.apply(
+        LiveCaptionArrived(name="live-caption-arrived", meeting_id=live.id, sentence=_sentence(1, "GHOST CAPTION")),
+        fetched_at=3.0,
+    )
+    reborn.apply(
+        AccessLogsFetched(name="access-logs-fetched", meeting_id=live.id, logs=[_access_log()]),
+        fetched_at=4.0,
+    )
+    projected = reborn.projection.meetings[live.id]
+    assert projected.capture_state == "captured"
+    assert b"GHOST CAPTION" not in projected.files["transcript.md"]
+
+
 def test_detail_terminal_still_is_live_captures_with_logs(tmp_path: Path) -> None:
     """Even when the detail keeps is_live=True (a bug on Fireflies' side we've
     observed on old meetings), a terminal summary_status + access logs is
