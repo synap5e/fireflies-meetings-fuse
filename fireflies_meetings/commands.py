@@ -5,19 +5,22 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import gc
+import time
 from dataclasses import dataclass
 from typing import Literal
 
 import trio
 
+from .access_logs import AccessLogsOutcome
 from .capture import CaptureStore
-from .models import AccessLogEntry, Channel, Meeting, Sentence, TranscriptDetail
+from .models import Channel, Meeting, Sentence, TranscriptDetail
 from .projection import (
     BackfillDiagnostic,
     Projection,
     ProjectionBuildOptions,
     build_projection_from_captures,
 )
+from .resolver import merge_detail_observation, merge_list_observation
 
 _libc_name = ctypes.util.find_library("c")
 _libc = ctypes.CDLL(_libc_name) if _libc_name else None
@@ -53,7 +56,7 @@ class DetailFetched:
 class AccessLogsFetched:
     name: Literal["access-logs-fetched"]
     meeting_id: str
-    logs: list[AccessLogEntry]
+    outcome: AccessLogsOutcome
 
 
 @dataclass(frozen=True)
@@ -108,17 +111,9 @@ class CommandProcessor:
         self._auth_fatal = False
         self._chat_auth_fatal = False
         snapshot = capture.read_snapshot()
-        # Ids whose detail is terminal — captions arriving after we've locked
-        # in a final transcript must not re-taint it. Populated at boot from
-        # the on-disk snapshot; DetailFetched grows it live.
-        self._terminal_meeting_ids: set[str] = {
-            meeting_id
-            for meeting_id, detail in snapshot.details.items()
-            if detail.meeting.summary_is_terminal
-        }
         self.projection = projection or build_projection_from_captures(
             snapshot,
-            ProjectionBuildOptions(user_email=user_email),
+            ProjectionBuildOptions(user_email=user_email, now_ms=time.time() * 1000),
         )
         self._send, self._receive = trio.open_memory_channel[Command](100)
 
@@ -137,33 +132,28 @@ class CommandProcessor:
     def apply(self, command: Command, *, fetched_at: float) -> tuple[Projection, str | None]:
         invalidate_meeting_id: str | None = None
         if isinstance(command, ListRefreshed):
-            self._capture.write_list(command.meetings, fetched_at=fetched_at)
+            existing = {meeting.id: meeting for meeting in self._capture.read_list()}
+            meetings = [
+                merge_list_observation(existing.get(meeting.id), meeting)
+                for meeting in command.meetings
+            ]
+            self._capture.write_list(meetings, fetched_at=fetched_at)
         elif isinstance(command, StatusSupplemented):
             existing = {meeting.id: meeting for meeting in self._capture.read_list()}
             for meeting in command.meetings:
                 existing.setdefault(meeting.id, meeting)
             self._capture.write_list(list(existing.values()), fetched_at=fetched_at)
         elif isinstance(command, DetailFetched):
-            self._capture.write_detail(command.meeting_id, command.detail)
-            if command.detail.meeting.summary_is_terminal:
-                self._live_captions.pop(command.meeting_id, None)
-                self._terminal_meeting_ids.add(command.meeting_id)
+            previous = self._capture.read_details().get(command.meeting_id)
+            detail = merge_detail_observation(previous, command.detail)
+            self._capture.write_detail(command.meeting_id, detail)
             invalidate_meeting_id = command.meeting_id
         elif isinstance(command, AccessLogsFetched):
-            self._capture.write_access_logs(command.meeting_id, command.logs)
+            self._capture.write_access_logs(command.meeting_id, command.outcome)
             invalidate_meeting_id = command.meeting_id
         elif isinstance(command, ChannelsRefreshed):
             self._capture.write_channels(command.channels, command.memberships, fetched_at=fetched_at)
         else:
-            # A late caption for a meeting whose detail is already terminal
-            # must not re-taint it. capture_state stays 'partial' between
-            # DetailFetched(terminal) and AccessLogsFetched, so the state
-            # check alone isn't a tight enough guard.
-            if command.meeting_id in self._terminal_meeting_ids:
-                return self.projection, None
-            projected = self.projection.meetings.get(command.meeting_id)
-            if projected is not None and projected.capture_state == "captured":
-                return self.projection, None
             rows = self._live_captions.setdefault(command.meeting_id, {})
             rows[str(command.sentence.index)] = command.sentence
             invalidate_meeting_id = command.meeting_id
@@ -187,6 +177,7 @@ class CommandProcessor:
                 diagnostics=self._diagnostics,
                 auth_fatal=self._auth_fatal,
                 chat_auth_fatal=self._chat_auth_fatal,
+                now_ms=time.time() * 1000,
             ),
         )
         _return_freed_arenas_to_os()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from fireflies_meetings.access_logs import access_logs_ok
 from fireflies_meetings.capture import CaptureStore
 from fireflies_meetings.models import AccessLogEntry, Meeting, MeetingInfo, Sentence, TranscriptDetail
 from fireflies_meetings.projection import Projection, ProjectionBuildOptions, build_projection_from_captures
@@ -68,7 +69,7 @@ def _build_projection(
                 sentences=sentences.get(meeting.id, [_sentence(0, f"{meeting.id} sentence.")]),
             ),
         )
-        capture.write_access_logs(meeting.id, [_access_log()])
+        capture.write_access_logs(meeting.id, access_logs_ok([_access_log()]))
     return build_projection_from_captures(
         capture.read_snapshot(),
         ProjectionBuildOptions(user_email=user_email),

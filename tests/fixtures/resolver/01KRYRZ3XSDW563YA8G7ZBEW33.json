@@ -1,0 +1,54 @@
+{
+  "meeting_id": "01KRYRZ3XSDW563YA8G7ZBEW33",
+  "list_meeting": {
+    "id": "01KRYRZ3XSDW563YA8G7ZBEW33",
+    "title": "Assets Standup",
+    "date_epoch_ms": 1779836400000.0,
+    "date_str": "2026-05-27",
+    "duration_mins": 15.0,
+    "is_live": false,
+    "organizer_email": "mattmiller@comfy.org",
+    "participants": [],
+    "transcript_url": "https://app.fireflies.ai/view/01KRYRZ3XSDW563YA8G7ZBEW33",
+    "meeting_info": {
+      "fred_joined": false,
+      "silent_meeting": false,
+      "summary_status": "processed"
+    },
+    "slug": "assets-standup"
+  },
+  "detail": {
+    "meeting": {
+      "id": "01KRYRZ3XSDW563YA8G7ZBEW33",
+      "title": "Assets Standup",
+      "date_epoch_ms": 1779836400000.0,
+      "date_str": "2026-05-27",
+      "duration_mins": 11.640000343322754,
+      "is_live": false,
+      "organizer_email": "mattmiller@comfy.org",
+      "participants": [
+        "luke@comfy.org,simonpinfold@comfy.org,drjkl@comfy.org,jacob@comfy.org,mattmiller@comfy.org,robin@comfy.org,jaewon@comfy.org",
+        "luke@comfy.org",
+        "simonpinfold@comfy.org",
+        "drjkl@comfy.org",
+        "jacob@comfy.org",
+        "robin@comfy.org",
+        "jaewon@comfy.org"
+      ],
+      "transcript_url": "https://app.fireflies.ai/view/01KRYRZ3XSDW563YA8G7ZBEW33",
+      "meeting_info": {
+        "fred_joined": true,
+        "silent_meeting": true,
+        "summary_status": "skipped"
+      },
+      "slug": ""
+    },
+    "sentences": [],
+    "speakers": [],
+    "summary": null,
+    "attendees": [],
+    "access_logs": [],
+    "transcript_error": ""
+  },
+  "access_logs": []
+}

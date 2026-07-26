@@ -1,0 +1,72 @@
+{
+  "meeting_id": "01KY5KYMJV24A6JXE283MJ3SGM",
+  "list_meeting": {
+    "id": "01KY5KYMJV24A6JXE283MJ3SGM",
+    "title": "7/22 - Allyson & Todd Terrazas (FBRC.ai / AI On The Lot / LA Comfy meetups)",
+    "date_epoch_ms": 1784747700000.0,
+    "date_str": "2026-07-23",
+    "duration_mins": 46.18000030517578,
+    "is_live": false,
+    "organizer_email": "allyson@comfy.org",
+    "participants": [
+      "allyson@comfy.org"
+    ],
+    "transcript_url": "https://app.fireflies.ai/view/01KY5KYMJV24A6JXE283MJ3SGM",
+    "meeting_info": {
+      "fred_joined": false,
+      "silent_meeting": false,
+      "summary_status": "processed"
+    },
+    "slug": "7-22-allyson-todd-terrazas-fbrc-ai-ai-on-the-lot-la-comfy"
+  },
+  "detail": {
+    "meeting": {
+      "id": "01KY5KYMJV24A6JXE283MJ3SGM",
+      "title": "Jul 22, 12:13 PM",
+      "date_epoch_ms": 1784747700000.0,
+      "date_str": "2026-07-23",
+      "duration_mins": 46.18000030517578,
+      "is_live": false,
+      "organizer_email": "allyson@comfy.org",
+      "participants": [
+        "allyson@comfy.org"
+      ],
+      "transcript_url": "https://app.fireflies.ai/view/01KY5KYMJV24A6JXE283MJ3SGM",
+      "meeting_info": {
+        "fred_joined": false,
+        "silent_meeting": false,
+        "summary_status": "processed"
+      },
+      "slug": "jul-22-12-13-pm"
+    },
+    "sentences": [
+      {
+        "index": 0,
+        "text": "Hooray.",
+        "start_time": 2.32,
+        "end_time": 2.8,
+        "speaker_name": "Speaker 1"
+      },
+      {
+        "index": 1,
+        "text": "So, yeah, good vibes.",
+        "start_time": 3.6,
+        "end_time": 5.44,
+        "speaker_name": "Speaker 1"
+      },
+      {
+        "index": 2,
+        "text": "Yeah.",
+        "start_time": 8.88,
+        "end_time": 9.24,
+        "speaker_name": "Speaker 2"
+      }
+    ],
+    "speakers": [],
+    "summary": null,
+    "attendees": [],
+    "access_logs": [],
+    "transcript_error": ""
+  },
+  "access_logs": []
+}

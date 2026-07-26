@@ -1,0 +1,70 @@
+{
+  "meeting_id": "01KS8VAT08HQXHX43CXV6WP6K5",
+  "list_meeting": {
+    "id": "01KS8VAT08HQXHX43CXV6WP6K5",
+    "title": "Simon <> Luke",
+    "date_epoch_ms": 1779487295073.0,
+    "date_str": "2026-05-23",
+    "duration_mins": 26.33415,
+    "is_live": false,
+    "organizer_email": "simonpinfold@comfy.org",
+    "participants": [],
+    "transcript_url": "https://app.fireflies.ai/view/01KS8VAT08HQXHX43CXV6WP6K5",
+    "meeting_info": {
+      "fred_joined": false,
+      "silent_meeting": false,
+      "summary_status": "processed"
+    },
+    "slug": "simon-luke"
+  },
+  "detail": {
+    "meeting": {
+      "id": "01KS8VAT08HQXHX43CXV6WP6K5",
+      "title": "Simon <> Luke",
+      "date_epoch_ms": 1779487200000.0,
+      "date_str": "2026-05-23",
+      "duration_mins": 27.0,
+      "is_live": false,
+      "organizer_email": "simonpinfold@comfy.org",
+      "participants": [
+        "luke@comfy.org"
+      ],
+      "transcript_url": "https://app.fireflies.ai/view/01KS8VAT08HQXHX43CXV6WP6K5",
+      "meeting_info": {
+        "fred_joined": false,
+        "silent_meeting": false,
+        "summary_status": "processed"
+      },
+      "slug": ""
+    },
+    "sentences": [
+      {
+        "index": 0,
+        "text": "Hey.",
+        "start_time": 0.08,
+        "end_time": 0.4,
+        "speaker_name": "Luke Mino-Altherr"
+      },
+      {
+        "index": 1,
+        "text": "Hey.",
+        "start_time": 0.4,
+        "end_time": 0.88,
+        "speaker_name": "Simon Pinfold"
+      },
+      {
+        "index": 2,
+        "text": "How you doing?",
+        "start_time": 1.68,
+        "end_time": 2.32,
+        "speaker_name": "Simon Pinfold"
+      }
+    ],
+    "speakers": [],
+    "summary": null,
+    "attendees": [],
+    "access_logs": [],
+    "transcript_error": ""
+  },
+  "access_logs": []
+}

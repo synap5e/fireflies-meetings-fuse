@@ -6,6 +6,13 @@ from pathlib import Path
 from typing import cast
 
 from fireflies_meetings import store as store_module
+from fireflies_meetings.access_logs import (
+    ACCESS_LOGS_FAILED,
+    AccessLogsFailed,
+    AccessLogsOk,
+    AccessLogsOutcome,
+    access_logs_ok,
+)
 from fireflies_meetings.api import FirefliesClient
 from fireflies_meetings.capture import CaptureStore, migrate_legacy_cache
 from fireflies_meetings.commands import (
@@ -46,8 +53,8 @@ class _DetailClient:
     def list_recent_status_meetings(self, *, limit: int = 100) -> list[Meeting]:
         return []
 
-    def get_access_logs(self, meeting_id: str) -> list[AccessLogEntry]:
-        return []
+    def get_access_logs(self, meeting_id: str) -> AccessLogsOutcome:
+        return access_logs_ok([])
 
 
 def _meeting(
@@ -109,7 +116,7 @@ def test_projection_build_is_idempotent(tmp_path: Path) -> None:
     meeting = _meeting()
     capture.write_list([meeting], fetched_at=1.0)
     capture.write_detail(meeting.id, _detail(meeting))
-    capture.write_access_logs(meeting.id, [_access_log()])
+    capture.write_access_logs(meeting.id, access_logs_ok([_access_log()]))
 
     first = build_projection_from_captures(capture.read_snapshot())
     second = build_projection_from_captures(capture.read_snapshot())
@@ -132,7 +139,11 @@ def test_commands_update_projection_and_capture_files(tmp_path: Path) -> None:
     assert (tmp_path / "meetings" / meeting.id / "detail.json").is_file()
 
     processor.apply(
-        AccessLogsFetched(name="access-logs-fetched", meeting_id=meeting.id, logs=[_access_log()]),
+        AccessLogsFetched(
+            name="access-logs-fetched",
+            meeting_id=meeting.id,
+            outcome=access_logs_ok([_access_log()]),
+        ),
         fetched_at=3.0,
     )
     assert processor.projection.meetings[meeting.id].capture_state == "captured"
@@ -161,7 +172,11 @@ def test_command_edges_unknown_detail_status_supplement_and_late_live(tmp_path: 
         fetched_at=5.0,
     )
     processor.apply(
-        AccessLogsFetched(name="access-logs-fetched", meeting_id=captured.id, logs=[_access_log()]),
+        AccessLogsFetched(
+            name="access-logs-fetched",
+            meeting_id=captured.id,
+            outcome=access_logs_ok([_access_log()]),
+        ),
         fetched_at=6.0,
     )
     before = processor.projection.meetings[captured.id].files["transcript.md"]
@@ -219,7 +234,11 @@ def test_late_caption_cannot_taint_terminal_meeting(tmp_path: Path) -> None:
         fetched_at=4.0,
     )
     processor.apply(
-        AccessLogsFetched(name="access-logs-fetched", meeting_id=live.id, logs=[_access_log()]),
+        AccessLogsFetched(
+            name="access-logs-fetched",
+            meeting_id=live.id,
+            outcome=access_logs_ok([_access_log()]),
+        ),
         fetched_at=5.0,
     )
 
@@ -247,7 +266,11 @@ def test_terminal_meeting_ids_survive_processor_reboot(tmp_path: Path) -> None:
         fetched_at=3.0,
     )
     reborn.apply(
-        AccessLogsFetched(name="access-logs-fetched", meeting_id=live.id, logs=[_access_log()]),
+        AccessLogsFetched(
+            name="access-logs-fetched",
+            meeting_id=live.id,
+            outcome=access_logs_ok([_access_log()]),
+        ),
         fetched_at=4.0,
     )
     projected = reborn.projection.meetings[live.id]
@@ -270,7 +293,11 @@ def test_detail_terminal_still_is_live_captures_with_logs(tmp_path: Path) -> Non
         fetched_at=2.0,
     )
     processor.apply(
-        AccessLogsFetched(name="access-logs-fetched", meeting_id=stuck_live.id, logs=[_access_log()]),
+        AccessLogsFetched(
+            name="access-logs-fetched",
+            meeting_id=stuck_live.id,
+            outcome=access_logs_ok([_access_log()]),
+        ),
         fetched_at=3.0,
     )
     projected = processor.projection.meetings[stuck_live.id]
@@ -297,7 +324,11 @@ def test_stale_is_live_transitions_out_when_detail_summary_terminal(tmp_path: Pa
         fetched_at=2.0,
     )
     processor.apply(
-        AccessLogsFetched(name="access-logs-fetched", meeting_id=list_meeting.id, logs=[_access_log()]),
+        AccessLogsFetched(
+            name="access-logs-fetched",
+            meeting_id=list_meeting.id,
+            outcome=access_logs_ok([_access_log()]),
+        ),
         fetched_at=3.0,
     )
 
@@ -417,8 +448,13 @@ def test_migration_round_trip_preserves_structured_data(tmp_path: Path) -> None:
     migrate_legacy_cache(tmp_path)
 
     detail = TranscriptDetail.model_validate_json((tmp_path / "meetings" / "MEET01" / "detail.json").read_text())
-    logs_raw = json.loads((tmp_path / "meetings" / "MEET01" / "access_logs.json").read_text())
-    logs = [AccessLogEntry.model_validate(item) for item in logs_raw]
+    logs_raw: object = json.loads((tmp_path / "meetings" / "MEET01" / "access_logs.json").read_text())
+    assert isinstance(logs_raw, dict)
+    typed_logs = cast("dict[str, object]", logs_raw)
+    raw_log_items = typed_logs.get("logs")
+    assert isinstance(raw_log_items, list)
+    logs = [AccessLogEntry.model_validate(item) for item in cast("list[object]", raw_log_items)]
+    assert typed_logs["outcome"] == "ok"
     assert detail.sentences[0].text == "Stored text"
     assert detail.summary is not None and detail.summary.short_summary == "Stored summary"
     assert detail.speakers[0].name == "Alice"
@@ -429,6 +465,23 @@ def test_migration_round_trip_preserves_structured_data(tmp_path: Path) -> None:
     assert list(tmp_path.glob("detail.legacy.*"))
 
 
+def test_access_log_capture_reads_legacy_list_and_round_trips_tagged_outcomes(tmp_path: Path) -> None:
+    capture = CaptureStore(tmp_path)
+    legacy_path = capture.access_logs_path("LEGACY01")
+    legacy_path.parent.mkdir(parents=True)
+    legacy_path.write_text(json.dumps([_access_log().model_dump()]))
+
+    legacy = capture.read_access_logs()["LEGACY01"]
+    assert isinstance(legacy, AccessLogsOk)
+    assert legacy.logs == (_access_log(),)
+
+    capture.write_access_logs("FAILED01", ACCESS_LOGS_FAILED)
+    failed = capture.read_access_logs()["FAILED01"]
+    assert isinstance(failed, AccessLogsFailed)
+    failed_raw = json.loads(capture.access_logs_path("FAILED01").read_text())
+    assert failed_raw == {"outcome": "failed"}
+
+
 def test_in_progress_surface_is_minimal_and_machine_readable(tmp_path: Path) -> None:
     capture = CaptureStore(tmp_path)
     captured = _meeting("CAPTURED01")
@@ -436,7 +489,7 @@ def test_in_progress_surface_is_minimal_and_machine_readable(tmp_path: Path) -> 
     live = _meeting("LIVE01", title="Live", summary_status="processing", is_live=True)
     capture.write_list([captured, partial, live], fetched_at=1.0)
     capture.write_detail(captured.id, _detail(captured))
-    capture.write_access_logs(captured.id, [_access_log()])
+    capture.write_access_logs(captured.id, access_logs_ok([_access_log()]))
 
     projection = build_projection_from_captures(capture.read_snapshot())
 

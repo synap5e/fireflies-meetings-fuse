@@ -12,6 +12,7 @@ from pathlib import Path
 
 import httpx
 
+from .access_logs import access_logs_ok
 from .api import (
     FatalAPIError,
     FirefliesClient,
@@ -39,7 +40,6 @@ log = logging.getLogger(__name__)
 _BACKOFF_INITIAL = 30.0
 _BACKOFF_MAX = 900.0
 _BACKOFF_JITTER = 0.25
-_ABANDON_AFTER_MS = 12 * 3600 * 1000  # placeholder meetings older than this age out
 
 
 @dataclass(frozen=True)
@@ -86,46 +86,10 @@ class _BackoffState:
         return self.fatal or time.monotonic() < self.until
 
 
-def _looks_abandoned(detail: TranscriptDetail, date_epoch_ms: float, *, now_ms: float) -> bool:
-    """Fireflies leaves calendar entries in the transcripts list forever with
-    dur=<scheduled>, status='' when the bot never joined or the recording
-    failed. A fetch of these returns 200 with no sentences/duration/status —
-    _capture_state stays 'partial' → the backfill loop re-polls them forever.
-
-    After the age threshold we promote the cached summary_status to
-    'missing_from_api' so the projection reaches 'captured' and the meeting
-    drops out of the backfill queue."""
-    m = detail.meeting
-    if m.meeting_info.summary_status or m.duration_mins > 0 or detail.sentences:
-        return False
-    if date_epoch_ms <= 0:
-        return False
-    return (now_ms - date_epoch_ms) > _ABANDON_AFTER_MS
-
-
 def _with_slug(meeting: Meeting) -> Meeting:
     if meeting.slug:
         return meeting
     return meeting.model_copy(update={"slug": slugify(meeting.title) if meeting.title else meeting.id[:12]})
-
-
-def _merge_refresh_entry(existing: MeetingEntry | None, new_entry: MeetingEntry) -> MeetingEntry:
-    if existing is None:
-        return new_entry
-    overrides: dict[str, object] = {}
-    if (
-        existing.meeting.is_live
-        and not new_entry.meeting.is_live
-        and not new_entry.meeting.summary_is_terminal
-    ):
-        overrides["is_live"] = True
-    if new_entry.meeting.date_epoch_ms == 0 and existing.meeting.date_epoch_ms > 0:
-        overrides["date_epoch_ms"] = existing.meeting.date_epoch_ms
-        overrides["date_str"] = existing.meeting.date_str
-    if not overrides:
-        return new_entry
-    meeting = new_entry.meeting.model_copy(update=overrides)
-    return MeetingEntry(meeting=meeting, slug=meeting.slug)
 
 
 class MeetingStore:
@@ -201,19 +165,11 @@ class MeetingStore:
             self._backoff.record_failure()
             return
 
-        existing = {
-            meeting_id: MeetingEntry(meeting=item.meeting, slug=item.meeting.slug)
-            for meeting_id, item in self._projection.meetings.items()
-        }
-        refreshed: list[Meeting] = []
-        for meeting in primary:
-            slugged = _with_slug(meeting)
-            merged = _merge_refresh_entry(existing.get(slugged.id), MeetingEntry(slugged, slugged.slug))
-            refreshed.append(merged.meeting)
+        refreshed = [_with_slug(meeting) for meeting in primary]
         if is_initial:
             self._apply_command(ListRefreshed(name="list-refreshed", meetings=refreshed))
         else:
-            merged_by_id = {item.meeting.id: item.meeting for item in existing.values()}
+            merged_by_id = {meeting.id: meeting for meeting in self._capture.read_list()}
             merged_by_id.update({meeting.id: meeting for meeting in refreshed})
             self._apply_command(ListRefreshed(name="list-refreshed", meetings=list(merged_by_id.values())))
         if supplemental:
@@ -369,16 +325,22 @@ class MeetingStore:
             "date_str": item.meeting.date_str,
             "date_epoch_ms": item.meeting.date_epoch_ms,
         }
-        if _looks_abandoned(detail, item.meeting.date_epoch_ms, now_ms=time.time() * 1000):
-            log.info("Ageing out empty placeholder %s (%s)", meeting_id, item.meeting.title)
-            meeting_update["meeting_info"] = detail.meeting.meeting_info.model_copy(
-                update={"summary_status": "missing_from_api"},
-            )
         detail = detail.model_copy(update={"meeting": detail.meeting.model_copy(update=meeting_update)})
         self._apply_command(DetailFetched(name="detail-fetched", meeting_id=meeting_id, detail=detail))
-        if detail.meeting.summary_is_terminal:
-            logs = detail.access_logs or self._client.get_access_logs(meeting_id)
-            self._apply_command(AccessLogsFetched(name="access-logs-fetched", meeting_id=meeting_id, logs=list(logs)))
+        resolved = self._projection.meetings.get(meeting_id)
+        if resolved is not None and resolved.meeting.summary_is_terminal:
+            outcome = (
+                access_logs_ok(detail.access_logs)
+                if detail.access_logs
+                else self._client.get_access_logs(meeting_id)
+            )
+            self._apply_command(
+                AccessLogsFetched(
+                    name="access-logs-fetched",
+                    meeting_id=meeting_id,
+                    outcome=outcome,
+                ),
+            )
         self._backoff.record_success()
         self._notify_live_change(meeting_id)
 

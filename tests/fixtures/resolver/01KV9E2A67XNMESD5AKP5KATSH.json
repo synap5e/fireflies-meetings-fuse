@@ -1,0 +1,55 @@
+{
+  "meeting_id": "01KV9E2A67XNMESD5AKP5KATSH",
+  "list_meeting": {
+    "id": "01KV9E2A67XNMESD5AKP5KATSH",
+    "title": "Hold for PR Review",
+    "date_epoch_ms": 1782342000000.0,
+    "date_str": "2026-06-25",
+    "duration_mins": 60.0,
+    "is_live": false,
+    "organizer_email": "luke@comfy.org",
+    "participants": [],
+    "transcript_url": "https://app.fireflies.ai/view/01KV9E2A67XNMESD5AKP5KATSH",
+    "meeting_info": {
+      "fred_joined": false,
+      "silent_meeting": false,
+      "summary_status": ""
+    },
+    "slug": "hold-for-pr-review"
+  },
+  "detail": {
+    "meeting": {
+      "id": "01KV9E2A67XNMESD5AKP5KATSH",
+      "title": "Hold for PR Review",
+      "date_epoch_ms": 1782342000000.0,
+      "date_str": "2026-06-25",
+      "duration_mins": 0.0,
+      "is_live": false,
+      "organizer_email": "luke@comfy.org",
+      "participants": [
+        "luke@comfy.org",
+        "simonpinfold@comfy.org",
+        "kishore@comfy.org",
+        "hunter@comfy.org",
+        "si@comfy.org",
+        "mattmiller@comfy.org",
+        "deep@comfy.org",
+        "wei@comfy.org"
+      ],
+      "transcript_url": "https://app.fireflies.ai/view/01KV9E2A67XNMESD5AKP5KATSH",
+      "meeting_info": {
+        "fred_joined": false,
+        "silent_meeting": false,
+        "summary_status": "missing_from_api"
+      },
+      "slug": "hold-for-pr-review"
+    },
+    "sentences": [],
+    "speakers": [],
+    "summary": null,
+    "attendees": [],
+    "access_logs": [],
+    "transcript_error": ""
+  },
+  "access_logs": []
+}

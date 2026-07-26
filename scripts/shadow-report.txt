@@ -1,0 +1,35 @@
+# Resolver shadow-comparison report
+
+cache: /home/simon/.cache/fireflies-meetings
+meetings: 1780
+resolver determinism delta: 0
+
+## Audited precedence conflict populations
+- date_epoch_ms: 62
+- date_str: 9
+- duration_mins: 317
+- fred_joined: 147
+- is_live: 3
+- participants: 1376
+- summary_status: 261
+- title: 7
+
+## Canonical field deltas vs legacy ProjectedMeeting.meeting
+- date_epoch_ms: 8
+- date_str: 8
+- duration_mins: 159
+- is_live: 2
+- meeting_info.fred_joined: 147
+- meeting_info.summary_status: 261
+
+## Rendered-file deltas vs legacy rendering
+- meeting.json: 1388
+- participants.md: 439
+- summary.md: 434
+- transcript.md: 18
+- views.md: 18
+
+## State deltas
+
+## Unexpected
+0 meetings with unexpected delta

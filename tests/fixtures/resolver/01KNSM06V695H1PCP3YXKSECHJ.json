@@ -1,0 +1,80 @@
+{
+  "meeting_id": "01KNSM06V695H1PCP3YXKSECHJ",
+  "list_meeting": {
+    "id": "01KNSM06V695H1PCP3YXKSECHJ",
+    "title": "Simon <> Luke",
+    "date_epoch_ms": 0.0,
+    "date_str": "",
+    "duration_mins": 0.0,
+    "is_live": false,
+    "organizer_email": "luke@comfy.org",
+    "participants": [],
+    "transcript_url": "https://app.fireflies.ai/view/01KNSM06V695H1PCP3YXKSECHJ",
+    "meeting_info": {
+      "fred_joined": false,
+      "silent_meeting": false,
+      "summary_status": "processed"
+    },
+    "slug": "simon-luke"
+  },
+  "detail": {
+    "meeting": {
+      "id": "01KNSM06V695H1PCP3YXKSECHJ",
+      "title": "Simon <> Luke",
+      "date_epoch_ms": 1776209400000.0,
+      "date_str": "2026-04-15",
+      "duration_mins": 35.130001068115234,
+      "is_live": false,
+      "organizer_email": "luke@comfy.org",
+      "participants": [
+        "luke@comfy.org,simonpinfold@comfy.org",
+        "simonpinfold@comfy.org"
+      ],
+      "transcript_url": "https://app.fireflies.ai/view/01KNSM06V695H1PCP3YXKSECHJ",
+      "meeting_info": {
+        "fred_joined": true,
+        "silent_meeting": false,
+        "summary_status": "processed"
+      },
+      "slug": ""
+    },
+    "sentences": [
+      {
+        "index": 0,
+        "text": "Not feeling like.",
+        "start_time": 0.4,
+        "end_time": 1.76,
+        "speaker_name": "Simon Pinfold"
+      },
+      {
+        "index": 1,
+        "text": "Yeah, slept like two hours night before last, so my brain was just like pretty Brian brain fog yesterday.",
+        "start_time": 1.84,
+        "end_time": 10.12,
+        "speaker_name": "Simon Pinfold"
+      },
+      {
+        "index": 2,
+        "text": "But okay.",
+        "start_time": 10.12,
+        "end_time": 12.12,
+        "speaker_name": "Luke Mino-Altherr"
+      }
+    ],
+    "speakers": [],
+    "summary": null,
+    "attendees": [],
+    "access_logs": [],
+    "transcript_error": ""
+  },
+  "access_logs": [
+    {
+      "id": "69ded7c2bb4f8d513b9e3cde",
+      "user_id": "01KJRDPFY833WRQX73KXY57KEQ",
+      "user_email": "luke@comfy.org",
+      "user_name": "Luke Mino-Altherr",
+      "action": "view_summary",
+      "timestamp": "2026-04-15T00:11:46.557Z"
+    }
+  ]
+}

@@ -18,6 +18,13 @@ from typing import cast
 
 from pydantic import ValidationError
 
+from .access_logs import (
+    ACCESS_LOGS_FAILED,
+    ACCESS_LOGS_PENDING,
+    AccessLogsOk,
+    AccessLogsOutcome,
+    access_logs_ok,
+)
 from .api import JsonObject
 from .models import AccessLogEntry, Channel, Meeting, TranscriptDetail
 
@@ -46,7 +53,7 @@ def _dump_json_bytes(value: object) -> bytes:
 class CaptureSnapshot:
     meetings: tuple[Meeting, ...]
     details: dict[str, TranscriptDetail]
-    access_logs: dict[str, tuple[AccessLogEntry, ...]]
+    access_logs: dict[str, AccessLogsOutcome]
     channels: tuple[Channel, ...] = ()
     channel_memberships: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
@@ -181,10 +188,10 @@ class CaptureStore:
     def write_detail(self, meeting_id: str, detail: TranscriptDetail) -> None:
         atomic_write_bytes(self.detail_path(meeting_id), detail.model_dump_json(indent=2).encode() + b"\n")
 
-    def read_access_logs(self) -> dict[str, tuple[AccessLogEntry, ...]]:
-        logs: dict[str, tuple[AccessLogEntry, ...]] = {}
+    def read_access_logs(self) -> dict[str, AccessLogsOutcome]:
+        outcomes: dict[str, AccessLogsOutcome] = {}
         if not self.meetings_dir.is_dir():
-            return logs
+            return outcomes
         for meeting_dir in self.meetings_dir.iterdir():
             if not meeting_dir.is_dir():
                 continue
@@ -196,23 +203,22 @@ class CaptureStore:
             except (OSError, json.JSONDecodeError) as e:
                 log.warning("Skipping malformed access-log capture %s: %s", path, e)
                 continue
-            if not isinstance(raw, list):
-                continue
-            entries: list[AccessLogEntry] = []
-            for item in cast("list[object]", raw):
-                if not isinstance(item, dict):
-                    continue
-                try:
-                    entries.append(AccessLogEntry.model_validate(item))
-                except ValidationError as e:
-                    log.debug("Skipping malformed access-log row in %s: %s", path, e)
-            logs[meeting_dir.name] = tuple(entries)
-        return logs
+            outcome = _parse_access_logs_outcome(raw, path=path)
+            if outcome is not None:
+                outcomes[meeting_dir.name] = outcome
+        return outcomes
 
-    def write_access_logs(self, meeting_id: str, logs: list[AccessLogEntry]) -> None:
+    def write_access_logs(self, meeting_id: str, outcome: AccessLogsOutcome) -> None:
+        if isinstance(outcome, AccessLogsOk):
+            body: object = {
+                "outcome": "ok",
+                "logs": [entry.model_dump() for entry in outcome.logs],
+            }
+        else:
+            body = {"outcome": outcome.outcome}
         atomic_write_bytes(
             self.access_logs_path(meeting_id),
-            _dump_json_bytes([entry.model_dump() for entry in logs]),
+            _dump_json_bytes(body),
         )
 
 
@@ -250,7 +256,10 @@ def migrate_legacy_cache(cache_dir: Path) -> None:
             )
             atomic_write_bytes(
                 target / "access_logs.json",
-                _dump_json_bytes([entry.model_dump() for entry in logs]),
+                _dump_json_bytes({
+                    "outcome": "ok",
+                    "logs": [entry.model_dump() for entry in logs],
+                }),
             )
             migrated += 1
 
@@ -307,10 +316,46 @@ def _verify_staging(staging: Path) -> None:
             continue
         TranscriptDetail.model_validate_json((meeting_dir / "detail.json").read_text())
         raw: object = json.loads((meeting_dir / "access_logs.json").read_text())
-        if not isinstance(raw, list):
-            raise ValueError(f"{meeting_dir / 'access_logs.json'} is not a list")
-        for item in cast("list[object]", raw):
-            AccessLogEntry.model_validate(item)
+        if _parse_access_logs_outcome(raw, path=meeting_dir / "access_logs.json") is None:
+            raise ValueError(f"{meeting_dir / 'access_logs.json'} has no valid outcome")
+
+
+def _parse_access_logs_outcome(
+    raw: object,
+    *,
+    path: Path,
+) -> AccessLogsOutcome | None:
+    """Parse tagged captures plus legacy bare-list captures."""
+    raw_logs: list[object]
+    if isinstance(raw, list):
+        raw_logs = cast("list[object]", raw)
+    elif isinstance(raw, dict):
+        typed = cast("JsonObject", raw)
+        tag = typed.get("outcome")
+        if tag == "pending":
+            return ACCESS_LOGS_PENDING
+        if tag == "failed":
+            return ACCESS_LOGS_FAILED
+        if tag != "ok":
+            log.warning("Skipping access-log capture with unknown outcome %s: %s", tag, path)
+            return None
+        candidate_logs = typed.get("logs")
+        if not isinstance(candidate_logs, list):
+            log.warning("Skipping access-log capture with non-list logs: %s", path)
+            return None
+        raw_logs = cast("list[object]", candidate_logs)
+    else:
+        return None
+
+    entries: list[AccessLogEntry] = []
+    for item in raw_logs:
+        if not isinstance(item, dict):
+            continue
+        try:
+            entries.append(AccessLogEntry.model_validate(item))
+        except ValidationError as e:
+            log.debug("Skipping malformed access-log row in %s: %s", path, e)
+    return access_logs_ok(entries)
 
 
 def _purge_old_legacy_dirs(cache_dir: Path) -> None:

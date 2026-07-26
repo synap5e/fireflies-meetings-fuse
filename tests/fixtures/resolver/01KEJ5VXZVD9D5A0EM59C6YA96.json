@@ -1,0 +1,66 @@
+{
+  "meeting_id": "01KEJ5VXZVD9D5A0EM59C6YA96",
+  "list_meeting": {
+    "id": "01KEJ5VXZVD9D5A0EM59C6YA96",
+    "title": "Lightricks Model Release Retro",
+    "date_epoch_ms": 1768010400000.0,
+    "date_str": "2026-01-10",
+    "duration_mins": 85.19000244140625,
+    "is_live": false,
+    "organizer_email": "robin@comfy.org",
+    "participants": [
+      "purz@comfy.org",
+      "daxiong@comfy.org",
+      "kosinkadink@comfy.org",
+      "jo@comfy.org",
+      "peterc@comfy.org",
+      "comfy@comfy.org",
+      "yoland@comfy.org",
+      "robin@comfy.org",
+      "paula@comfy.org"
+    ],
+    "transcript_url": "https://app.fireflies.ai/view/01KEJ5VXZVD9D5A0EM59C6YA96",
+    "meeting_info": {
+      "fred_joined": true,
+      "silent_meeting": false,
+      "summary_status": "processed"
+    },
+    "slug": "lightricks-model-release-retro"
+  },
+  "detail": {
+    "meeting": {
+      "id": "01KEJ5VXZVD9D5A0EM59C6YA96",
+      "title": "Lightricks Model Release Retro",
+      "date_epoch_ms": 1768010400000.0,
+      "date_str": "2026-01-10",
+      "duration_mins": 85.19000244140625,
+      "is_live": false,
+      "organizer_email": "robin@comfy.org",
+      "participants": [
+        "purz@comfy.org",
+        "daxiong@comfy.org",
+        "kosinkadink@comfy.org",
+        "jo@comfy.org",
+        "peterc@comfy.org",
+        "comfy@comfy.org",
+        "yoland@comfy.org",
+        "robin@comfy.org",
+        "paula@comfy.org"
+      ],
+      "transcript_url": "https://app.fireflies.ai/view/01KEJ5VXZVD9D5A0EM59C6YA96",
+      "meeting_info": {
+        "fred_joined": true,
+        "silent_meeting": false,
+        "summary_status": "missing_from_api"
+      },
+      "slug": ""
+    },
+    "sentences": [],
+    "speakers": [],
+    "summary": null,
+    "attendees": [],
+    "access_logs": [],
+    "transcript_error": ""
+  },
+  "access_logs": []
+}

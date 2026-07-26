@@ -11,6 +11,7 @@ from typing import NoReturn
 import httpx
 from pydantic import ValidationError
 
+from .access_logs import ACCESS_LOGS_FAILED, AccessLogsOk, AccessLogsOutcome, access_logs_ok
 from .models import AccessLogEntry, Channel, Meeting, Sentence, TranscriptDetail
 from .session_auth import SessionAuth, internal_request_headers
 
@@ -631,13 +632,11 @@ class FirefliesClient:
             log.warning("Skipping malformed internal transcript detail: %s", e)
             return None
 
-    def get_access_logs(self, meeting_id: str) -> list[AccessLogEntry]:
+    def get_access_logs(self, meeting_id: str) -> AccessLogsOutcome:
         """Fetch the meeting's summary-access log via the internal API.
 
-        Returns an empty list when session auth isn't configured, when the
-        internal call fails, or when the log is genuinely empty -- callers
-        can't distinguish these, which is fine for a best-effort secondary
-        data source.
+        A successful empty response is distinct from a failed or unavailable
+        internal request so the resolver knows whether capture is complete.
         """
         body = self._post_internal(
             _INTERNAL_ACCESS_LOGS_QUERY,
@@ -646,11 +645,11 @@ class FirefliesClient:
             referer=f"https://app.fireflies.ai/view/{meeting_id}",
         )
         if body is None:
-            return []
+            return ACCESS_LOGS_FAILED
         data = body.get("data")
         raw = data.get("getMeetingSummaryAccessLogs") if isinstance(data, dict) else None
         if not isinstance(raw, list):
-            return []
+            return ACCESS_LOGS_FAILED
         entries: list[AccessLogEntry] = []
         for item in raw:
             if not isinstance(item, dict):
@@ -659,7 +658,7 @@ class FirefliesClient:
                 entries.append(AccessLogEntry.model_validate(item))
             except ValidationError as e:
                 log.debug("Skipping malformed access-log entry for %s: %s", meeting_id, e)
-        return entries
+        return access_logs_ok(entries)
 
     def _get_internal_realtime_token(self, meeting_id: str) -> str | None:
         body = self._post_internal(
@@ -1095,10 +1094,10 @@ class FirefliesClient:
         """
         if not detail.meeting.is_completed:
             return detail
-        access_logs = self.get_access_logs(detail.meeting.id)
-        if not access_logs:
+        outcome = self.get_access_logs(detail.meeting.id)
+        if not isinstance(outcome, AccessLogsOk) or not outcome.logs:
             return detail
-        return detail.model_copy(update={"access_logs": access_logs})
+        return detail.model_copy(update={"access_logs": list(outcome.logs)})
 
     def get_user_email(self) -> str | None:
         """Fetch the authenticated user's email address."""

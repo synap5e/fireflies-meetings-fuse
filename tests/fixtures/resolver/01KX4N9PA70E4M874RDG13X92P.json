@@ -1,0 +1,92 @@
+{
+  "meeting_id": "01KX4N9PA70E4M874RDG13X92P",
+  "list_meeting": {
+    "id": "01KX4N9PA70E4M874RDG13X92P",
+    "title": "Backend Roundtable",
+    "date_epoch_ms": 1784311200000.0,
+    "date_str": "2026-07-18",
+    "duration_mins": 70.88999938964844,
+    "is_live": true,
+    "organizer_email": "luke@comfy.org",
+    "participants": [
+      "luke@comfy.org",
+      "simonpinfold@comfy.org",
+      "kishore@comfy.org",
+      "hunter@comfy.org",
+      "mattmiller@comfy.org",
+      "deep@comfy.org",
+      "sundar@comfy.org",
+      "wei@comfy.org",
+      "robin@comfy.org",
+      "james@comfy.org",
+      "miles@comfy.org"
+    ],
+    "transcript_url": "https://app.fireflies.ai/view/01KX4N9PA70E4M874RDG13X92P",
+    "meeting_info": {
+      "fred_joined": true,
+      "silent_meeting": false,
+      "summary_status": "processed"
+    },
+    "slug": "backend-roundtable"
+  },
+  "detail": {
+    "meeting": {
+      "id": "01KX4N9PA70E4M874RDG13X92P",
+      "title": "Backend Roundtable",
+      "date_epoch_ms": 1784311200000.0,
+      "date_str": "2026-07-18",
+      "duration_mins": 70.88999938964844,
+      "is_live": false,
+      "organizer_email": "luke@comfy.org",
+      "participants": [
+        "luke@comfy.org",
+        "simonpinfold@comfy.org",
+        "kishore@comfy.org",
+        "hunter@comfy.org",
+        "mattmiller@comfy.org",
+        "deep@comfy.org",
+        "sundar@comfy.org",
+        "wei@comfy.org",
+        "robin@comfy.org",
+        "james@comfy.org",
+        "miles@comfy.org"
+      ],
+      "transcript_url": "https://app.fireflies.ai/view/01KX4N9PA70E4M874RDG13X92P",
+      "meeting_info": {
+        "fred_joined": true,
+        "silent_meeting": false,
+        "summary_status": "processed"
+      },
+      "slug": "backend-roundtable"
+    },
+    "sentences": [
+      {
+        "index": 0,
+        "text": "I hooked up my stream deck to swarm host.",
+        "start_time": 1.84,
+        "end_time": 4.52,
+        "speaker_name": "Hunter Senft-Grupp"
+      },
+      {
+        "index": 1,
+        "text": "So it now has all my threads that need attention.",
+        "start_time": 4.52,
+        "end_time": 9.6,
+        "speaker_name": "Hunter Senft-Grupp"
+      },
+      {
+        "index": 2,
+        "text": "Now blink Nice.",
+        "start_time": 9.76,
+        "end_time": 11.68,
+        "speaker_name": "Hunter Senft-Grupp"
+      }
+    ],
+    "speakers": [],
+    "summary": null,
+    "attendees": [],
+    "access_logs": [],
+    "transcript_error": ""
+  },
+  "access_logs": []
+}

@@ -1,0 +1,118 @@
+{
+  "meeting_id": "01KFKFT8F5E88FYQ6QR9R1TXXA",
+  "list_meeting": {
+    "id": "01KFKFT8F5E88FYQ6QR9R1TXXA",
+    "title": "Mid Week Sync",
+    "date_epoch_ms": 1769623200000.0,
+    "date_str": "2026-01-29",
+    "duration_mins": 64.36000061035156,
+    "is_live": false,
+    "organizer_email": "yoland@comfy.org",
+    "participants": [
+      "johnpaul@comfy.org",
+      "sirolim@comfy.org",
+      "yoland@comfy.org",
+      "sonam@comfy.org",
+      "core@comfy.org",
+      "hcl@comfy.org",
+      "marwan@comfy.org",
+      "simonpinfold@comfy.org",
+      "joshua@comfy.org",
+      "rob@comfy.org",
+      "mackenzie@comfy.org",
+      "barish.ozbay@gmail.com",
+      "rizz@comfy.org",
+      "admin@hunterbolt.com",
+      "jamesperper@comfy.org",
+      "kyle@comfy.org",
+      "adminx1@webpostbox.net",
+      "robin@comfy.org",
+      "paula@comfy.org",
+      "cbyrne@comfy.org",
+      "jo@comfy.org",
+      "purz@comfy.org",
+      "julien@comfy.org",
+      "jake@comfy.org"
+    ],
+    "transcript_url": "https://app.fireflies.ai/view/01KFKFT8F5E88FYQ6QR9R1TXXA",
+    "meeting_info": {
+      "fred_joined": true,
+      "silent_meeting": false,
+      "summary_status": "processed"
+    },
+    "slug": "mid-week-sync"
+  },
+  "detail": {
+    "meeting": {
+      "id": "01KFKFT8F5E88FYQ6QR9R1TXXA",
+      "title": "Mid Week Sync",
+      "date_epoch_ms": 1769623200000.0,
+      "date_str": "2026-01-29",
+      "duration_mins": 0.0,
+      "is_live": true,
+      "organizer_email": "yoland@comfy.org",
+      "participants": [
+        "johnpaul@comfy.org",
+        "sirolim@comfy.org",
+        "yoland@comfy.org",
+        "sonam@comfy.org",
+        "core@comfy.org",
+        "hcl@comfy.org",
+        "marwan@comfy.org",
+        "simonpinfold@comfy.org",
+        "joshua@comfy.org",
+        "rob@comfy.org",
+        "mackenzie@comfy.org",
+        "barish.ozbay@gmail.com",
+        "rizz@comfy.org",
+        "admin@hunterbolt.com",
+        "jamesperper@comfy.org",
+        "kyle@comfy.org",
+        "adminx1@webpostbox.net",
+        "robin@comfy.org",
+        "paula@comfy.org",
+        "cbyrne@comfy.org",
+        "jo@comfy.org",
+        "purz@comfy.org",
+        "julien@comfy.org",
+        "jake@comfy.org"
+      ],
+      "transcript_url": "https://app.fireflies.ai/view/01KFKFT8F5E88FYQ6QR9R1TXXA",
+      "meeting_info": {
+        "fred_joined": true,
+        "silent_meeting": false,
+        "summary_status": "processed"
+      },
+      "slug": "mid-week-sync"
+    },
+    "sentences": [
+      {
+        "index": 0,
+        "text": "It.",
+        "start_time": 0.24,
+        "end_time": 0.48,
+        "speaker_name": "0"
+      },
+      {
+        "index": 1,
+        "text": "I'm just going to go through the, the notes that people wrote.",
+        "start_time": 75.14,
+        "end_time": 79.23,
+        "speaker_name": "0"
+      },
+      {
+        "index": 2,
+        "text": "So hiring?",
+        "start_time": 80.11,
+        "end_time": 81.15,
+        "speaker_name": "0"
+      }
+    ],
+    "speakers": [],
+    "summary": null,
+    "attendees": [],
+    "access_logs": [],
+    "transcript_error": ""
+  },
+  "access_logs": []
+}

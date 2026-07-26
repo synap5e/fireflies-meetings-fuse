@@ -9,8 +9,9 @@ from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Literal
 
+from .access_logs import ACCESS_LOGS_PENDING, AccessLogsOk
 from .capture import CaptureSnapshot
-from .models import AccessLogEntry, Channel, Meeting, Sentence, TranscriptDetail
+from .models import Channel, Meeting, Sentence, TranscriptDetail
 from .renderer import (
     render_meeting_json,
     render_open_script,
@@ -19,6 +20,7 @@ from .renderer import (
     render_transcript,
     render_views,
 )
+from .resolver import MeetingEvidence, ResolvedMeeting, resolve_meeting
 from .slug import slugify
 
 MEETING_FILES: tuple[str, ...] = (
@@ -122,6 +124,7 @@ class ProjectionBuildOptions:
     diagnostics: dict[str, BackfillDiagnostic] = field(default_factory=dict)
     auth_fatal: bool = False
     chat_auth_fatal: bool = False
+    now_ms: float = 0.0
 
 
 def empty_projection(*, user_email: str | None = None) -> Projection:
@@ -139,8 +142,9 @@ def build_projection_from_captures(
     options: ProjectionBuildOptions | None = None,
 ) -> Projection:
     opts = options or ProjectionBuildOptions()
-    meetings = _meeting_map(snapshot)
     live_rows = opts.live_captions
+    resolved_meetings = _resolved_meeting_map(snapshot, opts)
+    meetings = {meeting_id: resolved.meeting for meeting_id, resolved in resolved_meetings.items()}
     diag = opts.diagnostics
     projected_by_id: dict[str, ProjectedMeeting] = {}
     entries_by_date: dict[str, list[Meeting]] = defaultdict(list)
@@ -168,6 +172,7 @@ def build_projection_from_captures(
     sentences_by_id: dict[str, tuple[Sentence, ...]] = {}
     ctx = _BuildContext(
         snapshot=snapshot,
+        resolved_meetings=resolved_meetings,
         live_rows=live_rows,
         hidden_ids=hidden_ids,
         dirname_by_id=dirname_by_id,
@@ -178,7 +183,12 @@ def build_projection_from_captures(
     )
     for meeting_id, meeting in meetings.items():
         projected_by_id[meeting_id] = _build_projected_meeting(meeting_id, meeting, ctx)
-    _collect_overlap_sentences(folded_overlaps, projected_by_id, sentences_by_id, snapshot)
+    _collect_overlap_sentences(
+        folded_overlaps,
+        projected_by_id,
+        sentences_by_id,
+        resolved_meetings,
+    )
 
     live_dirnames = _live_dirnames([m for m in meetings.values() if m.is_live and m.date_str])
     projected_by_id = _attach_secondary_paths(
@@ -208,6 +218,7 @@ def build_projection_from_captures(
 @dataclass(frozen=True)
 class _BuildContext:
     snapshot: CaptureSnapshot
+    resolved_meetings: dict[str, ResolvedMeeting]
     live_rows: dict[str, dict[str, Sentence]]
     hidden_ids: set[str]
     dirname_by_id: dict[str, str]
@@ -222,11 +233,14 @@ def _build_projected_meeting(
     meeting: Meeting,
     ctx: _BuildContext,
 ) -> ProjectedMeeting:
+    resolved = ctx.resolved_meetings[meeting_id]
     detail_capture = ctx.snapshot.details.get(meeting_id)
-    access_logs = list(ctx.snapshot.access_logs.get(meeting_id, ()))
-    has_access_log_capture = meeting_id in ctx.snapshot.access_logs
-    detail = _project_detail(meeting, detail_capture, access_logs, ctx.live_rows.get(meeting_id))
-    state = _capture_state(meeting, detail_capture, has_access_log_capture, ctx.live_rows.get(meeting_id))
+    has_access_log_capture = isinstance(
+        ctx.snapshot.access_logs.get(meeting_id),
+        AccessLogsOk,
+    )
+    detail = _resolved_detail(resolved, detail_capture)
+    state = resolved.state
     files = MappingProxyType(_render_projected_files(meeting, detail, state, has_access_log_capture))
     primary_path = (
         None if meeting_id in ctx.hidden_ids
@@ -236,7 +250,7 @@ def _build_projected_meeting(
     if overlap_ids:
         ctx.sentences_by_id[meeting_id] = tuple(detail.sentences)
     return ProjectedMeeting(
-        meeting=meeting,
+        meeting=resolved.meeting,
         files=files,
         capture_state=state,
         primary_path=primary_path,
@@ -250,22 +264,36 @@ def _collect_overlap_sentences(
     folded_overlaps: dict[str, tuple[str, ...]],
     projected_by_id: dict[str, ProjectedMeeting],
     sentences_by_id: dict[str, tuple[Sentence, ...]],
-    snapshot: CaptureSnapshot,
+    resolved_meetings: dict[str, ResolvedMeeting],
 ) -> None:
     for overlap_ids in folded_overlaps.values():
         for overlap_id in overlap_ids:
             if overlap_id in projected_by_id and overlap_id not in sentences_by_id:
-                overlap_detail_capture = snapshot.details.get(overlap_id)
-                if overlap_detail_capture is not None:
-                    sentences_by_id[overlap_id] = tuple(overlap_detail_capture.sentences)
+                resolved = resolved_meetings.get(overlap_id)
+                if resolved is not None:
+                    sentences_by_id[overlap_id] = resolved.sentences
 
 
-def _meeting_map(snapshot: CaptureSnapshot) -> dict[str, Meeting]:
-    meetings = {_with_slug(meeting).id: _with_slug(meeting) for meeting in snapshot.meetings}
-    for meeting_id, detail in snapshot.details.items():
-        if meeting_id not in meetings:
-            meetings[meeting_id] = _with_slug(detail.meeting)
-    return meetings
+def _resolved_meeting_map(
+    snapshot: CaptureSnapshot,
+    options: ProjectionBuildOptions,
+) -> dict[str, ResolvedMeeting]:
+    list_by_id = {meeting.id: meeting for meeting in snapshot.meetings}
+    meeting_ids = list(dict.fromkeys((*list_by_id, *snapshot.details)))
+    resolved: dict[str, ResolvedMeeting] = {}
+    for meeting_id in meeting_ids:
+        detail = snapshot.details.get(meeting_id)
+        item = resolve_meeting(MeetingEvidence(
+            list_meeting=list_by_id.get(meeting_id),
+            detail=detail,
+            access_logs=snapshot.access_logs.get(meeting_id, ACCESS_LOGS_PENDING),
+            live_captions=options.live_captions.get(meeting_id, {}),
+            terminal_seen=detail is not None and detail.meeting.summary_is_terminal,
+            now_ms=options.now_ms,
+        ))
+        canonical = _with_slug(item.meeting)
+        resolved[meeting_id] = item if canonical is item.meeting else replace(item, meeting=canonical)
+    return resolved
 
 
 def _make_slug(meeting: Meeting) -> str:
@@ -276,51 +304,25 @@ def _with_slug(meeting: Meeting) -> Meeting:
     return meeting if meeting.slug else meeting.model_copy(update={"slug": _make_slug(meeting)})
 
 
-def _project_detail(
-    meeting: Meeting,
+def _resolved_detail(
+    resolved: ResolvedMeeting,
     detail_capture: TranscriptDetail | None,
-    access_logs: list[AccessLogEntry],
-    live_rows: dict[str, Sentence] | None,
 ) -> TranscriptDetail:
     if detail_capture is None:
-        detail = TranscriptDetail(meeting=meeting, access_logs=access_logs)
-    else:
-        detail = detail_capture.model_copy(update={
-            "meeting": detail_capture.meeting.model_copy(update={
-                "slug": meeting.slug,
-                "date_str": meeting.date_str,
-                "date_epoch_ms": meeting.date_epoch_ms,
-                "is_live": meeting.is_live or detail_capture.meeting.is_live,
-            }),
-            "access_logs": access_logs,
-        })
-    if live_rows:
-        merged = {str(sentence.index): sentence for sentence in detail.sentences}
-        merged.update(live_rows)
-        detail = detail.model_copy(update={
-            "sentences": sorted(merged.values(), key=lambda sentence: (sentence.start_time, sentence.index)),
-            "transcript_error": "",
-        })
-    return detail
-
-
-def _capture_state(
-    meeting: Meeting,
-    detail_capture: TranscriptDetail | None,
-    has_access_log_capture: bool,
-    live_rows: dict[str, Sentence] | None,
-) -> CaptureState:
-    detail_terminal = detail_capture is not None and detail_capture.meeting.summary_is_terminal
-    if (meeting.is_live or live_rows) and not meeting.summary_is_terminal and not detail_terminal:
-        return "live"
-    if detail_capture is None or detail_capture.transcript_error:
-        return "partial"
-    status = detail_capture.meeting.meeting_info.summary_status or meeting.meeting_info.summary_status
-    if status == "missing_from_api":
-        return "captured"
-    if detail_capture.meeting.summary_is_terminal and has_access_log_capture:
-        return "captured"
-    return "partial"
+        return TranscriptDetail(
+            meeting=resolved.meeting,
+            sentences=list(resolved.sentences),
+            access_logs=list(resolved.access_logs),
+        )
+    return detail_capture.model_copy(update={
+        "meeting": resolved.meeting,
+        "sentences": list(resolved.sentences),
+        "access_logs": list(resolved.access_logs),
+        "transcript_error": (
+            "" if resolved.sentences != tuple(detail_capture.sentences)
+            else detail_capture.transcript_error
+        ),
+    })
 
 
 def _render_projected_files(

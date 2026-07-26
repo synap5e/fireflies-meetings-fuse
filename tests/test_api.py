@@ -21,6 +21,7 @@ from collections.abc import Callable
 import httpx
 import pytest
 
+from fireflies_meetings.access_logs import AccessLogsFailed, AccessLogsOk
 from fireflies_meetings.api import (
     FatalAPIError,
     FirefliesClient,
@@ -527,6 +528,32 @@ def test_get_user_email_returns_none_on_fatal() -> None:
 
     client = _make_client(handler)
     assert client.get_user_email() is None
+
+
+def test_get_access_logs_distinguishes_successful_empty_from_unavailable() -> None:
+    unavailable = _make_client(lambda _req: httpx.Response(500))
+    assert isinstance(unavailable.get_access_logs("MEET01"), AccessLogsFailed)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url == httpx.URL("https://app.fireflies.ai/api/v4/graphql")
+        payload = json.loads(req.content)
+        assert payload["operationName"] == "GetMeetingSummaryAccessLogs"
+        return httpx.Response(
+            200,
+            json={"data": {"getMeetingSummaryAccessLogs": []}},
+        )
+
+    client = FirefliesClient(
+        "dummy-key",
+        transport=httpx.MockTransport(handler),
+        session_auth=SessionAuth(
+            access_token="Bearer access-token",
+            refresh_token="refresh-token",
+        ),
+    )
+    outcome = client.get_access_logs("MEET01")
+    assert isinstance(outcome, AccessLogsOk)
+    assert outcome.logs == ()
 
 
 def test_list_active_meeting_ids_returns_ids() -> None:
