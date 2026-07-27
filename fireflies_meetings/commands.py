@@ -19,6 +19,7 @@ from .projection import (
     Projection,
     ProjectionBuildOptions,
     build_projection_from_captures,
+    rebuild_one_meeting,
 )
 from .resolver import merge_detail_observation, merge_list_observation
 
@@ -157,8 +158,32 @@ class CommandProcessor:
             rows = self._live_captions.setdefault(command.meeting_id, {})
             rows[str(command.sentence.index)] = command.sentence
             invalidate_meeting_id = command.meeting_id
+            if self._apply_caption_fast_path(command.meeting_id):
+                return self.projection, invalidate_meeting_id
         self._rebuild()
         return self.projection, invalidate_meeting_id
+
+    def _apply_caption_fast_path(self, meeting_id: str) -> bool:
+        """Incremental swap for one meeting's file bytes, skipping the O(N)
+        full rebuild. Captions can't move meetings between slug groups or
+        change primary paths, so fold groups + tree structure stay put.
+
+        Returns True on success. Falls back to False (caller does full
+        rebuild) when the meeting isn't in the current projection yet —
+        e.g. a caption arrived before the first list refresh landed it."""
+        existing = self.projection.meetings.get(meeting_id)
+        if existing is None:
+            return False
+        snapshot = self._capture.read_snapshot()
+        updated = rebuild_one_meeting(
+            snapshot,
+            meeting_id,
+            existing,
+            live_captions=self._live_captions,
+            now_ms=time.time() * 1000,
+        )
+        self.projection = self.projection.replace_meeting(meeting_id, updated)
+        return True
 
     async def send(self, command: Command) -> None:
         await self._send.send(command)

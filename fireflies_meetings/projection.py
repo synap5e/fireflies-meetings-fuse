@@ -116,6 +116,34 @@ class Projection:
         projected = self.meetings.get(meeting_id)
         return projected is not None and projected.capture_state != "captured"
 
+    def replace_meeting(self, meeting_id: str, updated: ProjectedMeeting) -> Projection:
+        """Swap one meeting's ProjectedMeeting entry and its file-node contents.
+
+        Fold groups (ghost/overlap), tree structure, and other meetings' entries
+        stay put — only the target meeting's cells change. Used for the live-
+        caption fast path where captions can't move meetings between slug
+        groups or change primary paths, only file bytes."""
+        if meeting_id not in self.meetings:
+            return self
+        new_meetings = dict(self.meetings)
+        new_meetings[meeting_id] = updated
+        new_nodes = dict(self.nodes)
+        for path, node in self.nodes.items():
+            if (
+                node.kind == "file"
+                and node.meeting_id == meeting_id
+                and node.file_name in updated.files
+            ):
+                new_nodes[path] = replace(node, content=updated.files[node.file_name])
+        return Projection(
+            nodes=MappingProxyType(new_nodes),
+            meetings=MappingProxyType(new_meetings),
+            live_dirnames=self.live_dirnames,
+            user_email=self.user_email,
+            auth_fatal=self.auth_fatal,
+            chat_auth_fatal=self.chat_auth_fatal,
+        )
+
 
 @dataclass(frozen=True)
 class ProjectionBuildOptions:
@@ -294,6 +322,51 @@ def _resolved_meeting_map(
         canonical = _with_slug(item.meeting)
         resolved[meeting_id] = item if canonical is item.meeting else replace(item, meeting=canonical)
     return resolved
+
+
+def rebuild_one_meeting(
+    snapshot: CaptureSnapshot,
+    meeting_id: str,
+    existing: ProjectedMeeting,
+    *,
+    live_captions: dict[str, dict[str, Sentence]],
+    now_ms: float,
+) -> ProjectedMeeting:
+    """Recompute one meeting's ProjectedMeeting without touching fold groups.
+
+    Live captions can't move a meeting between slug groups or change its
+    primary_path, so we can reuse everything about placement (paths,
+    ghost_id, overlap_ids, overlap_dirnames, overlap_warning) and only
+    re-resolve + re-render this one meeting's file bytes."""
+    list_meeting = next(
+        (m for m in snapshot.meetings if m.id == meeting_id), None,
+    )
+    detail_capture = snapshot.details.get(meeting_id)
+    resolved = resolve_meeting(MeetingEvidence(
+        list_meeting=list_meeting,
+        detail=detail_capture,
+        access_logs=snapshot.access_logs.get(meeting_id, ACCESS_LOGS_PENDING),
+        live_captions=live_captions.get(meeting_id, {}),
+        terminal_seen=detail_capture is not None and detail_capture.meeting.summary_is_terminal,
+        now_ms=now_ms,
+    ))
+    canonical = _with_slug(resolved.meeting)
+    if canonical is not resolved.meeting:
+        resolved = replace(resolved, meeting=canonical)
+    detail = _resolved_detail(resolved, detail_capture)
+    has_access_log_capture = isinstance(
+        snapshot.access_logs.get(meeting_id),
+        AccessLogsOk,
+    )
+    files = MappingProxyType(_render_projected_files(
+        resolved.meeting, detail, resolved.state, has_access_log_capture,
+    ))
+    return replace(
+        existing,
+        meeting=resolved.meeting,
+        files=files,
+        capture_state=resolved.state,
+    )
 
 
 def _make_slug(meeting: Meeting) -> str:

@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import cast
 
-from fireflies_meetings import store as store_module
+from fireflies_meetings import commands as commands_module, store as store_module
 from fireflies_meetings.access_logs import (
     ACCESS_LOGS_FAILED,
     AccessLogsFailed,
@@ -398,6 +398,81 @@ def test_backfill_ages_out_empty_placeholder_after_threshold(tmp_path: Path, mon
     projected = store.projection.meetings["PH01"]
     assert projected.capture_state == "captured", "aged placeholder should drop out of the backfill queue"
     assert "PH01" not in store.get_uncached_meeting_ids()
+
+
+def test_live_caption_skips_full_rebuild(tmp_path: Path, monkeypatch: object) -> None:
+    """Captions must go through the incremental fast path, not the O(N)
+    full rebuild. Assert build_projection_from_captures is never called
+    for captions once the meeting is in the projection."""
+    capture = CaptureStore(tmp_path)
+    processor = CommandProcessor(capture)
+    live = _meeting("MEET01", summary_status="processing", is_live=True)
+    processor.apply(ListRefreshed(name="list-refreshed", meetings=[live]), fetched_at=1.0)
+
+    build_count = 0
+    original_build = commands_module.build_projection_from_captures
+
+    def counting_build(*args: object, **kwargs: object) -> object:
+        nonlocal build_count
+        build_count += 1
+        return original_build(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(commands_module, "build_projection_from_captures", counting_build)  # type: ignore[attr-defined]
+
+    for i in range(5):
+        processor.apply(
+            LiveCaptionArrived(name="live-caption-arrived", meeting_id=live.id, sentence=_sentence(i, f"caption {i}")),
+            fetched_at=2.0 + i,
+        )
+
+    assert build_count == 0, f"caption path should not trigger full rebuild, got {build_count}"
+    projected = processor.projection.meetings[live.id]
+    for i in range(5):
+        assert f"caption {i}".encode() in projected.files["transcript.md"]
+
+
+def test_live_caption_falls_back_to_rebuild_when_meeting_unknown(tmp_path: Path) -> None:
+    """First caption for a meeting we haven't seen via list yet has to go
+    through full rebuild — the projection doesn't have a ProjectedMeeting
+    to swap, so the incremental path can't cover it."""
+    capture = CaptureStore(tmp_path)
+    processor = CommandProcessor(capture)
+    processor.apply(
+        LiveCaptionArrived(name="live-caption-arrived", meeting_id="NEW01", sentence=_sentence(1, "surprise")),
+        fetched_at=1.0,
+    )
+    assert "NEW01" not in processor.projection.meetings
+
+
+def test_live_caption_leaves_other_meetings_untouched(tmp_path: Path) -> None:
+    """Incremental swap must not disturb ghost-fold groupings for other
+    meetings that share a slug. Regression guard against the caption fast
+    path accidentally re-running ghost/overlap folding and reshuffling."""
+    capture = CaptureStore(tmp_path)
+    processor = CommandProcessor(capture)
+    live = _meeting("LIVE01", title="Live Standup", summary_status="processing", is_live=True)
+    other = _meeting("OTHER01", title="Other Meeting", summary_status="processed")
+    processor.apply(ListRefreshed(name="list-refreshed", meetings=[live, other]), fetched_at=1.0)
+    processor.apply(
+        DetailFetched(name="detail-fetched", meeting_id=other.id, detail=_detail(other)),
+        fetched_at=2.0,
+    )
+    processor.apply(
+        AccessLogsFetched(
+            name="access-logs-fetched",
+            meeting_id=other.id,
+            outcome=access_logs_ok([_access_log()]),
+        ),
+        fetched_at=3.0,
+    )
+    other_files_before = processor.projection.meetings[other.id].files["transcript.md"]
+
+    processor.apply(
+        LiveCaptionArrived(name="live-caption-arrived", meeting_id=live.id, sentence=_sentence(1, "hi")),
+        fetched_at=4.0,
+    )
+
+    assert processor.projection.meetings[other.id].files["transcript.md"] == other_files_before
 
 
 def test_inode_map_survives_projection_swap_until_forget() -> None:
