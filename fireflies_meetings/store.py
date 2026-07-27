@@ -32,6 +32,7 @@ from .commands import (
 )
 from .models import Meeting, Sentence, TranscriptDetail
 from .projection import MEETING_FILES, Projection
+from .raw import NoOpRawSink, RawEnvelope, RawSink
 from .slug import slugify
 from .status_cache import StatusCache
 
@@ -102,8 +103,10 @@ class MeetingStore:
         list_ttl: float = 1800.0,
         status_cache: StatusCache | None = None,
         user_email: str | None = None,
+        raw_sink: RawSink | None = None,
     ) -> None:
         self._client = client
+        self._raw = raw_sink or NoOpRawSink()
         self._status_cache = status_cache or StatusCache()
         self._capture = CaptureStore(self._status_cache.cache_dir)
         self.user_email = user_email
@@ -125,6 +128,21 @@ class MeetingStore:
 
     def _apply_projection(self) -> None:
         self._projection = self._processor.projection
+
+    def _write_synthetic(self, source: str, endpoint: str, body: object) -> None:
+        try:
+            self._raw.write(RawEnvelope(
+                source=source,
+                endpoint=endpoint,
+                operation_variables=None,
+                page_cursor=None,
+                fetched_at=time.time(),
+                outcome="synthetic",
+                body_encoding="json",
+                body=body,
+            ))
+        except (OSError, TypeError, ValueError):
+            log.warning("Raw archive write failed for %s/%s", source, endpoint, exc_info=True)
 
     def _apply_command(self, command: object) -> str | None:
         with self._lock:
@@ -198,6 +216,8 @@ class MeetingStore:
         calls: getChannelsList + paginated fetchChannelMeetings("all").
         Silent on any failure — channels are decorative, not critical.
         """
+        # TODO(raw-open-question-4): Unchanged channel polls are intentionally
+        # deduplicated in JSONL while _last_seen still advances.
         if self._backoff.is_backed_off:
             return
         if time.time() - self._channels_cache_time < self._channels_ttl:
@@ -299,6 +319,11 @@ class MeetingStore:
         try:
             detail = self._client.get_transcript(meeting_id)
         except TranscriptNotFoundError:
+            self._write_synthetic(
+                "synthetic-not-found",
+                "transcript-not-found",
+                {"meeting_id": meeting_id, "summary_status": "missing_from_api"},
+            )
             detail = TranscriptDetail(meeting=item.meeting.model_copy(update={
                 "meeting_info": item.meeting.meeting_info.model_copy(update={"summary_status": "missing_from_api"}),
             }))
@@ -320,6 +345,7 @@ class MeetingStore:
         except httpx.HTTPError:
             self._backoff.record_failure()
             raise
+        observed_summary_status = detail.meeting.meeting_info.summary_status
         meeting_update: dict[str, object] = {
             "slug": item.meeting.slug,
             "date_str": item.meeting.date_str,
@@ -328,6 +354,16 @@ class MeetingStore:
         detail = detail.model_copy(update={"meeting": detail.meeting.model_copy(update=meeting_update)})
         self._apply_command(DetailFetched(name="detail-fetched", meeting_id=meeting_id, detail=detail))
         resolved = self._projection.meetings.get(meeting_id)
+        if (
+            observed_summary_status != "missing_from_api"
+            and resolved is not None
+            and resolved.meeting.meeting_info.summary_status == "missing_from_api"
+        ):
+            self._write_synthetic(
+                "synthetic-age-out",
+                "empty-placeholder-age-out",
+                {"meeting_id": meeting_id, "summary_status": "missing_from_api"},
+            )
         if resolved is not None and resolved.meeting.summary_is_terminal:
             outcome = (
                 access_logs_ok(detail.access_logs)
@@ -345,6 +381,11 @@ class MeetingStore:
         self._notify_live_change(meeting_id)
 
     def watch_meeting(self, meeting_id: str) -> bool:
+        self._write_synthetic(
+            "synthetic-watch",
+            "watch-meeting",
+            {"meeting_id": meeting_id},
+        )
         item = self._projection.meetings.get(meeting_id)
         if item is not None:
             if not item.meeting.is_live and not item.meeting.is_completed:
@@ -377,6 +418,11 @@ class MeetingStore:
         return True
 
     def sync_active_meeting_ids(self, active_ids: list[str]) -> None:
+        self._write_synthetic(
+            "synthetic-active-id",
+            "active-meeting-ids",
+            {"meeting_ids": sorted(set(active_ids))},
+        )
         active = set(active_ids)
         meetings = [
             item.meeting.model_copy(update={"is_live": True})

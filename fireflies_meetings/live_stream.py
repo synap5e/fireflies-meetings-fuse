@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Callable
 from typing import cast
 
@@ -12,6 +13,7 @@ from pydantic import ValidationError
 
 from .api import FirefliesClient
 from .models import Sentence
+from .raw import NoOpRawSink, RawEnvelope, RawSink
 
 log = logging.getLogger(__name__)
 
@@ -132,12 +134,30 @@ def spawn_caption_drainer(
 
 def make_broadcast_handler(
     coalescer: CaptionCoalescer,
+    *,
+    raw_sink: RawSink | None = None,
+    meeting_id: str | None = None,
 ) -> Callable[[object], None]:
+    sink = raw_sink or NoOpRawSink()
+
     def on_transcription_broadcast(raw: object) -> None:
         normalized = normalize_stream_sentence(raw)
         if normalized is None:
             return
         transcript_id, sentence = normalized
+        try:
+            sink.write(RawEnvelope(
+                source="socketio-transcription",
+                endpoint="caption",
+                operation_variables={"meeting_id": meeting_id} if meeting_id is not None else None,
+                page_cursor=None,
+                fetched_at=time.time(),
+                outcome="ok",
+                body_encoding="json",
+                body=raw,
+            ))
+        except (OSError, TypeError, ValueError):
+            log.warning("Raw archive write failed for socketio-transcription/caption", exc_info=True)
         coalescer.submit(transcript_id, sentence)
 
     return on_transcription_broadcast
@@ -154,6 +174,7 @@ def stream_live_transcript(
     *,
     on_update: Callable[[str, Sentence], None],
     stop_event: threading.Event,
+    raw_sink: RawSink | None = None,
 ) -> None:
     """Block until `stop_event` is set while streaming live caption updates."""
     token = client.get_internal_realtime_token(meeting_id)
@@ -166,7 +187,7 @@ def stream_live_transcript(
 
     sio.on(
         "transcription.broadcast.event",
-        handler=make_broadcast_handler(coalescer),
+        handler=make_broadcast_handler(coalescer, raw_sink=raw_sink, meeting_id=meeting_id),
         namespace=_LIVE_STREAM_NAMESPACE,
     )
 

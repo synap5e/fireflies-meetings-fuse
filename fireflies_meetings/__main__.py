@@ -341,6 +341,7 @@ async def _live_transcript_stream_loop(
                     meeting_id,
                     on_update=functools.partial(store.apply_live_transcript_update, meeting_id),
                     stop_event=stop_event,
+                    raw_sink=client.raw_sink,
                 ),
             )
         except LiveTranscriptStreamError:
@@ -464,6 +465,7 @@ def cmd_mount(args: argparse.Namespace) -> None:
 
     from .api import FirefliesClient
     from .fuse_ops import FirefliesMeetingOps
+    from .raw import JsonlRawSink, NoOpRawSink, RawSink
     from .status_cache import StatusCache
     from .store import MeetingStore
 
@@ -474,10 +476,15 @@ def cmd_mount(args: argparse.Namespace) -> None:
     mountpoint.mkdir(parents=True, exist_ok=True)
 
     session_auth = _load_session_auth(args.session_auth)
-    client = FirefliesClient(api_key, session_auth=session_auth)
+    status_cache = StatusCache()
+    raw_sink: RawSink = NoOpRawSink()
     try:
-        status_cache = StatusCache()
+        raw_sink = JsonlRawSink(status_cache.cache_dir / "raw")
+    except (OSError, ValueError):
+        _log.warning("Raw archive unavailable; continuing without archival", exc_info=True)
 
+    client = FirefliesClient(api_key, session_auth=session_auth, raw_sink=raw_sink)
+    try:
         user_email = os.environ.get("FIREFLIES_USER_EMAIL", "").strip()
         if not user_email:
             user_email = client.get_user_email() or ""
@@ -488,7 +495,12 @@ def cmd_mount(args: argparse.Namespace) -> None:
                     "Could not determine user email; mine/ directory will be unavailable"
                 )
 
-        store = MeetingStore(client, status_cache=status_cache, user_email=user_email or None)
+        store = MeetingStore(
+            client,
+            status_cache=status_cache,
+            user_email=user_email or None,
+            raw_sink=raw_sink,
+        )
         ops = FirefliesMeetingOps(store)
 
         fuse_options: set[str] = {

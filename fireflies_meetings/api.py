@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import time
 from datetime import UTC, datetime
-from typing import NoReturn
+from typing import NoReturn, cast
 
 import httpx
 from pydantic import ValidationError
 
 from .access_logs import ACCESS_LOGS_FAILED, AccessLogsOk, AccessLogsOutcome, access_logs_ok
 from .models import AccessLogEntry, Channel, Meeting, Sentence, TranscriptDetail
+from .raw import NoOpRawSink, RawEnvelope, RawSink
 from .session_auth import SessionAuth, internal_request_headers
 
 log = logging.getLogger(__name__)
@@ -517,8 +519,10 @@ class FirefliesClient:
         *,
         session_auth: SessionAuth | None = None,
         transport: httpx.BaseTransport | None = None,
+        raw_sink: RawSink | None = None,
     ) -> None:
         self._session_auth = session_auth
+        self._raw = raw_sink or NoOpRawSink()
         headers: dict[str, str] = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -572,6 +576,10 @@ class FirefliesClient:
     def has_internal_auth(self) -> bool:
         return self._session_auth is not None
 
+    @property
+    def raw_sink(self) -> RawSink:
+        return self._raw
+
     def get_internal_realtime_token(self, meeting_id: str) -> str | None:
         return self._get_internal_realtime_token(meeting_id)
 
@@ -580,6 +588,7 @@ class FirefliesClient:
         query: str,
         variables: dict[str, JsonValue],
         *,
+        endpoint: str,
         operation_name: str,
         referer: str,
     ) -> JsonObject | None:
@@ -601,22 +610,49 @@ class FirefliesClient:
                     "variables": variables,
                 },
             )
-            resp.raise_for_status()
-            body: JsonObject = resp.json()
-        except (httpx.HTTPError, json.JSONDecodeError, ValueError) as e:
+        except httpx.HTTPError as e:
+            self._write_raw(RawEnvelope(
+                source="fireflies-hive",
+                endpoint=endpoint,
+                operation_variables=variables,
+                page_cursor=None,
+                fetched_at=time.time(),
+                outcome="transient_error",
+                body_encoding="json",
+                body=None,
+            ))
             log.debug("Internal Fireflies fallback failed for %s: %s", operation_name, e)
             return None
 
-        data = body.get("data")
-        if not isinstance(data, dict) and body.get("errors"):
-            log.debug("Internal Fireflies fallback returned only errors: %s", body["errors"])
+        body, body_encoding = self._response_body(resp)
+        outcome = self._response_outcome(resp, body)
+        self._write_raw(RawEnvelope(
+            source="fireflies-hive",
+            endpoint=endpoint,
+            operation_variables=variables,
+            page_cursor=None,
+            fetched_at=time.time(),
+            outcome=outcome,
+            body=body,
+            body_encoding=body_encoding,
+        ))
+        if outcome not in {"ok", "empty"}:
+            log.debug("Internal Fireflies fallback failed for %s: HTTP %d", operation_name, resp.status_code)
             return None
-        return body
+
+        assert isinstance(body, dict)
+        typed_body = cast("JsonObject", body)
+        data = typed_body.get("data")
+        if not isinstance(data, dict) and typed_body.get("errors"):
+            log.debug("Internal Fireflies fallback returned only errors: %s", typed_body["errors"])
+            return None
+        return typed_body
 
     def _get_internal_transcript(self, meeting_id: str) -> TranscriptDetail | None:
         body = self._post_internal(
             _INTERNAL_DETAIL_QUERY,
             {"meetingNoteId": meeting_id},
+            endpoint="transcript",
             operation_name="fetchNotepadMeeting",
             referer=f"https://app.fireflies.ai/view/{meeting_id}",
         )
@@ -641,6 +677,7 @@ class FirefliesClient:
         body = self._post_internal(
             _INTERNAL_ACCESS_LOGS_QUERY,
             {"meetingId": meeting_id},
+            endpoint="access-logs",
             operation_name="GetMeetingSummaryAccessLogs",
             referer=f"https://app.fireflies.ai/view/{meeting_id}",
         )
@@ -664,12 +701,16 @@ class FirefliesClient:
         body = self._post_internal(
             _INTERNAL_REALTIME_TOKEN_QUERY,
             {"meetingId": meeting_id},
+            endpoint="realtime-token",
             operation_name="getTranscriptFFAuth",
             referer=f"https://app.fireflies.ai/view/{meeting_id}",
         )
         if body is None:
             return None
 
+        # TODO(raw-open-question-2): The Hive realtime-token envelope records
+        # auth_denied directly; decide whether replay also needs a separate
+        # synthetic-token-denied fact.
         data = body.get("data")
         raw_token = data.get("getTranscriptFFAuth") if isinstance(data, dict) else None
         if isinstance(raw_token, str) and raw_token:
@@ -690,6 +731,7 @@ class FirefliesClient:
         body = self._post_internal(
             _INTERNAL_LIVE_TRANSCRIPT_QUERY,
             {"meetingId": meeting_id, "realtimeToken": token},
+            endpoint="live-transcript",
             operation_name="getLiveTranscript",
             referer=f"https://app.fireflies.ai/view/{meeting_id}",
         )
@@ -706,21 +748,137 @@ class FirefliesClient:
         log.debug("Internal Fireflies live transcript returned %d sentences for %s", len(sentences), meeting_id)
         return base_detail.model_copy(update={"sentences": sentences, "transcript_error": ""})
 
-    def _post(self, query: str, variables: dict[str, JsonValue]) -> JsonObject:
+    def _write_raw(self, envelope: RawEnvelope) -> None:
+        try:
+            self._raw.write(envelope)
+        except (OSError, TypeError, ValueError):
+            log.warning(
+                "Raw archive write failed for %s/%s",
+                envelope.source,
+                envelope.endpoint,
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _response_body(resp: httpx.Response) -> tuple[object, str]:
+        try:
+            return resp.json(), "json"
+        except (json.JSONDecodeError, ValueError):
+            # TODO(raw-open-question-1): Preserve malformed/non-JSON bytes as
+            # base64 for now; revisit whether a transport-content-type outcome
+            # should be distinct from transient_error.
+            return base64.b64encode(resp.content).decode("ascii"), "raw"
+
+    @staticmethod
+    def _response_outcome(resp: httpx.Response, body: object) -> str:
+        if resp.status_code == 429:
+            return "rate_limited"
+        if resp.status_code in (401, 403):
+            return "transient_error" if resp.text.lstrip().startswith("<") else "auth_denied"
+        if resp.status_code >= 400:
+            return "transient_error"
+        if not isinstance(body, dict):
+            return "transient_error"
+        typed_body = cast("JsonObject", body)
+        errors = typed_body.get("errors")
+        codes = FirefliesClient._graphql_error_codes(errors)
+        if "object_not_found" in codes:
+            return "not_found"
+        if codes & {"forbidden", "unauthenticated", "unauthorized"}:
+            return "auth_denied"
+        if isinstance(errors, list) and not typed_body.get("data"):
+            return "transient_error"
+        data = typed_body.get("data")
+        if isinstance(data, dict) and data and all(value in (None, "", [], {}) for value in data.values()):
+            return "empty"
+        return "ok"
+
+    @staticmethod
+    def _graphql_error_codes(errors: object) -> set[str]:
+        if not isinstance(errors, list):
+            return set()
+        codes: set[str] = set()
+        for error in cast("list[object]", errors):
+            if not isinstance(error, dict):
+                continue
+            typed_error = cast("dict[str, object]", error)
+            code = typed_error.get("code")
+            if isinstance(code, str):
+                codes.add(code.lower())
+            extensions = typed_error.get("extensions")
+            if isinstance(extensions, dict):
+                extension_code = cast("dict[str, object]", extensions).get("code")
+                if isinstance(extension_code, str):
+                    codes.add(extension_code.lower())
+        return codes
+
+    def _request_public(
+        self,
+        query: str,
+        variables: dict[str, JsonValue],
+        *,
+        endpoint: str,
+        page_cursor: object | None,
+    ) -> httpx.Response:
+        try:
+            return self._client.post(_ENDPOINT, json={"query": query, "variables": variables})
+        except httpx.HTTPError:
+            self._write_raw(RawEnvelope(
+                source="fireflies-public-graphql",
+                endpoint=endpoint,
+                operation_variables=variables,
+                page_cursor=page_cursor,
+                fetched_at=time.time(),
+                outcome="transient_error",
+                body_encoding="json",
+                body=None,
+            ))
+            raise
+
+    @staticmethod
+    def _rate_limit_reset(resp: httpx.Response) -> float | None:
+        reset_header = resp.headers.get("x-ratelimit-reset-api")
+        try:
+            return float(reset_header) if reset_header else None
+        except ValueError:
+            log.warning("Malformed x-ratelimit-reset-api header: %r", reset_header)
+            return None
+
+    def _post(
+        self,
+        query: str,
+        variables: dict[str, JsonValue],
+        *,
+        endpoint: str,
+        page_cursor: object | None = None,
+    ) -> JsonObject:
         """Execute a GraphQL query, handle rate limit headers and errors."""
+        # TODO(raw-open-question-3): operation_variables intentionally stores
+        # the exact GraphQL variables shown in the envelope contract. If query
+        # text becomes runtime-variable, include its digest in a schema bump.
         if time.monotonic() < self._rate_limit_blocked_until:
             wait = self._rate_limit_blocked_until - time.monotonic()
             raise RateLimitedError(retry_after=wait)
 
-        resp = self._client.post(_ENDPOINT, json={"query": query, "variables": variables})
-
-        reset_header = resp.headers.get("x-ratelimit-reset-api")
-        reset_secs: float | None
-        try:
-            reset_secs = float(reset_header) if reset_header else None
-        except ValueError:
-            log.warning("Malformed x-ratelimit-reset-api header: %r", reset_header)
-            reset_secs = None
+        resp = self._request_public(
+            query,
+            variables,
+            endpoint=endpoint,
+            page_cursor=page_cursor,
+        )
+        reset_secs = self._rate_limit_reset(resp)
+        raw_body, encoding = self._response_body(resp)
+        outcome = self._response_outcome(resp, raw_body)
+        self._write_raw(RawEnvelope(
+            source="fireflies-public-graphql",
+            endpoint=endpoint,
+            operation_variables=variables,
+            page_cursor=page_cursor,
+            fetched_at=time.time(),
+            outcome=outcome,
+            body_encoding=encoding,
+            body=raw_body,
+        ))
 
         if resp.status_code == 429:
             self._rate_limit_blocked_until = time.monotonic() + (reset_secs or 60.0)
@@ -736,10 +894,9 @@ class FirefliesClient:
 
         resp.raise_for_status()
 
-        try:
-            body: JsonObject = resp.json()
-        except (json.JSONDecodeError, ValueError) as e:
-            raise TransientAPIError(f"Non-JSON response body: {e}") from e
+        if not isinstance(raw_body, dict):
+            raise TransientAPIError("Non-JSON response body")
+        body = cast("JsonObject", raw_body)
 
         # Bucket-exhausted but the response itself succeeded — keep the data,
         # arm the next call to back off.
@@ -751,11 +908,55 @@ class FirefliesClient:
                 reset_secs,
             )
 
-        if "errors" in body and not body.get("data"):
+        if outcome == "transient_error" and "errors" in body and not body.get("data"):
             raise TransientAPIError(f"GraphQL errors: {body['errors']}")
         if "errors" in body:
             log.warning("GraphQL errors (partial data): %s", body["errors"])
         return body
+
+    def _post_hive(
+        self,
+        query: str,
+        variables: dict[str, JsonValue],
+        *,
+        endpoint: str,
+        operation_name: str | None = None,
+        page_cursor: object | None = None,
+    ) -> JsonObject | None:
+        """Execute one best-effort Hive request and archive its raw response."""
+        if self._hive_client is None:
+            return None
+        request_body: dict[str, object] = {"query": query, "variables": variables}
+        if operation_name is not None:
+            request_body["operationName"] = operation_name
+        try:
+            resp = self._hive_client.post(_HIVE_ENDPOINT, json=request_body)
+        except httpx.HTTPError:
+            self._write_raw(RawEnvelope(
+                source="fireflies-hive",
+                endpoint=endpoint,
+                operation_variables=variables,
+                page_cursor=page_cursor,
+                fetched_at=time.time(),
+                outcome="transient_error",
+                body_encoding="json",
+                body=None,
+            ))
+            return None
+
+        body, body_encoding = self._response_body(resp)
+        outcome = self._response_outcome(resp, body)
+        self._write_raw(RawEnvelope(
+            source="fireflies-hive",
+            endpoint=endpoint,
+            operation_variables=variables,
+            page_cursor=page_cursor,
+            fetched_at=time.time(),
+            outcome=outcome,
+            body=body,
+            body_encoding=body_encoding,
+        ))
+        return cast("JsonObject", body) if outcome in {"ok", "empty"} and isinstance(body, dict) else None
 
     def list_transcripts(self, *, max_pages: int | None = None) -> list[Meeting]:
         """Fetch all transcripts, paginating through results.
@@ -772,7 +973,12 @@ class FirefliesClient:
             if max_pages is not None and page >= max_pages:
                 break
 
-            body = self._post(_LIST_QUERY, {"limit": _PAGE_SIZE, "skip": skip})
+            body = self._post(
+                _LIST_QUERY,
+                {"limit": _PAGE_SIZE, "skip": skip},
+                endpoint="transcripts",
+                page_cursor={"page": page + 1, "page_size": _PAGE_SIZE},
+            )
             data = body.get("data")
             raw_list = data.get("transcripts") if isinstance(data, dict) else None
 
@@ -823,15 +1029,14 @@ class FirefliesClient:
                 "size": _PAGE_SIZE,
                 "channelId": "all",
             }
-            try:
-                resp = self._hive_client.post(
-                    _HIVE_ENDPOINT,
-                    json={"query": _HIVE_LIST_QUERY, "variables": variables},
-                )
-                resp.raise_for_status()
-                body: JsonObject = resp.json()
-            except (httpx.HTTPError, json.JSONDecodeError, ValueError) as e:
-                log.warning("Hive API fallback failed: %s", e)
+            body = self._post_hive(
+                _HIVE_LIST_QUERY,
+                variables,
+                endpoint="transcripts",
+                page_cursor={"page": page + 1, "page_size": _PAGE_SIZE},
+            )
+            if body is None:
+                log.warning("Hive API fallback failed")
                 break
 
             channel = body.get("data")
@@ -886,19 +1091,14 @@ class FirefliesClient:
             "totalCount": 0,
             "status": None,
         }
-        try:
-            resp = self._hive_client.post(
-                _HIVE_ENDPOINT,
-                json={
-                    "operationName": "getUserMeetingsForStatus",
-                    "query": _HIVE_STATUS_QUERY,
-                    "variables": variables,
-                },
-            )
-            resp.raise_for_status()
-            body: JsonObject = resp.json()
-        except (httpx.HTTPError, json.JSONDecodeError, ValueError) as e:
-            log.warning("Status API supplemental list failed: %s", e)
+        body = self._post_hive(
+            _HIVE_STATUS_QUERY,
+            variables,
+            endpoint="status-supplement",
+            operation_name="getUserMeetingsForStatus",
+        )
+        if body is None:
+            log.warning("Status API supplemental list failed")
             return []
 
         data = body.get("data")
@@ -940,19 +1140,14 @@ class FirefliesClient:
         """
         if self._hive_client is None:
             return []
-        try:
-            resp = self._hive_client.post(
-                _HIVE_ENDPOINT,
-                json={
-                    "operationName": "getChannelsList",
-                    "query": _HIVE_CHANNELS_LIST_QUERY,
-                    "variables": {},
-                },
-            )
-            resp.raise_for_status()
-            body: JsonObject = resp.json()
-        except (httpx.HTTPError, json.JSONDecodeError, ValueError) as e:
-            log.warning("Channels list fetch failed: %s", e)
+        body = self._post_hive(
+            _HIVE_CHANNELS_LIST_QUERY,
+            {},
+            endpoint="channels",
+            operation_name="getChannelsList",
+        )
+        if body is None:
+            log.warning("Channels list fetch failed")
             return []
         data = body.get("data")
         raw_list = data.get("getChannelsList") if isinstance(data, dict) else None
@@ -1015,19 +1210,16 @@ class FirefliesClient:
         offset: int,
     ) -> list[tuple[str, list[str]]] | None:
         assert self._hive_client is not None
-        try:
-            resp = self._hive_client.post(
-                _HIVE_ENDPOINT,
-                json={
-                    "operationName": "fetchChannelMeetings",
-                    "query": _HIVE_MEMBERSHIPS_QUERY,
-                    "variables": {"from": offset, "size": _PAGE_SIZE, "channelId": channel_id},
-                },
-            )
-            resp.raise_for_status()
-            body: JsonObject = resp.json()
-        except (httpx.HTTPError, json.JSONDecodeError, ValueError) as e:
-            log.warning("Channel %s memberships fetch failed at offset %d: %s", channel_id, offset, e)
+        variables: JsonObject = {"from": offset, "size": _PAGE_SIZE, "channelId": channel_id}
+        body = self._post_hive(
+            _HIVE_MEMBERSHIPS_QUERY,
+            variables,
+            endpoint="channel-memberships",
+            operation_name="fetchChannelMeetings",
+            page_cursor={"offset": offset, "page_size": _PAGE_SIZE},
+        )
+        if body is None:
+            log.warning("Channel %s memberships fetch failed at offset %d", channel_id, offset)
             return None
         data = body.get("data")
         outer = data.get("getChannelMeetings") if isinstance(data, dict) else None
@@ -1050,7 +1242,7 @@ class FirefliesClient:
 
     def get_transcript(self, meeting_id: str) -> TranscriptDetail:
         """Fetch full transcript detail including sentences and summary."""
-        body = self._post(_DETAIL_QUERY, {"id": meeting_id})
+        body = self._post(_DETAIL_QUERY, {"id": meeting_id}, endpoint="transcript")
         data = body.get("data")
         raw = data.get("transcript") if isinstance(data, dict) else None
         if not isinstance(raw, dict) or not raw:
@@ -1102,7 +1294,7 @@ class FirefliesClient:
     def get_user_email(self) -> str | None:
         """Fetch the authenticated user's email address."""
         try:
-            body = self._post(_USER_QUERY, {})
+            body = self._post(_USER_QUERY, {}, endpoint="user")
         except (RateLimitedError, FatalAPIError, TransientAPIError, httpx.HTTPError):
             log.warning("Failed to fetch user email from API")
             return None
@@ -1115,7 +1307,11 @@ class FirefliesClient:
 
     def list_active_meeting_ids(self) -> list[str]:
         """Fetch IDs for meetings currently in active or paused state."""
-        body = self._post(_ACTIVE_MEETINGS_QUERY, {"states": ["active", "paused"]})
+        body = self._post(
+            _ACTIVE_MEETINGS_QUERY,
+            {"states": ["active", "paused"]},
+            endpoint="active-meetings",
+        )
         data = body.get("data")
         raw_list = data.get("active_meetings") if isinstance(data, dict) else None
         if not isinstance(raw_list, list):
