@@ -135,3 +135,8 @@ def test_legacy_import_is_tagged_and_idempotent(tmp_path: Path) -> None:
     assert len(envelopes) == 4
     assert {envelope["outcome"] for envelope in envelopes} == {"legacy-import"}
     assert any(envelope["body"] == {"outcome": "ok", "logs": []} for envelope in envelopes)
+
+    # Legacy import must not clobber _last_seen — those record live poll
+    # observability, and legacy mtimes would make endpoints look stale
+    # until the next live poll happens.
+    assert not (cache / "raw" / "_last_seen").exists()

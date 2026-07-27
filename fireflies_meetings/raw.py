@@ -178,12 +178,17 @@ class JsonlRawSink:
         del envelope
         return True
 
+    def _updates_last_seen(self, envelope: RawEnvelope) -> bool:
+        del envelope
+        return True
+
     def write(self, envelope: RawEnvelope) -> None:
         self._validate_component(envelope.source, field_name="source")
         self._validate_component(envelope.endpoint, field_name="endpoint")
         lock = self._source_lock(envelope.source)
         with lock:
-            self._write_last_seen(envelope)
+            if self._updates_last_seen(envelope):
+                self._write_last_seen(envelope)
             if not self._should_deduplicate(envelope):
                 self._append(envelope)
                 return
@@ -200,9 +205,17 @@ class JsonlRawSink:
 
 
 class LegacyImportSink(JsonlRawSink):
-    """Archive reconstructed legacy captures without deduplicating them."""
+    """Archive reconstructed legacy captures without deduplicating them.
+
+    Does not update ``_last_seen``: those files record live poll history and
+    would otherwise be clobbered by the importer's older mtimes, making
+    endpoints not yet re-polled since import look stale."""
 
     def _should_deduplicate(self, envelope: RawEnvelope) -> bool:
         if envelope.outcome != "legacy-import":
             raise ValueError("LegacyImportSink requires outcome='legacy-import'")
+        return False
+
+    def _updates_last_seen(self, envelope: RawEnvelope) -> bool:
+        del envelope
         return False
