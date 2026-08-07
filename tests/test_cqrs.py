@@ -580,5 +580,11 @@ def test_in_progress_surface_is_minimal_and_machine_readable(tmp_path: Path) -> 
     assert projection.node("/BACKFILL_IN_PROGRESS") is not None
     backfill = projection.file_content("/BACKFILL_IN_PROGRESS")
     assert backfill is not None
-    assert b"## 2026-03-31 partial" in backfill
-    assert b"## 2026-03-31 live" in backfill
+    # date_str is computed at projection time from date_epoch_ms in the host's
+    # local timezone, so hardcoding a specific calendar date makes the test
+    # host-timezone-dependent. Instead pull the actual dates from the
+    # projection and assert the backfill file reports them.
+    partial_date = projection.meetings[partial.id].meeting.date_str
+    live_date = projection.meetings[live.id].meeting.date_str
+    assert f"## {partial_date} partial".encode() in backfill
+    assert f"## {live_date} live".encode() in backfill
