@@ -7,12 +7,15 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
+# fusermount3 is at /run/wrappers/bin (NixOS setuid wrapper). Absolute path
+# because systemd's user-service PATH lookup for ExecStart* is minimal —
+# even 'fusermount3' with Environment=PATH=... doesn't resolve.
 WorkingDirectory=%h/agentic/fireflies-meetings-fuse
 EnvironmentFile=%h/agentic/fireflies-meetings-fuse/.env
-ExecStartPre=-fusermount3 -uz /views/fireflies-meetings
+ExecStartPre=-/run/wrappers/bin/fusermount3 -uz /views/fireflies-meetings
 ExecStart=%h/agentic/fireflies-meetings-fuse/.venv/bin/fireflies-meetings mount
-ExecStop=fusermount3 -u /views/fireflies-meetings
-ExecStopPost=-fusermount3 -u /views/fireflies-meetings
+ExecStop=/run/wrappers/bin/fusermount3 -u /views/fireflies-meetings
+ExecStopPost=-/run/wrappers/bin/fusermount3 -u /views/fireflies-meetings
 Restart=on-failure
 RestartSec=10
 
