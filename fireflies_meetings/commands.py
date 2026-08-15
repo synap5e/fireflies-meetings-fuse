@@ -16,6 +16,7 @@ from .capture import CaptureStore
 from .models import Channel, Meeting, Sentence, TranscriptDetail
 from .projection import (
     BackfillDiagnostic,
+    OneMeetingEvidence,
     Projection,
     ProjectionBuildOptions,
     build_projection_from_captures,
@@ -145,43 +146,59 @@ class CommandProcessor:
                 existing.setdefault(meeting.id, meeting)
             self._capture.write_list(list(existing.values()), fetched_at=fetched_at)
         elif isinstance(command, DetailFetched):
-            previous = self._capture.read_details().get(command.meeting_id)
+            previous = self._capture.read_detail(command.meeting_id)
             detail = merge_detail_observation(previous, command.detail)
             self._capture.write_detail(command.meeting_id, detail)
             invalidate_meeting_id = command.meeting_id
+            if self._apply_one_meeting_fast_path(command.meeting_id):
+                return self.projection, invalidate_meeting_id
         elif isinstance(command, AccessLogsFetched):
             self._capture.write_access_logs(command.meeting_id, command.outcome)
             invalidate_meeting_id = command.meeting_id
+            if self._apply_one_meeting_fast_path(command.meeting_id):
+                return self.projection, invalidate_meeting_id
         elif isinstance(command, ChannelsRefreshed):
             self._capture.write_channels(command.channels, command.memberships, fetched_at=fetched_at)
         else:
             rows = self._live_captions.setdefault(command.meeting_id, {})
             rows[str(command.sentence.index)] = command.sentence
             invalidate_meeting_id = command.meeting_id
-            if self._apply_caption_fast_path(command.meeting_id):
+            if self._apply_one_meeting_fast_path(command.meeting_id):
                 return self.projection, invalidate_meeting_id
         self._rebuild()
         return self.projection, invalidate_meeting_id
 
-    def _apply_caption_fast_path(self, meeting_id: str) -> bool:
+    def _apply_one_meeting_fast_path(self, meeting_id: str) -> bool:
         """Incremental swap for one meeting's file bytes, skipping the O(N)
-        full rebuild. Captions can't move meetings between slug groups or
-        change primary paths, so fold groups + tree structure stay put.
+        full rebuild.
+
+        Safe for any command that only changes one meeting's content —
+        captions, detail fetches, access-log fetches — because none of
+        them move meetings between slug groups or change primary paths,
+        so fold groups and tree structure stay put.
+
+        NOT safe for list refreshes or channels: those can add/drop
+        meetings and reshape fold groups.
+
+        Reads only THIS meeting's cached detail + access logs (a few KB)
+        instead of the full snapshot (~160MB of JSON parse across 1780
+        meeting dirs). The full-snapshot read was pinning CPU near 90%
+        under normal backfill load.
 
         Returns True on success. Falls back to False (caller does full
         rebuild) when the meeting isn't in the current projection yet —
-        e.g. a caption arrived before the first list refresh landed it."""
+        e.g. a detail fetch arrived before its list refresh landed it."""
         existing = self.projection.meetings.get(meeting_id)
         if existing is None:
             return False
-        snapshot = self._capture.read_snapshot()
-        updated = rebuild_one_meeting(
-            snapshot,
-            meeting_id,
-            existing,
+        evidence = OneMeetingEvidence(
+            list_meeting=existing.meeting,
+            detail_capture=self._capture.read_detail(meeting_id),
+            access_logs=self._capture.read_access_log(meeting_id),
             live_captions=self._live_captions,
             now_ms=time.time() * 1000,
         )
+        updated = rebuild_one_meeting(meeting_id, existing, evidence)
         self.projection = self.projection.replace_meeting(meeting_id, updated)
         return True
 

@@ -84,6 +84,33 @@ class CaptureStore:
     def access_logs_path(self, meeting_id: str) -> Path:
         return self.meetings_dir / meeting_id / "access_logs.json"
 
+    def read_detail(self, meeting_id: str) -> TranscriptDetail | None:
+        """Read one meeting's cached detail without touching the other ~1780.
+
+        The full snapshot read walks every meeting dir and JSON-parses every
+        detail file (~160MB of parse work). Single-meeting update paths call
+        this instead."""
+        path = self.detail_path(meeting_id)
+        if not path.is_file():
+            return None
+        try:
+            return TranscriptDetail.model_validate_json(path.read_text())
+        except (OSError, ValidationError) as e:
+            log.warning("Skipping malformed detail capture %s: %s", path, e)
+            return None
+
+    def read_access_log(self, meeting_id: str) -> AccessLogsOutcome:
+        """Read one meeting's cached access-logs outcome, or 'pending' if absent."""
+        path = self.access_logs_path(meeting_id)
+        if not path.is_file():
+            return ACCESS_LOGS_PENDING
+        try:
+            parsed = _parse_access_logs_outcome(json.loads(path.read_text()), path=path)
+            return parsed if parsed is not None else ACCESS_LOGS_PENDING
+        except (OSError, json.JSONDecodeError, ValidationError) as e:
+            log.warning("Skipping malformed access logs %s: %s", path, e)
+            return ACCESS_LOGS_PENDING
+
     def read_snapshot(self) -> CaptureSnapshot:
         channels, memberships = self.read_channels()
         return CaptureSnapshot(

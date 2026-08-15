@@ -374,6 +374,13 @@ def _select(rule: FieldRule, evidence: MeetingEvidence) -> tuple[object, str]:
     raise ValueError(f"no resolver candidate matched {rule.field}")
 
 
+# Track (meeting_id, list_status) pairs we've already warned about so a
+# meeting that stays list-terminal/detail-empty across many rebuilds doesn't
+# spam once per rebuild. Reset only on process restart — that's fine, the
+# audit signal is "did we see this on this boot" which grep still surfaces.
+_LIST_TERMINAL_WARNED: set[tuple[str, str]] = set()
+
+
 def _warn_on_list_terminal_detail_empty(evidence: MeetingEvidence) -> None:
     if (
         evidence.list_meeting is None
@@ -382,8 +389,13 @@ def _warn_on_list_terminal_detail_empty(evidence: MeetingEvidence) -> None:
         or evidence.list_meeting.meeting_info.summary_status not in _TERMINAL_STATUSES
     ):
         return
-    # TODO(resolver-open-question-1): list-terminal/detail-empty has not been
-    # observed in the audited corpus. Use the list status, but keep it visible.
+    # TODO(resolver-open-question-1): list-terminal/detail-empty was not in the
+    # audited corpus but shows up in production. Warn once per (id, status)
+    # so the signal stays visible without storming the log on every rebuild.
+    key = (evidence.list_meeting.id, evidence.list_meeting.meeting_info.summary_status)
+    if key in _LIST_TERMINAL_WARNED:
+        return
+    _LIST_TERMINAL_WARNED.add(key)
     log.warning(
         "Resolver using terminal list status %s for %s because detail status is empty",
         evidence.list_meeting.meeting_info.summary_status,

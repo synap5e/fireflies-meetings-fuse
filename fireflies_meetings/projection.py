@@ -9,7 +9,7 @@ from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Literal
 
-from .access_logs import ACCESS_LOGS_PENDING, AccessLogsOk
+from .access_logs import ACCESS_LOGS_PENDING, AccessLogsOk, AccessLogsOutcome
 from .capture import CaptureSnapshot
 from .models import Channel, Meeting, Sentence, TranscriptDetail
 from .renderer import (
@@ -324,40 +324,51 @@ def _resolved_meeting_map(
     return resolved
 
 
+@dataclass(frozen=True)
+class OneMeetingEvidence:
+    """Everything ``rebuild_one_meeting`` needs — bundled so it can be
+    read once (from disk or from the current projection) and passed by
+    reference. Avoids re-reading the ~160MB full cache snapshot on
+    every single-meeting update."""
+
+    list_meeting: Meeting | None
+    detail_capture: TranscriptDetail | None
+    access_logs: AccessLogsOutcome
+    live_captions: dict[str, dict[str, Sentence]]
+    now_ms: float
+
+
 def rebuild_one_meeting(
-    snapshot: CaptureSnapshot,
     meeting_id: str,
     existing: ProjectedMeeting,
-    *,
-    live_captions: dict[str, dict[str, Sentence]],
-    now_ms: float,
+    evidence: OneMeetingEvidence,
 ) -> ProjectedMeeting:
     """Recompute one meeting's ProjectedMeeting without touching fold groups.
 
-    Live captions can't move a meeting between slug groups or change its
-    primary_path, so we can reuse everything about placement (paths,
-    ghost_id, overlap_ids, overlap_dirnames, overlap_warning) and only
-    re-resolve + re-render this one meeting's file bytes."""
-    list_meeting = next(
-        (m for m in snapshot.meetings if m.id == meeting_id), None,
-    )
-    detail_capture = snapshot.details.get(meeting_id)
+    Per-meeting updates (captions, detail fetches, access-log fetches)
+    can't move a meeting between slug groups or change its primary_path,
+    so we can reuse everything about placement (paths, ghost_id,
+    overlap_ids, overlap_dirnames, overlap_warning) and only re-resolve
+    + re-render this one meeting's file bytes.
+
+    Takes the meeting's evidence directly (from CaptureStore.read_detail
+    etc.) rather than a full CaptureSnapshot — a snapshot read walks all
+    ~1780 meeting dirs and JSON-parses ~160MB, which is O(N) on every
+    single-meeting update and was the source of ~90% CPU sustained load."""
+    detail_capture = evidence.detail_capture
     resolved = resolve_meeting(MeetingEvidence(
-        list_meeting=list_meeting,
+        list_meeting=evidence.list_meeting,
         detail=detail_capture,
-        access_logs=snapshot.access_logs.get(meeting_id, ACCESS_LOGS_PENDING),
-        live_captions=live_captions.get(meeting_id, {}),
+        access_logs=evidence.access_logs,
+        live_captions=evidence.live_captions.get(meeting_id, {}),
         terminal_seen=detail_capture is not None and detail_capture.meeting.summary_is_terminal,
-        now_ms=now_ms,
+        now_ms=evidence.now_ms,
     ))
     canonical = _with_slug(resolved.meeting)
     if canonical is not resolved.meeting:
         resolved = replace(resolved, meeting=canonical)
     detail = _resolved_detail(resolved, detail_capture)
-    has_access_log_capture = isinstance(
-        snapshot.access_logs.get(meeting_id),
-        AccessLogsOk,
-    )
+    has_access_log_capture = isinstance(evidence.access_logs, AccessLogsOk)
     files = MappingProxyType(_render_projected_files(
         resolved.meeting, detail, resolved.state, has_access_log_capture,
     ))
