@@ -83,6 +83,8 @@ query Transcript($id: String!) {
     organizer_email
     participants
     transcript_url
+    video_url
+    audio_url
     speakers {
       id
       name

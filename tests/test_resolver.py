@@ -176,6 +176,23 @@ def test_participants_always_use_list_even_when_empty_and_detail_is_fallback() -
     assert resolve_meeting(_evidence(None, detail)).meeting.participants == ["detail@example.com"]
 
 
+def test_media_urls_and_timestamps_use_detail_observation() -> None:
+    listed = _meeting()
+    detailed = _meeting(
+        video_url="https://cdn.fireflies.ai/video.mp4?Expires=1788106885",
+        video_url_fetched_at=1785388800.123,
+        audio_url=None,
+        audio_url_fetched_at=None,
+    )
+
+    resolved = resolve_meeting(_evidence(listed, _detail(detailed))).meeting
+
+    assert resolved.video_url == detailed.video_url
+    assert resolved.video_url_fetched_at == detailed.video_url_fetched_at
+    assert resolved.audio_url is None
+    assert resolved.audio_url_fetched_at is None
+
+
 def test_summary_status_uses_detail_then_list_then_age_out() -> None:
     assert (
         resolve_meeting(

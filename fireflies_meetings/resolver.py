@@ -31,6 +31,10 @@ type MeetingField = Literal[
     "organizer_email",
     "participants",
     "transcript_url",
+    "video_url",
+    "video_url_fetched_at",
+    "audio_url",
+    "audio_url_fetched_at",
     "slug",
     "meeting_info.summary_status",
     "meeting_info.fred_joined",
@@ -229,6 +233,46 @@ def _detail_url(evidence: MeetingEvidence) -> str:
     return evidence.detail.meeting.transcript_url
 
 
+def _list_video_url(evidence: MeetingEvidence) -> str | None:
+    assert evidence.list_meeting is not None
+    return evidence.list_meeting.video_url
+
+
+def _detail_video_url(evidence: MeetingEvidence) -> str | None:
+    assert evidence.detail is not None
+    return evidence.detail.meeting.video_url
+
+
+def _list_video_url_fetched_at(evidence: MeetingEvidence) -> float | None:
+    assert evidence.list_meeting is not None
+    return evidence.list_meeting.video_url_fetched_at
+
+
+def _detail_video_url_fetched_at(evidence: MeetingEvidence) -> float | None:
+    assert evidence.detail is not None
+    return evidence.detail.meeting.video_url_fetched_at
+
+
+def _list_audio_url(evidence: MeetingEvidence) -> str | None:
+    assert evidence.list_meeting is not None
+    return evidence.list_meeting.audio_url
+
+
+def _detail_audio_url(evidence: MeetingEvidence) -> str | None:
+    assert evidence.detail is not None
+    return evidence.detail.meeting.audio_url
+
+
+def _list_audio_url_fetched_at(evidence: MeetingEvidence) -> float | None:
+    assert evidence.list_meeting is not None
+    return evidence.list_meeting.audio_url_fetched_at
+
+
+def _detail_audio_url_fetched_at(evidence: MeetingEvidence) -> float | None:
+    assert evidence.detail is not None
+    return evidence.detail.meeting.audio_url_fetched_at
+
+
 def _list_slug(evidence: MeetingEvidence) -> str:
     assert evidence.list_meeting is not None
     return evidence.list_meeting.slug
@@ -330,6 +374,34 @@ FIELD_PRECEDENCE: tuple[FieldRule, ...] = (
         (
             SourceCandidate("list", _list_present, _list_url),
             SourceCandidate("detail", _detail_present, _detail_url),
+        ),
+    ),
+    FieldRule(
+        "video_url",
+        (
+            SourceCandidate("detail", _detail_present, _detail_video_url),
+            SourceCandidate("list", _list_present, _list_video_url),
+        ),
+    ),
+    FieldRule(
+        "video_url_fetched_at",
+        (
+            SourceCandidate("detail", _detail_present, _detail_video_url_fetched_at),
+            SourceCandidate("list", _list_present, _list_video_url_fetched_at),
+        ),
+    ),
+    FieldRule(
+        "audio_url",
+        (
+            SourceCandidate("detail", _detail_present, _detail_audio_url),
+            SourceCandidate("list", _list_present, _list_audio_url),
+        ),
+    ),
+    FieldRule(
+        "audio_url_fetched_at",
+        (
+            SourceCandidate("detail", _detail_present, _detail_audio_url_fetched_at),
+            SourceCandidate("list", _list_present, _list_audio_url_fetched_at),
         ),
     ),
     FieldRule(
@@ -446,6 +518,10 @@ def resolve_meeting(evidence: MeetingEvidence) -> ResolvedMeeting:
         "organizer_email": values["organizer_email"],
         "participants": values["participants"],
         "transcript_url": values["transcript_url"],
+        "video_url": values["video_url"],
+        "video_url_fetched_at": values["video_url_fetched_at"],
+        "audio_url": values["audio_url"],
+        "audio_url_fetched_at": values["audio_url_fetched_at"],
         "slug": values["slug"],
         "meeting_info": meeting_info,
     })

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shlex
 from collections import defaultdict
+from urllib.parse import parse_qs, urlsplit
 
 from .models import Meeting, TranscriptDetail
 
@@ -186,6 +187,18 @@ def render_views(meeting: Meeting, detail: TranscriptDetail) -> str:
 
 def render_meeting_json(meeting: Meeting, detail: TranscriptDetail) -> str:
     """Render meeting.json with all meeting data."""
+    media: dict[str, str | float | None] = {
+        "video_url": meeting.video_url,
+        "video_url_fetched_at": meeting.video_url_fetched_at,
+        "audio_url": meeting.audio_url,
+        "audio_url_fetched_at": meeting.audio_url_fetched_at,
+    }
+    video_url_expires_at = _url_expires_at(meeting.video_url)
+    if video_url_expires_at is not None:
+        media["video_url_expires_at"] = video_url_expires_at
+    audio_url_expires_at = _url_expires_at(meeting.audio_url)
+    if audio_url_expires_at is not None:
+        media["audio_url_expires_at"] = audio_url_expires_at
     data = {
         "id": meeting.id,
         "title": meeting.title,
@@ -196,6 +209,7 @@ def render_meeting_json(meeting: Meeting, detail: TranscriptDetail) -> str:
         "organizer_email": meeting.organizer_email,
         "participants": meeting.participants,
         "transcript_url": meeting.transcript_url,
+        "media": media,
         "meeting_info": {
             "fred_joined": meeting.meeting_info.fred_joined,
             "silent_meeting": meeting.meeting_info.silent_meeting,
@@ -236,6 +250,19 @@ def render_meeting_json(meeting: Meeting, detail: TranscriptDetail) -> str:
         ],
     }
     return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+
+
+def _url_expires_at(url: str | None) -> int | None:
+    """Read CloudFront's optional ``Expires`` query parameter from a media URL."""
+    if url is None:
+        return None
+    try:
+        expires_values = parse_qs(urlsplit(url).query).get("Expires")
+        if not expires_values:
+            return None
+        return int(expires_values[0])
+    except ValueError:
+        return None
 
 
 def render_open_script(meeting: Meeting) -> str:

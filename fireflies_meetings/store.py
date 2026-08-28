@@ -93,6 +93,15 @@ def _with_slug(meeting: Meeting) -> Meeting:
     return meeting.model_copy(update={"slug": slugify(meeting.title) if meeting.title else meeting.id[:12]})
 
 
+def _with_media_fetched_at(detail: TranscriptDetail, observed_at: float) -> TranscriptDetail:
+    """Record when the detail endpoint observed each non-null signed media URL."""
+    meeting = detail.meeting
+    return detail.model_copy(update={"meeting": meeting.model_copy(update={
+        "video_url_fetched_at": observed_at if meeting.video_url is not None else None,
+        "audio_url_fetched_at": observed_at if meeting.audio_url is not None else None,
+    })})
+
+
 class MeetingStore:
     """Stateful write facade; read methods serve the current projection only."""
 
@@ -145,6 +154,13 @@ class MeetingStore:
             log.warning("Raw archive write failed for %s/%s", source, endpoint, exc_info=True)
 
     def _apply_command(self, command: object) -> str | None:
+        observed_at = time.time()
+        if isinstance(command, DetailFetched):
+            command = DetailFetched(
+                name=command.name,
+                meeting_id=command.meeting_id,
+                detail=_with_media_fetched_at(command.detail, observed_at),
+            )
         with self._lock:
             if isinstance(
                 command,
@@ -157,7 +173,7 @@ class MeetingStore:
                     ChannelsRefreshed,
                 ),
             ):
-                _projection, invalidated = self._processor.apply(command, fetched_at=time.time())
+                _projection, invalidated = self._processor.apply(command, fetched_at=observed_at)
                 self._apply_projection()
                 return invalidated
         return None

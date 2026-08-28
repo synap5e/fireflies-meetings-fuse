@@ -141,6 +141,32 @@ def test_get_transcript_marks_partial_sentences_error() -> None:
     assert "INTERNAL_SERVER_ERROR" in detail.transcript_error
 
 
+def test_get_transcript_parses_signed_media_urls() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        payload = json.loads(req.content.decode())
+        assert "video_url" in payload["query"]
+        assert "audio_url" in payload["query"]
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "transcript": {
+                        "id": "MEET01",
+                        "title": "Recorded meeting",
+                        "date": 1774891800000,
+                        "video_url": None,
+                        "audio_url": "https://cdn.fireflies.ai/audio.mp3?Expires=1788106885",
+                    },
+                },
+            },
+        )
+
+    detail = _make_client(handler).get_transcript("MEET01")
+
+    assert detail.meeting.video_url is None
+    assert detail.meeting.audio_url == "https://cdn.fireflies.ai/audio.mp3?Expires=1788106885"
+
+
 def test_get_transcript_falls_back_to_internal_meeting_captions() -> None:
     """Live caption fallback should use the internal meetingNote.captions query."""
 

@@ -5,6 +5,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import cast
 
+import pytest
+
 from fireflies_meetings import commands as commands_module, store as store_module
 from fireflies_meetings.access_logs import (
     ACCESS_LOGS_FAILED,
@@ -40,15 +42,16 @@ from fireflies_meetings.store import MeetingStore
 
 
 class _DetailClient:
-    def __init__(self, detail: TranscriptDetail) -> None:
+    def __init__(self, detail: TranscriptDetail, meetings: list[Meeting] | None = None) -> None:
         self._detail = detail
+        self._meetings = meetings or []
 
     def get_transcript(self, meeting_id: str) -> TranscriptDetail:
         assert meeting_id == self._detail.meeting.id
         return self._detail
 
     def list_transcripts(self, *, max_pages: int | None = None) -> list[Meeting]:
-        return []
+        return self._meetings
 
     def list_recent_status_meetings(self, *, limit: int = 100) -> list[Meeting]:
         return []
@@ -148,6 +151,25 @@ def test_commands_update_projection_and_capture_files(tmp_path: Path) -> None:
     )
     assert processor.projection.meetings[meeting.id].capture_state == "captured"
     assert b"Viewer" in processor.projection.meetings[meeting.id].files["views.md"]
+
+
+def test_store_stamps_observed_media_urls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    meeting = _meeting().model_copy(update={
+        "video_url": "https://cdn.fireflies.ai/video.mp4?Expires=1788106885",
+        "audio_url": None,
+    })
+    store = MeetingStore(
+        cast(FirefliesClient, _DetailClient(_detail(meeting), [meeting])),
+        status_cache=StatusCache(cache_dir=tmp_path / "cache"),
+    )
+    monkeypatch.setattr(store_module.time, "time", lambda: 1785388800.123)
+
+    store.refresh_list_if_needed()
+    store.backfill_one(meeting.id)
+
+    resolved = store.projection.meetings[meeting.id].meeting
+    assert resolved.video_url_fetched_at == 1785388800.123
+    assert resolved.audio_url_fetched_at is None
 
 
 def test_command_edges_unknown_detail_status_supplement_and_late_live(tmp_path: Path) -> None:

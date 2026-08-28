@@ -170,6 +170,41 @@ def test_render_meeting_json() -> None:
     assert len(data["transcript"]) == 3
     assert data["transcript"][0]["speaker_name"] == "Alice"
     assert data["summary"]["gist"] == "Quick standup."
+    assert data["media"] == {
+        "video_url": None,
+        "video_url_fetched_at": None,
+        "audio_url": None,
+        "audio_url_fetched_at": None,
+    }
+
+
+def test_render_meeting_json_includes_media_urls_and_expiry() -> None:
+    video_url = "https://cdn.fireflies.ai/video.mp4?Expires=1788106885&Signature=signed"
+    meeting = _make_meeting(
+        video_url=video_url,
+        video_url_fetched_at=1785388800.123,
+        audio_url="https://cdn.fireflies.ai/audio.mp3?Expires=1788106999",
+        audio_url_fetched_at=1785388800.456,
+    )
+    data = json.loads(render_meeting_json(meeting, _make_detail(meeting)))
+
+    assert data["media"]["video_url"] == video_url
+    assert isinstance(data["media"]["video_url_fetched_at"], float)
+    assert data["media"]["audio_url"] == "https://cdn.fireflies.ai/audio.mp3?Expires=1788106999"
+    assert isinstance(data["media"]["audio_url_fetched_at"], float)
+    assert data["media"]["video_url_expires_at"] == 1788106885
+    assert data["media"]["audio_url_expires_at"] == 1788106999
+
+
+def test_render_meeting_json_omits_unparseable_media_expiry() -> None:
+    meeting = _make_meeting(
+        video_url="https://cdn.fireflies.ai/video.mp4?Expires=not-an-epoch",
+        audio_url="https://cdn.fireflies.ai/audio.mp3?Signature=signed",
+    )
+    media = json.loads(render_meeting_json(meeting, _make_detail(meeting)))["media"]
+
+    assert "video_url_expires_at" not in media
+    assert "audio_url_expires_at" not in media
 
 
 def test_render_open_script() -> None:

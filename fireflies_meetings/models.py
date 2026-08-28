@@ -305,6 +305,10 @@ class Meeting(_FFBaseModel):
     )
     participants: list[str] = Field(default_factory=list)
     transcript_url: str = ""
+    video_url: str | None = None
+    video_url_fetched_at: float | None = None
+    audio_url: str | None = None
+    audio_url_fetched_at: float | None = None
     meeting_info: MeetingInfo = Field(default_factory=MeetingInfo)
     slug: str = ""  # computed by store, set via model_copy
 

@@ -78,3 +78,12 @@ def test_summary_status_not_found_normalizes_to_missing_from_api() -> None:
     )
     assert meeting.meeting_info.summary_status == "missing_from_api"
     assert meeting.is_completed
+
+
+def test_meeting_without_media_fields_defaults_to_none() -> None:
+    meeting = Meeting.model_validate(_make("MEET01"))
+
+    assert meeting.video_url is None
+    assert meeting.video_url_fetched_at is None
+    assert meeting.audio_url is None
+    assert meeting.audio_url_fetched_at is None
