@@ -690,6 +690,26 @@ def test_in_progress_surface_is_minimal_and_machine_readable(tmp_path: Path) -> 
     assert f"## {live_date} live".encode() in backfill
 
 
+def test_backfill_sentinel_omits_deleted_diagnostic_fields(tmp_path: Path) -> None:
+    # `BackfillDiagnostic` was never written to, so all three of its fields
+    # rendered a fixed lie ("never" / "not attempted" / "none") on every
+    # backfill entry. Deleted in 928cf58; this locks the removal in.
+    capture = CaptureStore(tmp_path)
+    partial = _meeting("PARTIAL01", title="Partial", summary_status="processing")
+    capture.write_list([partial], fetched_at=1.0)
+
+    projection = build_projection_from_captures(capture.read_snapshot())
+
+    backfill = projection.file_content("/BACKFILL_IN_PROGRESS")
+    assert backfill is not None
+    partial_date = projection.meetings[partial.id].meeting.date_str
+    # Guard against the assertions below passing vacuously on an empty sentinel.
+    assert f"## {partial_date} partial".encode() in backfill
+    assert b"- capture_state: partial" in backfill
+    for dead_field in (b"last_poll_attempt", b"last_poll_outcome", b"backoff_window"):
+        assert dead_field not in backfill
+
+
 def _supplemented(tmp_path: Path, existing: Meeting | None, incoming: Meeting) -> dict[str, Meeting]:
     """Apply one StatusSupplemented over an optionally pre-seeded list."""
     capture = CaptureStore(tmp_path)
