@@ -1,0 +1,45 @@
+Task 2 evidence: hive allEmails participant parsing
+
+Worktree:
+$ pwd
+/home/simon/agentic/fireflies-meetings-fuse/.wt/handoff/known-bugs-batch
+
+Targeted regression tests:
+$ uv run pytest tests/test_api.py -k 'hive_fallback' -q
+.....                                                                    [100%]
+5 passed, 25 deselected in 0.12s
+
+Ruff:
+$ uv run ruff check fireflies_meetings tests
+All checks passed!
+
+Basedpyright:
+$ uv run basedpyright fireflies_meetings tests
+0 errors, 0 warnings, 0 notes
+
+Full test suite (tail output):
+$ uv run pytest -x -q
+........................................................................ [ 41%]
+........................................................................ [ 83%]
+............................                                             [100%]
+172 passed in 1.96s
+
+Production suppression count:
+$ grep -c 'type: ignore' fireflies_meetings/api.py
+0
+
+Diff validation:
+$ git diff --check
+(no output; exit 0)
+
+Touched parser lines:
+$ nl -ba fireflies_meetings/api.py | sed -n '350,370p'
+   356    participants: list[JsonValue] = []
+   357    valid = raw.get("validAttendees")
+   358    all_emails = raw.get("allEmails")
+   359    if isinstance(valid, list):
+   360        for e in valid:
+   361            if isinstance(e, str):
+   362                participants.append(e)
+   363    elif isinstance(all_emails, str):
+   364        participants.extend(part for part in re.split(r"[,\s]+", all_emails) if part)

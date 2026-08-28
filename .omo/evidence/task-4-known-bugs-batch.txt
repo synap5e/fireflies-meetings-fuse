@@ -1,0 +1,27 @@
+# Task 4 evidence — StatusSupplemented merge (known-bugs-batch)
+Date: 2026-08-28T10:47:57-07:00
+Worktree: /home/simon/agentic/fireflies-meetings-fuse/.wt/handoff/known-bugs-batch  Branch: handoff/known-bugs-batch
+
+$ uv run ruff check fireflies_meetings tests
+All checks passed!
+
+$ uv run basedpyright fireflies_meetings tests
+0 errors, 0 warnings, 0 notes
+
+$ uv run pytest -x -q
+........................................................................ [ 40%]
+........................................................................ [ 80%]
+...................................                                      [100%]
+179 passed in 1.78s
+
+$ rg -n "BackfillDiagnostic|last_poll_attempt" fireflies_meetings tests
+(exit 1 — 1 = no matches, as required)
+
+$ uv run pytest -q -k status_supplement
+........                                                                 [100%]
+8 passed, 171 deselected in 0.57s
+
+## Red proofs (guard removed -> test fails; all reverted afterwards)
+- revert handler to existing.setdefault(...)  -> 3 failed: updates_empty_status, fills_missing_title, never_touches_is_live
+- drop terminal guard + zero-date guard        -> 2 failed: keeps_terminal_status, zero_date_never_clobbers_known_date
+- drop is_live from _STATUS_MERGE_EXCLUDED_FIELDS -> 1 failed: never_promotes_meeting_to_live

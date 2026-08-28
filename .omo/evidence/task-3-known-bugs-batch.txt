@@ -1,0 +1,109 @@
+=========================================================================
+TASK 3 — Delete BackfillDiagnostic plumbing end to end
+Worktree: .wt/handoff/known-bugs-batch   Branch: handoff/known-bugs-batch
+Commit:   928cf58   (parent ba634ad)
+=========================================================================
+
+--- PRE-FLIGHT: confirm _diagnostics is genuinely write-only ------------
+$ rg -n '_diagnostics' fireflies_meetings tests
+fireflies_meetings/commands.py:112:        self._diagnostics: dict[str, BackfillDiagnostic] = {}
+fireflies_meetings/commands.py:219:                diagnostics=self._diagnostics,
+
+$ rg -n '_diagnostics\s*[\[.=]|_diagnostics\)' fireflies_meetings tests
+(exit 1 — no matches)
+
+VERDICT: one declaration, one read, ZERO writers. Deletion is safe.
+
+--- BEFORE: rg -n 'BackfillDiagnostic|last_poll_attempt|diagnostic' ----
+fireflies_meetings/projection.py:44:class BackfillDiagnostic:
+fireflies_meetings/projection.py:45:    last_poll_attempt: str = ""
+fireflies_meetings/projection.py:82:    diagnostic: BackfillDiagnostic = field(default_factory=BackfillDiagnostic)
+fireflies_meetings/projection.py:152:    diagnostics: dict[str, BackfillDiagnostic] = field(default_factory=dict)
+fireflies_meetings/projection.py:176:    diag = opts.diagnostics
+fireflies_meetings/projection.py:255:    diag: dict[str, BackfillDiagnostic]
+fireflies_meetings/projection.py:287:        diagnostic=ctx.diag.get(meeting_id, BackfillDiagnostic()),
+fireflies_meetings/projection.py:569:            diagnostic=item.diagnostic,
+fireflies_meetings/projection.py:848:        diag = item.diagnostic
+fireflies_meetings/projection.py:853:            f"- last_poll_attempt: {diag.last_poll_attempt or 'never'}",
+fireflies_meetings/commands.py:18:    BackfillDiagnostic,
+fireflies_meetings/commands.py:112:        self._diagnostics: dict[str, BackfillDiagnostic] = {}
+fireflies_meetings/commands.py:219:                diagnostics=self._diagnostics,
+
+(Two extra sites the plan's rg line did not list, found by reading:
+   projection.py:176  `diag = opts.diagnostics`   — local binding
+   projection.py:209  `diag=diag,`                — _BuildContext ctor kwarg
+ Both deleted.)
+
+--- AFTER --------------------------------------------------------------
+$ rg -n 'BackfillDiagnostic|last_poll_attempt' fireflies_meetings tests
+(exit 1 — ZERO matches)
+
+$ rg -ni 'diagnostic' fireflies_meetings tests
+(exit 1 — ZERO matches, case-insensitive; no unrelated English-word usage exists)
+
+$ rg -n 'last_poll_outcome|backoff_window' fireflies_meetings tests
+(exit 1 — ZERO matches)
+
+--- DIFF SUMMARY -------------------------------------------------------
+$ git show --stat 928cf58
+ fireflies_meetings/commands.py   |  3 ---
+ fireflies_meetings/projection.py | 18 ------------------
+ 2 files changed, 21 deletions(-)      (pure deletion, 0 insertions)
+
+--- SENTINEL RENDER VERIFICATION ---------------------------------------
+Non-empty case:
+  # Backfill In Progress
+  <blank>
+  ## 2026-03-30  (MEET01)
+  <blank>
+  - capture_state: partial
+  <blank>
+Empty case:
+  # Backfill In Progress
+  <blank>
+  _No meetings currently need backfill._
+
+Header, per-meeting heading, capture_state and blank-line structure all intact.
+
+--- GATE 1: ruff -------------------------------------------------------
+$ uv run ruff check fireflies_meetings tests
+All checks passed!
+
+--- GATE 2: basedpyright -----------------------------------------------
+$ uv run basedpyright fireflies_meetings/projection.py fireflies_meetings/commands.py
+0 errors, 0 warnings, 0 notes
+
+$ uv run basedpyright fireflies_meetings tests
+2 errors, 0 warnings, 0 notes
+  tests/test_api.py:30:5   - "_hive_meeting_to_dict" is private ... (reportPrivateUsage)
+  tests/test_api.py:544:39 - dict[str, str | None] not assignable to JsonObject (reportArgumentType)
+
+  NOT MINE. Both errors sit on lines a CONCURRENT SIBLING AGENT added in its
+  own uncommitted working-tree changes to tests/test_api.py:
+      $ git diff tests/test_api.py | rg -n '_hive_meeting_to_dict'
+      9:+    _hive_meeting_to_dict,
+      18:+    converted = _hive_meeting_to_dict(
+      ...
+  (all '+' lines). My two files are clean at 0/0/0, verified in isolation above.
+
+--- GATE 3: pytest -----------------------------------------------------
+$ uv run pytest -q
+........................................................................ [ 41%]
+........................................................................ [ 83%]
+............................                                             [100%]
+172 passed in 2.08s
+
+  Baseline was 165. The extra 7 are the sibling agent's newly added
+  test_api.py / test_cqrs.py tests. Zero failures, zero regressions.
+  No test referenced BackfillDiagnostic / .diagnostic / .diagnostics /
+  last_poll_attempt, so no test edits were required.
+
+--- DEVIATION FROM PLAN (accepted, see final report) -------------------
+Plan said "remove the last_poll_attempt line" (singular). In reality
+BackfillDiagnostic carried THREE fields — last_poll_attempt,
+last_poll_outcome, backoff_window — and the sentinel rendered ALL THREE
+from the same dead `diag` object. Deleting the class necessarily deletes
+all three render lines; keeping the other two was impossible (they read
+attributes of a deleted type) and pointless (equally never-written, so
+they permanently printed 'not attempted' / 'none'). All non-diag sentinel
+lines were preserved exactly.
