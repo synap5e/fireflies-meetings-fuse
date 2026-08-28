@@ -85,7 +85,7 @@ Empirically established, mostly the hard way.
 - `title`: list wins — detail synthesizes a `"Jul 22, HH:MM PM"` placeholder for untitled meetings.
 - `date_epoch_ms`: list wins — detail rounds to the scheduled minute.
 - `duration_mins`: detail wins if non-zero.
-- `participants` conflicts (1376 of 1780) are a **parser bug** in `api.py`, not data: detail returns `['a,b']` where list returns `['a','b']`. Masked by resolver precedence, still unfixed.
+- `participants` conflicts (1376 of 1780) are a **parser bug** in `api.py`, not data: detail returns `['a,b']` where list returns `['a','b']`. Masked by resolver precedence. **Fixed in `0013bb8`** — `api.py` now splits `allEmails` on commas at the source; the ~1376 meetings already cached with the comma-joined value stay that way until refetched.
 - `summary_status` has three flavours and provenance must survive: real terminal, synthetic `missing_from_api` from a 404, synthetic from the 12h age-out. The synthetic ones are deliberately reversible.
 - `video_url` / `audio_url` exist on the public `Transcript` type. Signed CloudFront URLs, ~4-day TTL, `Expires=` epoch in the query string. Often audio-only (screen-share meetings). No size metadata.
 - Calendar placeholders return **200 OK with `dur=0`, `sentences=0`, `summary_status=""`** — and, more recently, with the full *scheduled* duration, which is why zero-duration ghost detection alone stopped working.
@@ -122,12 +122,12 @@ Empirically established, mostly the hard way.
 Ordered roughly by cost.
 
 1. **Memory floor: ~1.5 GB steady, 2.1 GB peak, 438 MB swap.** Restart doesn't fix it. Breakdown: ~90 MB rendered `transcript.md` bytes, ~25 MB other rendered files, ~40 MB `Projection.nodes` (~40k keys), ~10 MB pydantic models, ~150 MB interpreter/imports, +300–400 MB transient during `_rebuild()`, 200–400 MB glibc fragmentation. Costed option not taken: stop pre-rendering `transcript.md` bytes (~1 hour of work, estimated ~800 MB). **The service is currently stopped over this.**
-2. **`sync_active_meeting_ids` emits `ListRefreshed` every 30s with no diff**, forcing a full O(N) rebuild twice a minute. This is the residual ~25–31% CPU.
-3. **`StatusSupplemented` uses `setdefault`** (`commands.py`) and so never updates an existing status.
+2. **`sync_active_meeting_ids` emits `ListRefreshed` every 30s with no diff**, forcing a full O(N) rebuild twice a minute. This is the residual ~25–31% CPU. **Fixed in `b24f32b`** — the sync now skips the rebuild unless a meeting newly flips to live; effect lands at the next service restart.
+3. **`StatusSupplemented` uses `setdefault`** (`commands.py`) and so never updates an existing status. **Fixed in `1e5f560`** — it now gap-fills empty fields and updates non-terminal status on an already-known meeting, instead of a no-op.
 4. **Chat-watcher 404 retry storm.** `watch_meeting` swallows `TranscriptNotFoundError` without recording anything, so a Chat-discovered ID that 404s is retried every ~55s for the full 7-day lookback (~11k pointless requests per stuck ID). Fix sketch: negative cache with TTL. See `backlog.md`.
 5. **`participants` parser bug in `api.py`** — comma-joined single-element list from the detail endpoint (§3).
 6. **Hive-auth-missing cascade:** missing session auth ⇒ `access_logs` FAILED ⇒ the resolver never promotes to `captured` ⇒ backfill never drains. There is no `SESSION_EXPIRED` sentinel for hive the way there is for the API key and Chat token.
-7. **`BackfillDiagnostic` fields are dead code** — `_diagnostics` is never written, so `last_poll_attempt: never` in the sentinel is always misleading.
+7. **`BackfillDiagnostic` fields are dead code** — `_diagnostics` is never written, so `last_poll_attempt: never` in the sentinel is always misleading. **Fixed in `928cf58`** — the class and its sentinel output were deleted outright.
 8. **One shared `_BackoffState` across four endpoint kinds.**
 9. **`transcript_error` branch in `projection.py`** — zero occurrences across 1780 cached meetings; safe to delete.
 10. **Zombie record `01KNMTSHS6…`** (2026-04-07 all-hands) with `date=0`, outside the 100-record status window. Harmless; the date filter keeps it out of `/live/`.

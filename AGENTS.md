@@ -80,7 +80,7 @@ These are load-bearing. Breaking one produces a bug that took days to find the f
 
 - **Pydantic at I/O boundaries only.** Frozen, `populate_by_name=True`, `extra="ignore"`. No hand-rolled `_parse_*` helpers; no post-construction mutation — `model_copy(update={...})`. `AliasChoices` lets one model round-trip both API and cache shapes.
 - **Pure functions over stateful methods.** When ruff `C901` trips, extract a stateless helper — not another method on `self`, and not a `noqa`.
-- **Type suppressions are near-zero and stay that way.** Current state: one `# type: ignore[assignment]` in `api.py:362`, seven in tests, one file-level `# pyright: reportPrivateUsage=false` in `tests/test_backoff.py`. Zero `# pyright: ignore`, zero `# noqa`. Prefer a stub in `stubs/` over a pragma — that's why `stubs/google*` and `stubs/socketio` exist.
+- **Type suppressions are near-zero and stay that way.** Current state: zero production `# type: ignore` (seven remain in tests, plus one file-level `# pyright: reportPrivateUsage=false` in `tests/test_backoff.py`). Zero `# pyright: ignore`, zero `# noqa`. Prefer a stub in `stubs/` over a pragma — that's why `stubs/google*` and `stubs/socketio` exist.
 - **Wrap pyfuse3 `NewType`s** (`InodeT`, `FileHandleT`, `FlagT`) rather than suppressing the type error.
 - **Lazy imports are confined to `__main__.py`** (per-file `PLC0415` ignore) so `unmount`/`--help` work without FUSE installed. Don't add them elsewhere.
 - **Tests never hit the network** — `httpx.MockTransport`, fakes, `tmp_path`, `monkeypatch`. `tests/conftest.py` pins `TZ=Pacific/Auckland` because dates are derived from epochs at projection time and the two dev hosts are 19h apart.
@@ -116,7 +116,7 @@ Never run `fireflies-meetings mount` by hand while the service owns the mountpoi
 
 - **The service is `failed` / stopped**, deliberately shut down over memory (~1.5 GB steady, 2.1 GB peak, 438 MB swap). Restart did not fix it. This is the top open problem.
 - **`ba634ad` (media URLs in `meeting.json`) is inert** until the service restarts — no cached detail has the new fields yet. Code on `main` ≠ code running.
-- Residual ~25–31% CPU is traced to `sync_active_meeting_ids` emitting `ListRefreshed` every 30s with no diff, forcing a full O(N) rebuild twice a minute.
+- **The no-diff `sync_active_meeting_ids` rebuild is fixed (`b24f32b`)**, but takes effect only at the next service restart — the service is still stopped, so nothing is live yet.
 - An architecture review (port to the Rust `vfsd` engine vs refactor pyfuse3 in place) was agreed but never held. `fuse_ops.py` is on the chopping block either way.
 
 See [`docs/decision-log.md`](docs/decision-log.md) for the full set of diagnosed-but-unfixed issues and the reasoning behind rejected designs.

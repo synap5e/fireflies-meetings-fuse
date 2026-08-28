@@ -1,0 +1,117 @@
+Task 5 (docs sync) — evidence
+==============================
+
+Context note: AGENTS.md and docs/decision-log.md were never git-tracked
+anywhere in this repo (confirmed: `git log --all -- AGENTS.md` and
+`-- docs/decision-log.md` both return nothing; they show as `??` untracked
+in the main checkout). They did not exist at all in this worktree before
+this commit. Per the plan's framing that AGENTS.md is "the canonical
+knowledge base (recently regenerated)", the current content was read
+read-only from the main checkout (/home/simon/agentic/fireflies-meetings-fuse/{AGENTS.md,docs/decision-log.md})
+without modifying it, then written into this worktree with the required
+edits applied, and committed here for the first time. backlog.md WAS
+already tracked on this branch but at an older revision; its current
+(uncommitted, regenerated 2026-08-28) content in main matched the plan's
+described section structure (Blocking/Correctness/Features/Housekeeping),
+so that revision was likewise brought in as the edit base.
+
+Verification that api.py:362's `# type: ignore[assignment]` was actually
+removed by 0013bb8 (not just claimed):
+
+$ git show 0013bb8 -- fireflies_meetings/api.py | grep -n -B3 -A3 "type: ignore"
+30-             if isinstance(e, str):
+31-                 participants.append(e)
+32--    elif isinstance(raw.get("allEmails"), str):
+33:-        all_emails: str = raw["allEmails"]  # type: ignore[assignment]
+34--        for e in all_emails.split():
+35--            participants.append(e)
+36-+    elif isinstance(all_emails, str):
+
+Post-edit confirmation of zero production type:ignore, and test-side counts
+matching the AGENTS.md claim (seven in tests, one file-level pyright directive):
+
+$ rg -n 'type: ignore' fireflies_meetings/
+(no output — zero matches)
+
+$ rg -n 'type: ignore' tests/ | wc -l
+7
+
+$ rg -n 'pyright: report' tests/
+tests/test_backoff.py:1:# pyright: reportPrivateUsage=false
+
+Commit hashes used for annotation (from `git log --oneline -6`):
+1e5f560 fix(commands): StatusSupplemented fills gaps and updates non-terminal status instead of setdefault
+0013bb8 fix(api): split hive allEmails on commas — 1376 meetings had comma-joined participants
+b24f32b perf(store): skip no-diff active-meeting syncs that forced full rebuilds every 30s
+928cf58 chore(projection): delete write-only BackfillDiagnostic — sentinel always claimed 'never'
+
+Files changed:
+- AGENTS.md (new, added to git for the first time)
+  (a) "Conventions" suppression sentence: "one `# type: ignore[assignment]`
+      in `api.py:362`" -> "zero production `# type: ignore`" (seven in
+      tests + one file-level pyright directive unchanged).
+  (b) "Current state (2026-08-28)": removed the residual-CPU bullet blaming
+      `sync_active_meeting_ids`; replaced with a bullet noting the fix
+      landed in `b24f32b` and takes effect at the next service restart
+      (service is still stopped, so nothing is live yet).
+- backlog.md (already tracked; content replaced with main's regenerated
+  2026-08-28 revision, then edited)
+  - Deleted "### Stop the no-diff rebuild" (was under ## Blocking).
+  - Deleted "### `StatusSupplemented` never updates existing status" (was
+    under ## Correctness).
+  - Removed "### Fix the `participants` parser" from ## Correctness and
+    replaced it with a Housekeeping bullet noting it's fixed in `0013bb8`,
+    explicitly preserving the caveat that the ~1376 already-cached
+    comma-joined values are NOT repaired — they heal only on refetch.
+- docs/decision-log.md (new, added to git for the first time)
+  §5 "Diagnosed, not fixed" — annotated, did not delete:
+    - item 2 (no-diff rebuild): "**Fixed in `b24f32b`** — the sync now
+      skips the rebuild unless a meeting newly flips to live; effect lands
+      at the next service restart."
+    - item 3 (setdefault): "**Fixed in `1e5f560`** — it now gap-fills empty
+      fields and updates non-terminal status on an already-known meeting,
+      instead of a no-op."
+    - item 7 (BackfillDiagnostic): "**Fixed in `928cf58`** — the class and
+      its sentinel output were deleted outright."
+  §3 "Fireflies API notes" — participants bullet: "still unfixed" removed,
+    replaced with "**Fixed in `0013bb8`** — `api.py` now splits `allEmails`
+    on commas at the source; the ~1376 meetings already cached with the
+    comma-joined value stay that way until refetched."
+  §5 item 5 (the participants cross-reference to §3) and all other
+  sections left untouched, as instructed (annotate only the four named
+  spots).
+
+Post-edit verification commands and full output:
+
+$ rg -n 'api.py:362|Stop the no-diff|setdefault' AGENTS.md backlog.md
+(no output — exit code 1, i.e. no matches: no stale claims remain)
+
+$ rg -ci 'fixed' docs/decision-log.md
+5
+
+$ rg -n '\]\(' AGENTS.md backlog.md docs/decision-log.md README.md
+docs/decision-log.md:5:...[`AGENTS.md`](../AGENTS.md); open work in [`backlog.md`](../backlog.md).
+backlog.md:3:...[`AGENTS.md`](AGENTS.md) and [`README.md`](README.md); ...[`docs/decision-log.md`](docs/decision-log.md).
+AGENTS.md:3:...[`README.md`](README.md)...[`docs/decision-log.md`](docs/decision-log.md)...[`backlog.md`](backlog.md).
+AGENTS.md:122:See [`docs/decision-log.md`](docs/decision-log.md) for the full set...
+README.md: (own internal links, unaffected — README.md was not touched)
+All relative paths verified to resolve given the files' actual locations
+(docs/decision-log.md -> ../AGENTS.md, ../backlog.md; root files -> docs/decision-log.md, AGENTS.md, backlog.md, README.md).
+
+Gates:
+
+$ uv run ruff check fireflies_meetings tests
+All checks passed!
+
+$ uv run basedpyright fireflies_meetings tests
+0 errors, 0 warnings, 0 notes
+
+$ uv run pytest -x -q
+........................................................................ [ 40%]
+........................................................................ [ 80%]
+...................................                                      [100%]
+179 passed in 3.19s
+
+Files NOT touched (per MUST NOT DO): README.md, anything under
+fireflies_meetings/ or tests/, no decision-log.md history deleted, no
+merge/push to main.

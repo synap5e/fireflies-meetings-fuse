@@ -33,23 +33,9 @@ Agreed and never scheduled. The question is port to the `vfsd` Rust engine vs re
 
 `fuse_ops.py` (784 LOC) is on the chopping block either way. If the port wins, the producer is `fireflies_meetings/vfs_feed.py` (~150–250 LOC) answering Hello+Subscribe on `unix:/run/user/1000/fireflies-meetings/vfs-feed.sock`; shadow mountpoints already exist. Hard requirements already given to the engine owner: **stable inodes across restarts** (agents record `file:line` references) and a **never-fetch read path**.
 
-### Stop the no-diff rebuild
-
-`sync_active_meeting_ids` emits `ListRefreshed` every 30s whether or not anything changed, forcing a full O(N) projection rebuild twice a minute. This is the residual ~25–31% CPU. Diff before emitting, or route it through the per-meeting fast path.
-
-Small — this is a guard clause, not a redesign.
-
 ---
 
 ## Correctness
-
-### Fix the `participants` parser
-
-1376 of 1780 meetings show a list/detail conflict on `participants`, and it's a parser bug in `api.py`, not real disagreement: the detail endpoint yields `['a,b']` where the list yields `['a','b']`. Resolver precedence currently masks it. Fix at the boundary and drop the mask.
-
-### `StatusSupplemented` never updates existing status
-
-`commands.py` uses `setdefault`, so a status that arrives after a meeting is already known is silently discarded. Flagged 2026-07-26, untouched. Decide whether status may downgrade an existing record before changing it — that is the unfinished half of the source-merging audit below.
 
 ### Negative cache for Chat-watcher 404s
 
@@ -59,7 +45,7 @@ Small — this is a guard clause, not a redesign.
 
 `getUserMeetingsForStatus` returns `errorDetail` and `puppetExitReason` — the diagnostics the public API lacks — and we throw them away. Add them to the query and render them into stub `summary.md` files so a failed meeting explains itself.
 
-This is the surviving half of the old "audit & clarify source-merging semantics" item. The audit itself is **done**: `resolver.py` now holds a data-driven per-field precedence table, and every `Meeting` field must have an entry or be dropped. What remains is the diagnostics plumbing plus the `setdefault` question above.
+This is the surviving half of the old "audit & clarify source-merging semantics" item. The audit itself is **done**: `resolver.py` now holds a data-driven per-field precedence table, and every `Meeting` field must have an entry or be dropped.
 
 ### Hive session expiry has no sentinel
 
@@ -102,4 +88,5 @@ Phase 3b of the raw-archive work: rebuild the projection from `raw/` rather than
 - On pro-crastinator: `~/.cache/fireflies-meetings/`, `~/.config/fireflies-meetings/`, the unit symlink and `.env` were left in place as rollback safety after the move to flow.
 - Dependabot flagged one moderate advisory (2026-05-02), never actioned.
 - `transcript_error` never persists: 0 of 2195 cached details carry one. It is *not* dead code — `api.py` sets it on the live partial-error path, `projection.py` clears it once sentences arrive, `renderer.py` renders it — so it only ever exists in memory mid-meeting. Worth confirming it actually reaches a rendered file before trusting it as a diagnostic. (An earlier note called this dead code; that was about a pre-resolver branch that no longer exists.)
+- **`participants` list/detail parser conflict is fixed (`0013bb8`)** — `api.py` now splits `allEmails` on commas, so future fetches come in clean. The ~1376 meetings already cached with comma-joined values are *not* repaired by this fix; they heal only when that meeting is refetched (backfill pass, notification refresh, or a `SIGUSR1` refresh).
 - Rename the CQRS vocabulary in `commands.py` / `tests/test_cqrs.py` to match what it actually is.
