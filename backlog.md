@@ -1,88 +1,105 @@
 # Backlog
 
-## Live Transcript Stream File
+Ideation, not spec. Canonical intent lives in [`AGENTS.md`](AGENTS.md) and [`README.md`](README.md); the reasoning behind past decisions is in [`docs/decision-log.md`](docs/decision-log.md).
 
-### What It Is
+Reconciled against the post-CQRS codebase on 2026-08-28. Ordered by what's actually blocking.
 
-Add a live-only `live-transcript.md` alongside the existing `transcript.md`.
+---
 
-- `transcript.md` stays the authoritative snapshot file.
-- `live-transcript.md` is an append-only, best-effort live stream.
-- `live-transcript.md` exists only while `is_live=True`.
+## Blocking
 
-### Why We'd Want It
+### Get memory under control
 
-It would make plain `tail -f` work cleanly for live meetings.
+The service is stopped because of this. ~1.5 GB steady, 2.1 GB peak, 438 MB swap; a restart doesn't clear it. Breakdown and the reason the projection is fully materialized are in the decision log.
 
-- Readers get transcript-so-far from byte 0, then block for more data.
-- When the meeting ends, readers drain the remaining bytes and get EOF.
+Options, costed but not chosen:
 
-### Contract Notes
+1. Stop pre-rendering `transcript.md` bytes; render on read from the parsed detail. ~1 hour, estimated ~800 MB. Note this puts work back on the read path — it must not become a *disk* read.
+2. `mmap` + a custom sentence iterator instead of parsed pydantic in the projection.
+3. Split the process (rejected once as overkill).
+4. Port to the out-of-process Rust engine, which sidesteps the Python heap entirely.
 
-- The file is visible through both `/live/<slug>/live-transcript.md` and the dated tree path while the meeting is live.
-- New opens after the meeting ends get `ENOENT`.
-- Existing open file descriptors keep reading buffered data until EOF.
-- The stream is best-effort append-only output.
-- There is no resync or rewrite protocol for corrected rows.
+Option 4 is entangled with the architecture review below, which is why nothing has been picked.
 
-### Rough Size
+### Hold the architecture review
 
-- Implementation on top of the baseline fix: about 210-320 LOC
-- Tests on top of the baseline fix: about 70-120 LOC
+Agreed and never scheduled. The question is port to the `vfsd` Rust engine vs refactor pyfuse3 in place. Feeding into it:
 
-### Risks
+- Are five concurrent trio loops the right decomposition?
+- Should ghost/overlap folding move from render time to ingest time?
+- Does `mine/` deserve a parallel subtree, or is it a shell alias?
+- Should `_terminal_meeting_ids` be persisted, or the late-caption bug class be fixed by dropping the socket earlier?
+- Should channels be first-class rather than a symlink fold?
 
-- Fireflies WebSocket rows are mutable, so superseded fragments may appear in `live-transcript.md` even if they do not survive into final `transcript.md`.
+`fuse_ops.py` (784 LOC) is on the chopping block either way. If the port wins, the producer is `fireflies_meetings/vfs_feed.py` (~150–250 LOC) answering Hello+Subscribe on `unix:/run/user/1000/fireflies-meetings/vfs-feed.sock`; shadow mountpoints already exist. Hard requirements already given to the engine owner: **stable inodes across restarts** (agents record `file:line` references) and a **never-fetch read path**.
 
-## Audit & Clarify Source-Merging Semantics
+### Stop the no-diff rebuild
 
-### What It Is
+`sync_active_meeting_ids` emits `ListRefreshed` every 30s whether or not anything changed, forcing a full O(N) projection rebuild twice a minute. This is the residual ~25–31% CPU. Diff before emitting, or route it through the per-meeting fast path.
 
-The store now folds in meetings from up to four discovery sources:
+Small — this is a guard clause, not a redesign.
 
-1. Public `transcripts` GraphQL query (the API key path) — finished transcripts only.
-2. Internal `getChannelMeetings` (hive endpoint, fallback) — used only when the public call errors.
-3. Internal `getUserMeetingsForStatus` (hive endpoint, supplemental) — surfaces meetings in any state, including processing/errored/audio-too-small.
-4. Google Chat watcher — IDs only, fed via `watch_meeting`.
-5. `active_meetings` GraphQL query — IDs only, used to mark live state.
+---
 
-Today's merge logic is ad-hoc: public list wins on conflict, status fills gaps, Chat/active_meetings flip `is_live=True`. There's no single owner-per-field model, and conflicts (e.g. status reports `processMeetingStatus=failed` while public returns a transcript) aren't reasoned about explicitly.
+## Correctness
 
-### Why It Matters
+### Fix the `participants` parser
 
-- Conflict cases work today but are accidental. Adding a sixth source or changing one method's behavior could silently corrupt state.
-- The status API exposes useful diagnostics (`errorDetail`, `puppetExitReason`) we currently throw away — we'd want them rendered into stub `summary.md` files, but that needs the merge story tightened first.
-- Stale state from any source (e.g. status flipping a meeting to "failed" after the public API has the transcript) could hide good data.
+1376 of 1780 meetings show a list/detail conflict on `participants`, and it's a parser bug in `api.py`, not real disagreement: the detail endpoint yields `['a,b']` where the list yields `['a','b']`. Resolver precedence currently masks it. Fix at the boundary and drop the mask.
 
-### Acceptance
+### `StatusSupplemented` never updates existing status
 
-- Document each source's authority per field (id, title, date, is_live, summary_status, transcript content, error details).
-- Update `_fetch_meetings` and `watch_meeting` / `sync_active_meeting_ids` to reflect that document.
-- Add `errorDetail` / `puppetExitReason` to the status query and surface them in stub renderings.
-- Add tests covering at least: public-only, status-only, public+status conflict, public→status downgrade-blocked, Chat-discovers-after-status.
+`commands.py` uses `setdefault`, so a status that arrives after a meeting is already known is silently discarded. Flagged 2026-07-26, untouched. Decide whether status may downgrade an existing record before changing it — that is the unfinished half of the source-merging audit below.
 
-### Rough Size
+### Negative cache for Chat-watcher 404s
 
-- Documentation + refactor: ~200-400 LOC including tests.
+`watch_meeting` swallows `TranscriptNotFoundError` without recording anything, so a Chat-discovered ID that 404s is retried every ~55s for the full 7-day lookback — roughly 11k pointless requests per stuck ID. Cache "tried, 404'd" keyed by meeting id with a ~6h TTL so a delayed transcript still gets a chance. ~30–50 LOC plus a test; lives alongside `_backoff` in `store.py`.
 
-## Cache 404s from Chat Watcher
+### Surface hive diagnostics
 
-### What It Is
+`getUserMeetingsForStatus` returns `errorDetail` and `puppetExitReason` — the diagnostics the public API lacks — and we throw them away. Add them to the query and render them into stub `summary.md` files so a failed meeting explains itself.
 
-When the Chat watcher discovers a `app.fireflies.ai/live/<id>` URL whose `getTranscript(id)` returns 404, the watcher keeps retrying that ID for the full 7-day lookback window.
+This is the surviving half of the old "audit & clarify source-merging semantics" item. The audit itself is **done**: `resolver.py` now holds a data-driven per-field precedence table, and every `Meeting` field must have an entry or be dropped. What remains is the diagnostics plumbing plus the `setdefault` question above.
 
-### Symptom
+### Hive session expiry has no sentinel
 
-Observed in journal: a single ID firing `watch_meeting(<id>): transcript not found, skipping` every ~55s for hours. Over the 7-day lookback that's ~11k pointless requests per stuck ID.
+Missing or expired session auth makes `access_logs` FAIL, which stops the resolver promoting meetings to `captured`, which stops backfill draining — silently. There are `AUTHENTICATION_EXPIRED` and `CHAT_AUTH_EXPIRED` markers but no equivalent for hive.
 
-### Why It Happens
+---
 
-`watch_meeting` swallows `TranscriptNotFoundError` and returns without recording anything. Next Chat poll re-discovers the same URL, calls `watch_meeting` again, gets the same 404. No memory of "we already tried this."
+## Features
 
-### Fix Sketch
+### Live transcript stream file
 
-Cache a "tried, 404'd" set keyed by meeting ID with a TTL (e.g. 6h, then expire so a delayed transcript gets a chance). `watch_meeting` short-circuits if ID is in the negative cache. Could live alongside `_backoff` in `MeetingStore`.
+A live-only `live-transcript.md` alongside `transcript.md`, so `tail -f` works cleanly on a meeting in progress.
 
-### Rough Size
+- `transcript.md` stays the authoritative, corrected snapshot.
+- `live-transcript.md` is append-only, best-effort, and exists only while `is_live=True`. New opens after the meeting ends get `ENOENT`; already-open fds drain to EOF.
+- Visible through both `/live/<slug>/` and the dated path while live.
 
-- Implementation: ~30-50 LOC plus a small test in `tests/`.
+Risk: Fireflies rows are mutable, so superseded fragments can appear here that never make it into the final `transcript.md`. There is deliberately no resync protocol.
+
+~210–320 LOC plus ~70–120 LOC of tests. Partly pre-empted — `tail --debug -f` reports *polling* mode on this mount, so the attr-timeout fix may already be enough. Verify that before building this.
+
+### Per-meeting force refetch
+
+There is no way to re-fetch one meeting; `SIGUSR1` is all-or-nothing. This is what would fix expired signed media URLs, since captured meetings are immutable-forever in cache and their `video_url` / `audio_url` go stale after ~4 days. Either extend `SIGUSR1` or add a control path — the literal `_control/refetch/<id>` form was declined at 1780+ meetings, so it needs a parameterized shape.
+
+### Cached media files
+
+`audio.mp3` / `video.mp4` as real files in the tree, JIT-fetched with LRU eviction and a size cap. Parked deliberately: ~80 GB for the full archive, 300–500 LOC through the layer we want to delete. Revisit after the architecture review.
+
+### Raw-driven build path
+
+Phase 3b of the raw-archive work: rebuild the projection from `raw/` rather than from normalized captures, with a shadow-verify harness comparing the two. Unblocked, never started, ~600 LOC. Insurance rather than a fix for anything currently broken.
+
+---
+
+## Housekeeping
+
+- `.wt/handoff/video-urls-in-meeting-json` worktree kept for reference; nothing to unwind.
+- Confirm `~/.cache/fireflies-meetings.pre-cqrs` (198 MB) and `detail.legacy.<ts>` were removed.
+- On pro-crastinator: `~/.cache/fireflies-meetings/`, `~/.config/fireflies-meetings/`, the unit symlink and `.env` were left in place as rollback safety after the move to flow.
+- Dependabot flagged one moderate advisory (2026-05-02), never actioned.
+- `transcript_error` never persists: 0 of 2195 cached details carry one. It is *not* dead code — `api.py` sets it on the live partial-error path, `projection.py` clears it once sentences arrive, `renderer.py` renders it — so it only ever exists in memory mid-meeting. Worth confirming it actually reaches a rendered file before trusting it as a diagnostic. (An earlier note called this dead code; that was about a pre-resolver branch that no longer exists.)
+- Rename the CQRS vocabulary in `commands.py` / `tests/test_cqrs.py` to match what it actually is.
