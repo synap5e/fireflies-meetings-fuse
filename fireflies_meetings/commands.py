@@ -90,6 +90,56 @@ Command = (
 )
 
 
+# Fields the generic gap-fill pass must never touch.
+#   id             — identifies the record; merging into it is meaningless.
+#   is_live        — a status observation is not a liveness signal.
+#   date_epoch_ms  — stricter standalone rule below (zero never wins).
+#   meeting_info   — nested; only summary_status merges, under its own rule.
+_STATUS_MERGE_EXCLUDED_FIELDS = frozenset({"id", "is_live", "date_epoch_ms", "meeting_info"})
+
+
+def _merge_status_supplement(existing: Meeting, incoming: Meeting) -> Meeting:
+    """Fold a status observation into an already-known meeting.
+
+    Status data ADDS information; it never destroys good cached data. The
+    caller handles ids it has never seen — those are stored as-is. For a
+    known id:
+
+    - Gap fill: a falsy field on `existing` takes `incoming`'s value when
+      that value is truthy. A truthy existing value always wins.
+    - `summary_status`: a terminal existing status is never overwritten
+      (see `Meeting.summary_is_terminal`). Otherwise a non-empty incoming
+      status wins.
+    - `date_epoch_ms`: a zero/absent incoming date never overwrites a
+      non-zero existing one. Zero is a valid-looking-but-wrong value here,
+      not merely "missing" — a zero-epoch status record once clobbered a
+      real meeting date in production.
+    - `is_live`: never touched.
+
+    `Meeting` is frozen, so the merge is a `model_copy(update=...)`.
+    """
+    updates: dict[str, object] = {}
+    for name in Meeting.model_fields:
+        if name in _STATUS_MERGE_EXCLUDED_FIELDS:
+            continue
+        if not getattr(existing, name) and getattr(incoming, name):
+            updates[name] = getattr(incoming, name)
+
+    # Standalone rule: only a missing existing date may be filled, and only
+    # by a non-zero incoming one.
+    if not existing.date_epoch_ms and incoming.date_epoch_ms:
+        updates["date_epoch_ms"] = incoming.date_epoch_ms
+
+    # Standalone rule: terminal statuses are final; non-terminal ones update.
+    incoming_status = incoming.meeting_info.summary_status
+    if incoming_status and not existing.summary_is_terminal:
+        updates["meeting_info"] = existing.meeting_info.model_copy(
+            update={"summary_status": incoming_status},
+        )
+
+    return existing.model_copy(update=updates)
+
+
 class CommandProcessor:
     """Serial command applier.
 
@@ -141,7 +191,10 @@ class CommandProcessor:
         elif isinstance(command, StatusSupplemented):
             existing = {meeting.id: meeting for meeting in self._capture.read_list()}
             for meeting in command.meetings:
-                existing.setdefault(meeting.id, meeting)
+                known = existing.get(meeting.id)
+                existing[meeting.id] = (
+                    meeting if known is None else _merge_status_supplement(known, meeting)
+                )
             self._capture.write_list(list(existing.values()), fetched_at=fetched_at)
         elif isinstance(command, DetailFetched):
             previous = self._capture.read_detail(command.meeting_id)

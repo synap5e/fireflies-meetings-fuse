@@ -688,3 +688,61 @@ def test_in_progress_surface_is_minimal_and_machine_readable(tmp_path: Path) -> 
     live_date = projection.meetings[live.id].meeting.date_str
     assert f"## {partial_date} partial".encode() in backfill
     assert f"## {live_date} live".encode() in backfill
+
+
+def _supplemented(tmp_path: Path, existing: Meeting | None, incoming: Meeting) -> dict[str, Meeting]:
+    """Apply one StatusSupplemented over an optionally pre-seeded list."""
+    capture = CaptureStore(tmp_path)
+    if existing is not None:
+        capture.write_list([existing], fetched_at=1.0)
+    processor = CommandProcessor(capture)
+    processor.apply(StatusSupplemented(name="status-supplemented", meetings=[incoming]), fetched_at=2.0)
+    return {meeting.id: meeting for meeting in capture.read_list()}
+
+
+def test_status_supplement_adds_unknown_meeting_as_is(tmp_path: Path) -> None:
+    incoming = _meeting("NEW01", title="Brand New", summary_status="processing")
+    assert _supplemented(tmp_path, None, incoming)["NEW01"] == incoming
+
+
+def test_status_supplement_keeps_terminal_status(tmp_path: Path) -> None:
+    existing = _meeting("TERM01", summary_status="processed")
+    incoming = _meeting("TERM01", summary_status="errored")
+    merged = _supplemented(tmp_path, existing, incoming)["TERM01"]
+    assert merged.meeting_info.summary_status == "processed"
+
+
+def test_status_supplement_updates_empty_status(tmp_path: Path) -> None:
+    existing = _meeting("GAP01", summary_status="")
+    incoming = _meeting("GAP01", summary_status="errored")
+    merged = _supplemented(tmp_path, existing, incoming)["GAP01"]
+    assert merged.meeting_info.summary_status == "errored"
+
+
+def test_status_supplement_zero_date_never_clobbers_known_date(tmp_path: Path) -> None:
+    existing = _meeting("DATE01", summary_status="").model_copy(update={"date_epoch_ms": 1234.0})
+    incoming = Meeting(id="DATE01", meeting_info=MeetingInfo(summary_status="errored"))
+    merged = _supplemented(tmp_path, existing, incoming)["DATE01"]
+    assert merged.date_epoch_ms == 1234.0
+
+
+def test_status_supplement_fills_missing_title(tmp_path: Path) -> None:
+    existing = _meeting("TITLE01", title="", summary_status="")
+    incoming = _meeting("TITLE01", title="Recovered Title", summary_status="")
+    merged = _supplemented(tmp_path, existing, incoming)["TITLE01"]
+    assert merged.title == "Recovered Title"
+
+
+def test_status_supplement_never_touches_is_live(tmp_path: Path) -> None:
+    existing = _meeting("LIVE01", is_live=True, summary_status="")
+    incoming = _meeting("LIVE01", is_live=False, summary_status="processing")
+    merged = _supplemented(tmp_path, existing, incoming)["LIVE01"]
+    assert merged.is_live is True
+    assert merged.meeting_info.summary_status == "processing"
+
+
+def test_status_supplement_never_promotes_meeting_to_live(tmp_path: Path) -> None:
+    existing = _meeting("LIVE02", is_live=False, summary_status="")
+    incoming = _meeting("LIVE02", is_live=True, summary_status="processing")
+    merged = _supplemented(tmp_path, existing, incoming)["LIVE02"]
+    assert merged.is_live is False
