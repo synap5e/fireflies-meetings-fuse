@@ -16,7 +16,7 @@ from fireflies_meetings.access_logs import (
     access_logs_ok,
 )
 from fireflies_meetings.api import FirefliesClient
-from fireflies_meetings.capture import CaptureStore, migrate_legacy_cache
+from fireflies_meetings.capture import CaptureSnapshot, CaptureStore, migrate_legacy_cache
 from fireflies_meetings.commands import (
     AccessLogsFetched,
     CommandProcessor,
@@ -36,7 +36,8 @@ from fireflies_meetings.models import (
     Summary,
     TranscriptDetail,
 )
-from fireflies_meetings.projection import build_projection_from_captures
+from fireflies_meetings.projection import Projection, ProjectionBuildOptions, build_projection_from_captures
+from fireflies_meetings.raw import RawEnvelope
 from fireflies_meetings.status_cache import StatusCache
 from fireflies_meetings.store import MeetingStore
 
@@ -58,6 +59,14 @@ class _DetailClient:
 
     def get_access_logs(self, meeting_id: str) -> AccessLogsOutcome:
         return access_logs_ok([])
+
+
+class _RecordingSink:
+    def __init__(self) -> None:
+        self.envelopes: list[RawEnvelope] = []
+
+    def write(self, envelope: RawEnvelope) -> None:
+        self.envelopes.append(envelope)
 
 
 def _meeting(
@@ -451,6 +460,75 @@ def test_live_caption_skips_full_rebuild(tmp_path: Path, monkeypatch: object) ->
     projected = processor.projection.meetings[live.id]
     for i in range(5):
         assert f"caption {i}".encode() in projected.files["transcript.md"]
+
+
+def test_sync_active_meeting_ids_skips_rebuild_without_flip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    live = _meeting("LIVE01", summary_status="processing", is_live=True)
+    sink = _RecordingSink()
+    store = MeetingStore(
+        cast(FirefliesClient, _DetailClient(TranscriptDetail(meeting=live), [live])),
+        status_cache=StatusCache(cache_dir=tmp_path / "cache"),
+        raw_sink=sink,
+    )
+    store.refresh_list_if_needed()
+
+    build_count = 0
+    original_build = commands_module.build_projection_from_captures
+
+    def counting_build(
+        snapshot: CaptureSnapshot,
+        options: ProjectionBuildOptions | None = None,
+    ) -> Projection:
+        nonlocal build_count
+        build_count += 1
+        return original_build(snapshot, options)
+
+    monkeypatch.setattr(commands_module, "build_projection_from_captures", counting_build)
+
+    store.sync_active_meeting_ids([live.id])
+    store.sync_active_meeting_ids([])
+
+    assert build_count == 0
+    assert [envelope.source for envelope in sink.envelopes] == [
+        "synthetic-active-id",
+        "synthetic-active-id",
+    ]
+
+
+def test_sync_active_meeting_ids_rebuilds_for_unseen_live_meeting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    meeting = _meeting("PROCESSING01", summary_status="processing")
+    sink = _RecordingSink()
+    store = MeetingStore(
+        cast(FirefliesClient, _DetailClient(TranscriptDetail(meeting=meeting), [meeting])),
+        status_cache=StatusCache(cache_dir=tmp_path / "cache"),
+        raw_sink=sink,
+    )
+    store.refresh_list_if_needed()
+
+    build_count = 0
+    original_build = commands_module.build_projection_from_captures
+
+    def counting_build(
+        snapshot: CaptureSnapshot,
+        options: ProjectionBuildOptions | None = None,
+    ) -> Projection:
+        nonlocal build_count
+        build_count += 1
+        return original_build(snapshot, options)
+
+    monkeypatch.setattr(commands_module, "build_projection_from_captures", counting_build)
+
+    store.sync_active_meeting_ids([meeting.id])
+
+    assert build_count == 1
+    assert store.projection.meetings[meeting.id].meeting.is_live
+    assert [envelope.source for envelope in sink.envelopes] == ["synthetic-active-id"]
 
 
 def test_live_caption_falls_back_to_rebuild_when_meeting_unknown(tmp_path: Path) -> None:

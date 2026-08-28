@@ -440,6 +440,13 @@ class MeetingStore:
             {"meeting_ids": sorted(set(active_ids))},
         )
         active = set(active_ids)
+        flipped = [
+            item.meeting.id
+            for item in self._projection.meetings.values()
+            if item.meeting.id in active and not item.meeting.is_completed and not item.meeting.is_live
+        ]
+        if not flipped:
+            return
         meetings = [
             item.meeting.model_copy(update={"is_live": True})
             if item.meeting.id in active and not item.meeting.is_completed
