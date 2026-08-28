@@ -520,6 +520,75 @@ def test_list_transcripts_skips_invalid_records() -> None:
     assert ids == ["MEET01", "MEET02"]
 
 
+def _list_hive_fallback_participants(
+    fields: dict[str, str | float | list[str] | None],
+) -> list[str]:
+    raw = {
+        "parseId": "MEET01",
+        "date": "2026-05-08T18:30:00.000Z",
+        "title": "Hive meeting",
+        "durationMins": 30.0,
+        **fields,
+    }
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url == httpx.URL("https://api.fireflies.ai/graphql"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": {"transcripts": None},
+                    "errors": [{"message": "unavailable"}],
+                },
+            )
+        if req.url == httpx.URL("https://app.fireflies.ai/api/v4/hive"):
+            return httpx.Response(
+                200,
+                json={"data": {"getChannelMeetings": {"meetings": [raw]}}},
+            )
+        raise AssertionError(f"Unexpected request URL: {req.url}")
+
+    client = FirefliesClient(
+        "dummy-key",
+        session_auth=SessionAuth(access_token="Bearer access-token", refresh_token="refresh-token"),
+        transport=httpx.MockTransport(handler),
+    )
+    return client.list_transcripts(max_pages=1)[0].participants
+
+
+def test_hive_fallback_splits_comma_and_whitespace_separated_emails() -> None:
+    participants = _list_hive_fallback_participants(
+        {"allEmails": "a@x.com,b@y.com c@z.com"},
+    )
+
+    assert participants == ["a@x.com", "b@y.com", "c@z.com"]
+
+
+def test_hive_fallback_preserves_valid_attendees_list() -> None:
+    participants = _list_hive_fallback_participants(
+        {"validAttendees": ["a@x.com", "b@y.com"]},
+    )
+
+    assert participants == ["a@x.com", "b@y.com"]
+
+
+def test_hive_fallback_omits_missing_all_emails() -> None:
+    participants = _list_hive_fallback_participants({})
+
+    assert participants == []
+
+
+def test_hive_fallback_omits_none_all_emails() -> None:
+    participants = _list_hive_fallback_participants({"allEmails": None})
+
+    assert participants == []
+
+
+def test_hive_fallback_filters_empty_all_emails() -> None:
+    participants = _list_hive_fallback_participants({"allEmails": ",,"})
+
+    assert participants == []
+
+
 def test_get_user_email_returns_none_on_transient_error() -> None:
     """A GraphQL error block during the startup user query must NOT crash mount."""
 

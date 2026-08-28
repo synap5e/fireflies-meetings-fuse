@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 import time
 from datetime import UTC, datetime
 from typing import NoReturn, cast
@@ -354,14 +355,13 @@ def _hive_meeting_to_dict(raw: JsonObject) -> JsonObject:
 
     participants: list[JsonValue] = []
     valid = raw.get("validAttendees")
+    all_emails = raw.get("allEmails")
     if isinstance(valid, list):
         for e in valid:
             if isinstance(e, str):
                 participants.append(e)
-    elif isinstance(raw.get("allEmails"), str):
-        all_emails: str = raw["allEmails"]  # type: ignore[assignment]
-        for e in all_emails.split():
-            participants.append(e)
+    elif isinstance(all_emails, str):
+        participants.extend(part for part in re.split(r"[,\s]+", all_emails) if part)
 
     return {
         "id": parse_id,
