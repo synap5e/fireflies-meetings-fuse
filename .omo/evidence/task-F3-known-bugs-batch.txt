@@ -1,0 +1,77 @@
+F3 — Real manual QA (live service smoke test)
+Executed by: Atlas (orchestrator), 2026-08-28 ~11:10-11:20 PDT
+
+PLAN AMENDMENT (ratified by orchestrator, same authority used for Todo 3):
+The plan's literal F3 procedure ("systemctl --user start fireflies-meetings
+... systemctl --user stop") assumed the real systemd service was stopped
+and that starting it would exercise this branch's code. Neither held at
+execution time:
+  1. The real service's ExecStart points at the MAIN checkout's venv
+     (/home/simon/agentic/fireflies-meetings-fuse/.venv/bin/fireflies-meetings),
+     not this worktree — `systemctl start` would smoke-test stale `main`
+     code (ba634ad), not the five commits on this branch. It cannot
+     validate this batch's fixes as written.
+  2. The real service was found ALREADY RUNNING at execution time
+     (ExecMainStartTimestamp=2026-08-28 09:44:01 PDT, MainPID=13213),
+     started by the repo owner ~47 minutes before this work session began
+     (session started_at=2026-08-28T17:31:04Z=10:31 PDT per boulder.json).
+     This is pre-existing, unrelated host state. Running the plan's literal
+     `systemctl stop` would have DISRUPTED the owner's own independent
+     restart — the opposite of the plan's intent (which was to avoid
+     disturbing owner-chosen state).
+
+Adapted method: mount THIS WORKTREE'S build directly at a scratch
+mountpoint, exercising the real code and the real on-disk cache, without
+touching the systemd unit, the real mountpoint (/views/fireflies-meetings),
+or the owner's already-running instance.
+
+PROCEDURE
+  1. Copied /home/simon/agentic/fireflies-meetings-fuse/.env (gitignored,
+     never committed) into the worktree so the CLI could read
+     FIREFLIES_API_KEY (the systemd unit loads it via EnvironmentFile=;
+     the bare CLI does not auto-load .env, so `set -a; source .env; set +a`
+     was used for the smoke shell).
+  2. mkdir /tmp/ff-smoke-known-bugs-batch
+  3. cd .wt/handoff/known-bugs-batch && uv run fireflies-meetings mount
+     /tmp/ff-smoke-known-bugs-batch  (backgrounded, logged to
+     /tmp/ff-smoke-known-bugs-batch.log)
+
+RESULTS
+  - Mount came up clean: `ls /tmp/ff-smoke-known-bugs-batch/` listed
+    2026-01 .. 2026-08 date directories, BACKFILL_IN_PROGRESS, live/.
+  - `cat` on a real meeting.json rendered correctly, including the
+    video_url/audio_url media fields from the prior ba634ad feature —
+    confirms the worktree's full history (not just this batch's 5 commits)
+    is functionally intact end to end.
+  - journalctl-equivalent (stdout/stderr log) showed zero tracebacks over
+    the full smoke window. One batch of `Resolver using terminal list
+    status ... because detail status is empty` WARNING lines fired exactly
+    ONCE at startup (expected — initial full projection build) and did NOT
+    repeat on subsequent ticks, consistent with todo 1's no-diff fix.
+  - CPU comparison, same wall-clock window, both processes sampled via
+    `ps -o time,etimes`:
+      - OLD code (owner's real service, PID 13213, main @ ba634ad):
+        CPU time delta over a 189s window = 50s -> ~26.5% average.
+        Matches the known/documented ~25-31% baseline exactly.
+      - NEW code (this branch, scratch mount, PID 574663):
+        CPU time delta over a 180s window (t0=43s etimes -> t1=223s etimes)
+        = 36s -> 38s, i.e. ~2s CPU / 180s wall = ~1.1% average.
+    This is a real, measured, side-by-side confirmation that the
+    no-diff-rebuild fix (b24f32b) eliminates the residual CPU burn.
+
+CLEANUP (all verified afterward)
+  - fusermount3 -u /tmp/ff-smoke-known-bugs-batch -> unmounted OK.
+  - Confirmed via `ps -eo pid,cmd | grep 'fireflies-meetings mount /tmp'`
+    -> no matching process (the mount process exits on unmount).
+  - `mount | grep ff-smoke` -> not mounted.
+  - rm -rf /tmp/ff-smoke-known-bugs-batch /tmp/ff-smoke-known-bugs-batch.log
+  - rm -f .wt/handoff/known-bugs-batch/.env (the copied API key file;
+    gitignored, was never committed, confirmed absent afterward).
+  - Re-confirmed the owner's real service was NEVER touched: same
+    MainPID (13213) and same ExecMainStartTimestamp (09:44:01 PDT)
+    before and after this smoke test.
+  - `git -C .wt/handoff/known-bugs-batch status --short` -> clean.
+
+VERDICT: PASS. Real code exercised, real data rendered, zero tracebacks,
+measured CPU improvement consistent with the fix, full teardown, owner's
+own service left completely undisturbed.
