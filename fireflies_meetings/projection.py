@@ -41,13 +41,6 @@ ACCESS_LOG_PENDING = b"_Awaiting access log_\n"
 
 
 @dataclass(frozen=True)
-class BackfillDiagnostic:
-    last_poll_attempt: str = ""
-    last_poll_outcome: str = ""
-    backoff_window: str = ""
-
-
-@dataclass(frozen=True)
 class ProjectedNode:
     kind: NodeKind
     children: tuple[tuple[str, bool], ...] = ()
@@ -79,7 +72,6 @@ class ProjectedMeeting:
     overlap_dirnames: MappingProxyType[str, str] = field(
         default_factory=lambda: MappingProxyType({}),
     )
-    diagnostic: BackfillDiagnostic = field(default_factory=BackfillDiagnostic)
 
 
 @dataclass(frozen=True)
@@ -149,7 +141,6 @@ class Projection:
 class ProjectionBuildOptions:
     user_email: str | None = None
     live_captions: dict[str, dict[str, Sentence]] = field(default_factory=dict)
-    diagnostics: dict[str, BackfillDiagnostic] = field(default_factory=dict)
     auth_fatal: bool = False
     chat_auth_fatal: bool = False
     now_ms: float = 0.0
@@ -173,7 +164,6 @@ def build_projection_from_captures(
     live_rows = opts.live_captions
     resolved_meetings = _resolved_meeting_map(snapshot, opts)
     meetings = {meeting_id: resolved.meeting for meeting_id, resolved in resolved_meetings.items()}
-    diag = opts.diagnostics
     projected_by_id: dict[str, ProjectedMeeting] = {}
     entries_by_date: dict[str, list[Meeting]] = defaultdict(list)
 
@@ -206,7 +196,6 @@ def build_projection_from_captures(
         dirname_by_id=dirname_by_id,
         folded_ghosts=folded_ghosts,
         folded_overlaps=folded_overlaps,
-        diag=diag,
         sentences_by_id=sentences_by_id,
     )
     for meeting_id, meeting in meetings.items():
@@ -252,7 +241,6 @@ class _BuildContext:
     dirname_by_id: dict[str, str]
     folded_ghosts: dict[str, str]
     folded_overlaps: dict[str, tuple[str, ...]]
-    diag: dict[str, BackfillDiagnostic]
     sentences_by_id: dict[str, tuple[Sentence, ...]]
 
 
@@ -284,7 +272,6 @@ def _build_projected_meeting(
         primary_path=primary_path,
         ghost_id=ctx.folded_ghosts.get(meeting_id),
         overlap_ids=overlap_ids,
-        diagnostic=ctx.diag.get(meeting_id, BackfillDiagnostic()),
     )
 
 
@@ -566,7 +553,6 @@ def _attach_secondary_paths(
             ghost_id=item.ghost_id,
             overlap_ids=item.overlap_ids,
             overlap_dirnames=overlap_dirnames,
-            diagnostic=item.diagnostic,
         )
     return result
 
@@ -845,14 +831,10 @@ def _render_backfill_summary(meetings: dict[str, ProjectedMeeting]) -> bytes:
         return b"# Backfill In Progress\n\n_No meetings currently need backfill._\n"
     parts = ["# Backfill In Progress", ""]
     for item in sorted(partial, key=lambda p: (p.meeting.date_str, p.meeting.slug), reverse=True):
-        diag = item.diagnostic
         parts.extend([
             f"## {item.meeting.date_str} {item.meeting.slug} ({item.meeting.id})",
             "",
             f"- capture_state: {item.capture_state}",
-            f"- last_poll_attempt: {diag.last_poll_attempt or 'never'}",
-            f"- last_poll_outcome: {diag.last_poll_outcome or 'not attempted'}",
-            f"- backoff_window: {diag.backoff_window or 'none'}",
             "",
         ])
     return "\n".join(parts).encode()

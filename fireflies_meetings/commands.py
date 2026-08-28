@@ -15,7 +15,6 @@ from .access_logs import AccessLogsOutcome
 from .capture import CaptureStore
 from .models import Channel, Meeting, Sentence, TranscriptDetail
 from .projection import (
-    BackfillDiagnostic,
     OneMeetingEvidence,
     Projection,
     ProjectionBuildOptions,
@@ -109,7 +108,6 @@ class CommandProcessor:
         self._capture = capture
         self._user_email = user_email
         self._live_captions: dict[str, dict[str, Sentence]] = {}
-        self._diagnostics: dict[str, BackfillDiagnostic] = {}
         self._auth_fatal = False
         self._chat_auth_fatal = False
         snapshot = capture.read_snapshot()
@@ -216,7 +214,6 @@ class CommandProcessor:
             ProjectionBuildOptions(
                 user_email=self._user_email,
                 live_captions=self._live_captions,
-                diagnostics=self._diagnostics,
                 auth_fatal=self._auth_fatal,
                 chat_auth_fatal=self._chat_auth_fatal,
                 now_ms=time.time() * 1000,
